@@ -60,7 +60,7 @@ def test_end_to_end_diagnosis():
         scorer=lambda d, dump_sets: d,
     ))
     d = engine.run("MCE uncorrectable ECC error")
-    assert d.schema_version == "1.0.0"
+    assert d.schema_version == "1.1.0"
     assert d.actions and d.actions[0].risk == Risk.LOW
     assert any("Memory ECC" in a.rationale for a in d.actions)
     assert d.references  # must cite docs

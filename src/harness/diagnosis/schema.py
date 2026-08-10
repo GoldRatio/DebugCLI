@@ -14,7 +14,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"
 
 
 class Subsystem(str, Enum):
@@ -25,6 +25,21 @@ class Subsystem(str, Enum):
     STORAGE = "storage"
     KERNEL = "kernel"
     GENERIC = "generic"
+
+
+class ServerState(str, Enum):
+    """Structural verdict separating an ACTIVE fault from a fixed server.
+
+    ``healthy`` means current-state evidence (live sensors, kernel state) is
+    nominal even if the historical event log references past faults -- a
+    server that was repaired and is now fully operational is ``healthy``.
+    ``fault``/``degraded`` require current-state evidence of a live problem.
+    """
+
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    FAULT = "fault"
+    UNKNOWN = "unknown"
 
 
 class Risk(str, Enum):
@@ -59,6 +74,7 @@ class ConfidenceBreakdown(BaseModel):
 
 class Diagnosis(BaseModel):
     schema_version: str = SCHEMA_VERSION
+    state: ServerState = ServerState.UNKNOWN
     diagnosis: str
     confidence: float = Field(ge=0.0, le=1.0)
     confidence_breakdown: ConfidenceBreakdown | None = None

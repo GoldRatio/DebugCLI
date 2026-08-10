@@ -13,15 +13,27 @@ from __future__ import annotations
 from ..base import RegisterDump
 from . import Collector
 
-_BMC_PROBES: dict[str, list[str]] = {
-    "cpu": ["sudo -S ipmitool sensor list"],
-    "kernel": ["sudo -S ipmitool sel list", "dmesg -r"],
+_BMC_PROBES: dict[str, list[tuple[str, str]]] = {
+    "cpu": [("sudo -S ipmitool sensor list", "sensor")],
+    "kernel": [("sudo -S ipmitool sel list", "sel"), ("dmesg -r", "dmesg")],
     "ipmi": [
-        "sudo -S ipmitool sensor list",
-        "sudo -S ipmitool sel list",
-        "sudo -S ipmitool fru print",
+        ("sudo -S ipmitool sensor list", "sensor"),
+        ("sudo -S ipmitool sel list", "sel"),
+        ("sudo -S ipmitool fru print", "fru"),
     ],
 }
+
+
+def _kind_for(cmd: str) -> str:
+    if "sel list" in cmd:
+        return "sel"
+    if "sensor list" in cmd:
+        return "sensor"
+    if "fru print" in cmd:
+        return "fru"
+    if "dmesg" in cmd:
+        return "dmesg"
+    return "other"
 
 
 class BmcConsoleCollector(Collector):
@@ -39,7 +51,7 @@ class BmcConsoleCollector(Collector):
         # detect_model already ran fru print). One console round-trip ~30s.
         done = {" ".join(c.argv) for c in getattr(self.runner, "calls", []) if c.ok}
         dumps = []
-        for cmd in _BMC_PROBES[self.subsystem]:
+        for cmd, kind in _BMC_PROBES[self.subsystem]:
             if cmd in done:
                 continue
             result = self.runner.execute([cmd])
@@ -49,6 +61,7 @@ class BmcConsoleCollector(Collector):
                 raw=result.stdout,
                 cmd_argv=[cmd],
                 ok=result.ok,
-                meta={"exit": result.exit_code, "elapsed_ms": result.elapsed_ms},
+                meta={"exit": result.exit_code, "elapsed_ms": result.elapsed_ms,
+                      "kind": kind},
             ))
         return dumps

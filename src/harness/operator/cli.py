@@ -316,6 +316,7 @@ def _audit_commands(log: AuditLog, trace: SessionTrace, runner) -> None:
 
 def _print_diagnosis(diagnosis: Diagnosis, out: Path, session_id: str) -> None:
     print(f"\n==== Diagnosis [{session_id}] ====")
+    print(f"state: {diagnosis.state.value}")
     print(diagnosis.diagnosis)
     print(f"confidence: {diagnosis.confidence}")
     if diagnosis.confidence_breakdown is not None:
@@ -493,7 +494,7 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
                 d,
                 retrieved_snippets=retriever(args.symptom) if retriever else None,
                 evidence_fit=(
-                    None if d.evidence else evidence_fit_from_dumps(dump_sets)
+                    None if d.evidence else evidence_fit_from_dumps(d, dump_sets)
                 ),
             )
         ),

@@ -132,7 +132,7 @@ def test_diagnose_end_to_end(tmp_path, capsys):
     args = _diagnose_args(tmp_path, approve_all=True)
     diag = run_diagnose(args, overrides={"session": FakeSession(), "llm": _fake_llm})
 
-    assert diag.schema_version == "1.0.0"
+    assert diag.schema_version == "1.1.0"
     assert diag.actions[0].risk == Risk.LOW
     assert diag.parts_discrepancies == []
 
@@ -330,7 +330,7 @@ def test_diagnose_console_path_runs_pipeline(tmp_path):
         "--out-dir", str(tmp_path / "runs"), "--llm", "stub", "--approve-all"])
     diag = run_diagnose(args, overrides={"console_runner": console_runner})
 
-    assert diag.schema_version == "1.0.0"
+    assert diag.schema_version == "1.1.0"
     calls = [" ".join(c.argv) for c in console_runner.calls]
     # BMC console path: FRU model detection + BMC-shell probes, no host-OS tools
     assert "sudo -S ipmitool fru print" in calls
@@ -440,7 +440,7 @@ def test_diagnose_uses_docs_lib_for_rag(tmp_path, monkeypatch):
         "--symptom", "MCE uncorrectable ECC error", "--docs-lib", lib,
         "--out-dir", str(tmp_path / "runs"), "--llm", "stub", "--approve-all"])
     diag = run_diagnose(args, overrides={"session": FakeSession()})
-    assert diag.schema_version == "1.0.0"
+    assert diag.schema_version == "1.1.0"
     assert diag.confidence_breakdown is not None  # scorer ran over retrieved snippets
 
 
@@ -451,7 +451,7 @@ def test_diagnose_interactive_session(tmp_path, monkeypatch, capsys):
         "--symptom", "MCE uncorrectable ECC error", "--out-dir", str(tmp_path / "runs"),
         "--llm", "stub", "--interactive", "--approve-all"])
     diag = run_diagnose(args, overrides={"session": FakeSession()})
-    assert diag.schema_version == "1.0.0"
+    assert diag.schema_version == "1.1.0"
 
     run_dir = next((tmp_path / "runs").iterdir())
     transcript = json.loads((run_dir / "transcript.json").read_text(encoding="utf-8"))
@@ -478,7 +478,7 @@ def test_diagnose_context_file_seeds_session(tmp_path):
         "--symptom", "MCE uncorrectable ECC error", "--out-dir", str(tmp_path / "runs"),
         "--llm", "stub", "--context-file", str(ctx_file), "--approve-all"])
     diag = run_diagnose(args, overrides={"session": FakeSession()})
-    assert diag.schema_version == "1.0.0"
+    assert diag.schema_version == "1.1.0"
 
     run_dir = next((tmp_path / "runs").iterdir())
     transcript = json.loads((run_dir / "transcript.json").read_text(encoding="utf-8"))
@@ -605,7 +605,7 @@ def test_diagnose_rack_cable_uses_console_defaults(tmp_path):
         "--out-dir", str(tmp_path / "runs"), "--llm", "stub", "--approve-all"])
     diag = run_diagnose(args, overrides={"console_runner": console_runner})
 
-    assert diag.schema_version == "1.0.0"
+    assert diag.schema_version == "1.1.0"
     assert "sudo -S ipmitool fru print" in [" ".join(c.argv) for c in console_runner.calls]
 
     run_dir = next((tmp_path / "runs").iterdir())
@@ -639,7 +639,7 @@ def test_diagnose_by_address_uses_ssh_identity_from_store(tmp_path):
         "--out-dir", str(tmp_path / "runs"), "--llm", "stub", "--approve-all"])
     diag = run_diagnose(args, overrides={"session": FakeSession(), "store": store})
 
-    assert diag.schema_version == "1.0.0"
+    assert diag.schema_version == "1.1.0"
     run_dir = next((tmp_path / "runs").iterdir())
     run_start = next(e.payload for e in
                      AuditLog(run_dir / "audit.jsonl").read() if e.kind == "run_start")
@@ -668,7 +668,7 @@ def test_diagnose_alias_targets_console(tmp_path):
         "--symptom", "MCE uncorrectable ECC error",
         "--out-dir", str(tmp_path / "runs"), "--llm", "stub", "--approve-all"])
     diag = run_diagnose(args, overrides={"console_runner": console_runner})
-    assert diag.schema_version == "1.0.0"
+    assert diag.schema_version == "1.1.0"
 
     run_dir = next((tmp_path / "runs").iterdir())
     run_start = next(e.payload for e in

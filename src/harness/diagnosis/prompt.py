@@ -19,9 +19,25 @@ SYSTEM_PREAMBLE = """You are a server-diagnostic assistant. You MAY ONLY suggest
 non-destructive, verifiable actions. ABSOLUTE RULE: never recommend writing to a
 hardware register, flashing firmware, or running any destructive/downgrade command.
 Your output must be grounded: every assertion about register meaning or repair must
-cite the source (document title + page) or a parts-list reference. If any register
-is flagged unknown, say so and suggest a manual lookup -- do NOT guess its meaning."""
+cite the source (document title + page) or a parts-list reference. Citations must
+name an actual document (title + page) from the Relevant Architecture Snippets or
+Parts List References -- the evidence sections of this prompt (Evidence Notes,
+Anomalous Evidence Summary, etc.) are NOT citable sources. If any register
+is flagged unknown, say so and suggest a manual lookup -- do NOT guess its meaning.
 
+Evidence kind rules:
+- IPMI SEL entries are a HISTORICAL event log: each entry records a PAST event with
+  its own timestamp and is NOT proof of a current fault. Weight live sensor
+  readings (current state) over stale SEL records.
+- An asserted event with no matching deassert is not automatically an active fault;
+  entries that recur at every power-on may be expected boot sequencing.
+- State clearly in the diagnosis whether a fault is ACTIVE (current sensors/state
+  disagree with nominal) versus HISTORICAL (only past log entries reference it).
+- Set the structured "state" field explicitly: "healthy" when live sensors/state
+  are nominal and only historical log entries reference past faults (the server is
+  fixed); "fault" ONLY when current-state evidence shows a live problem;
+  "degraded" for an active non-fatal issue; "unknown" only when evidence is
+  insufficient. The "diagnosis" text must match the chosen state."""
 
 def build_prompt(*,
                  model: DetectedModel | None,
@@ -47,6 +63,8 @@ def build_prompt(*,
         lines.append(f"- {d.mnemonic} = {d.raw_hex}" + (" (UNKNOWN, manual lookup)" if d.unknown else f" [catalog {d.catalog_version}]"))
         for f in d.decoded_fields:
             lines.append(f"    {f.name}: value={f.raw_value}" + (f" -> {f.meaning}" if f.meaning else ""))
+    lines.extend(["", "## Evidence Notes"])
+    lines.extend(summaries.notes or ["(none)"])
     lines.extend(["", "## Anomalous Evidence Summary"])
     lines.extend(summaries.interesting or ["(none)"])
     lines.extend(["", "## Relevant Architecture Snippets"])
@@ -81,7 +99,22 @@ lookups before you can produce a diagnosis -- do not rush.
 When you ask a question, keep it to ONE concise question so the operator can answer
 in a sentence (e.g. "Were there previous repair actions attempted, and what was
 replaced?"). The operator may answer briefly or not at all; never block forever on
-missing answers."""
+missing answers.
+
+Evidence kind rules:
+- IPMI SEL entries are a HISTORICAL event log: each entry records a PAST event with
+  its own timestamp and is NOT proof of a current fault. Weight live sensor
+  readings (current state) over stale SEL records.
+- An asserted event with no matching deassert is not automatically an active fault;
+  entries that recur at every power-on may be expected boot sequencing.
+- State clearly in the final diagnosis whether a fault is ACTIVE (current
+  sensors/state disagree with nominal) versus HISTORICAL (only past log entries
+  reference it).
+- Set the structured "state" field explicitly: "healthy" when live sensors/state
+  are nominal and only historical log entries reference past faults (the server is
+  fixed); "fault" ONLY when current-state evidence shows a live problem;
+  "degraded" for an active non-fatal issue; "unknown" only when evidence is
+  insufficient. The "diagnosis" text must match the chosen state."""
 
 TURN_CONTRACT = """Respond with STRICT JSON, exactly one of:
 {"kind": "question", "question": "..."}
@@ -122,6 +155,8 @@ def build_turn_evidence(*,
         lines.append(f"- {d.mnemonic} = {d.raw_hex}" + (" (UNKNOWN, manual lookup)" if d.unknown else f" [catalog {d.catalog_version}]"))
         for f in d.decoded_fields:
             lines.append(f"    {f.name}: value={f.raw_value}" + (f" -> {f.meaning}" if f.meaning else ""))
+    lines.extend(["", "## Evidence Notes"])
+    lines.extend(summaries.notes or ["(none)"])
     lines.extend(["", "## Anomalous Evidence Summary"])
     lines.extend(summaries.interesting or ["(none)"])
     lines.extend(["", "## Relevant Architecture Snippets"])
