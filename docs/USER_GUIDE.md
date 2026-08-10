@@ -1,0 +1,155 @@
+# User Guide
+
+End-to-end walkthrough for operating the harness: install, credentials,
+targeting, diagnosing, verifying, and reading the outputs.
+
+## 1. Install and prepare
+
+```powershell
+pip install -e ".[test,docs]"
+```
+
+Create your inventory (vault paths only). The packaged sample is
+`src/harness/config/inventory.yaml`; copy it and adjust:
+
+```powershell
+Copy-Item src\harness\config\inventory.yaml .\inventory.yaml
+harness lint --inventory inventory.yaml     # must print OK, no inline secrets
+```
+
+Required inventory blocks:
+
+- `trust_level:` — `lab | qa | prod`; gates the console path.
+- `llm:` — provider (`openai`/`gemini`), model, `api_key_vault_path` (optional;
+  use `--llm stub` to run the pipeline without an LLM).
+- `hosts:` — named hosts with `ssh` (OS) and `bmc` (IPMI) domains, separate
+  rotated credentials.
+- `console_defaults:` — fleet rack-manager settings so any rack/cable can be
+  targeted without per-host YAML: `address`, `user`, `identity_vault_path`,
+  `known_hosts_path`, `tool`, `trust_level`, `prompts`, `port`,
+  `sudo_vault_path`.
+
+## 2. Register credentials (once)
+
+```powershell
+# SSH private key — from a FILE path, never a literal
+harness secrets add-ssh 10.0.0.50 --key-file .\secrets\id_ed25519 --secret-dir .\secrets
+
+# Password — read interactively, never echoed
+harness secrets set-password bmc-ro --secret-dir .\secrets
+
+harness secrets list --secret-dir .\secrets
+harness secrets check 10.0.0.50 --secret-dir .\secrets
+```
+
+SSH-by-IP identity lookup order: `--identity-vault-path` >
+`secret/harness/ssh/<ip>` > `secret/harness/diagbot/id_ed25519`.
+
+## 3. Add architecture PDFs to the RAG library
+
+```powershell
+harness docs add .\docs\*.pdf        # chunk + index
+harness docs ls
+harness docs reindex                 # rebuild index, retries failures
+```
+
+Vendor PDFs are git-ignored; they live on your machine only.
+
+## 4. Diagnose
+
+### Interactive menu (no flags)
+
+```powershell
+harness            # or: harness menu
+```
+
+Auto-discovers the inventory, then menus: pick target → pick action
+(chat / diagnose / verify / console / docs / targets / secrets / lint).
+Esc cancels; typing filters; non-tty stdin falls back to numbered prompts.
+
+### Chat session
+
+```powershell
+harness session --inventory inventory.yaml --host h1
+harness> the DIMM error is back on h1
+```
+
+- Non-slash text routes (LLM, keyword fallback) to diagnose / probe / docs /
+  verify / status / reply.
+- Slash commands: `/help`, `/hosts`, `/use <host|rack cable n|ip|alias>`,
+  `/context <note>`, `/status`, `/stop`, `/runs`, `/history`, `/resume <dir>`,
+  `/lint`, `/targets ...`, `/docs ...`, `/quit`.
+- Type-ahead: messages typed while a run is in progress seed the next run.
+- Sessions persist under `--session-dir`; each run keeps `diagnosis.json` /
+  `trace.json` / `dumps.json` under `--out-dir`.
+
+### One-shot flags
+
+```powershell
+harness diagnose --inventory inventory.yaml --host h1 --symptom "ECC errors"
+harness diagnose --inventory inventory.yaml --rack Q61 --cable 8 --symptom "ECC errors"
+harness diagnose --inventory inventory.yaml --address 10.0.0.50 --symptom "ECC errors"
+harness diagnose --inventory inventory.yaml --target d1 --symptom "ECC errors"
+```
+
+Add `--approval` (y/N per action) or `--approve-all` (record all approved),
+`--context "note"` / `--context-file`, and `--max-turns` (default 6).
+
+## 5. Console path (serial/SOL, lab/QA only)
+
+```powershell
+harness console --inventory inventory.yaml --rack Q71 --cable 8 --probe "lspci -vvv -n -s 00:06:00.0"
+```
+
+- Rack id normalizes: `Q71`, `q71`, `71` → `jumpin q71-1 rm`.
+- `port: 2200` (BMC access port) drops you into the BMC BusyBox shell; the
+  collector plan substitutes host-OS probes with BMC equivalents
+  (`sudo -S ipmitool sensor list`, `sudo -S ipmitool sel list`, `dmesg -r`),
+  and skips pcie/storage probes that need host-OS tools.
+- sudo probes trigger an automatic `password for` → send-password handshake
+  from `sudo_vault_path`.
+
+## 6. Verify a repair
+
+```powershell
+harness verify --inventory inventory.yaml --host h1 --symptom "ECC errors" `
+  --baseline .\harness_runs\<run-id>\dumps.json --metric ecc
+```
+
+Re-runs collectors and reports whether the error counter moved relative to the
+baseline run — your before/after check for a completed repair.
+
+## 7. Target aliases
+
+```powershell
+harness targets --targets-file config\targets.yaml add d1 --rack Q61 --cable 8
+harness targets --targets-file config\targets.yaml ls
+harness diagnose --inventory inventory.yaml --target d1 --symptom "ECC errors"
+```
+
+Aliases are a path-only file; never credentials.
+
+## 8. Reading the outputs
+
+Under `harness_runs/<run-id>/`:
+
+- `diagnosis.json` — prioritized recommendations with confidence and part
+  references (pending human approval).
+- `trace.json` — what was planned, collected, decoded, and concluded.
+- `audit.jsonl` — append-only audit chain (redacted).
+- `dumps/*.txt` — raw collector output for manual cross-checking.
+
+## Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| `SerialConsoleError: allowed only at lab/qa` | `trust_level` is `prod`; set `lab`/`qa` |
+| `sudo password missing from vault` | no secret at `sudo_vault_path` |
+| `SerialProbeDenied: ... i2cset ...` | write tool — only reads allowed (`i2cdump`/`i2cget`) |
+| `did not see node prompt "~#"` | wrong/blank cable, or session timeout |
+| `spawn q71-1 rm` fails | rack-manager user lacks `jumpin`, or wrong rack id |
+| `Host key not in pinned known_hosts` | rack manager key not imported |
+| `SerialProbeDenied` on `lspci \| grep` | no `sh`/`>`/`$( )` in pipelines |
+
+See [TESTING.md](../TESTING.md) for the full live-console test walkthrough
+(rack Q71, cable 8) and acceptance checklist.

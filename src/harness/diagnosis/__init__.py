@@ -1,0 +1,1 @@
+"""diagnosis: schema, summarizer, orchestrator, scorer, verifier, parts validation."""

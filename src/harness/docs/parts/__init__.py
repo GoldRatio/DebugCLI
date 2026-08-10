@@ -1,0 +1,1 @@
+"""parts package: physical parts list -> slot->FRU/PN/SN graph."""

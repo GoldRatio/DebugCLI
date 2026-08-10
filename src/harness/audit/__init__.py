@@ -1,0 +1,1 @@
+"""audit: immutable, hash-chained execution trace and secret redaction."""

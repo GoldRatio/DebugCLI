@@ -1,0 +1,1 @@
+"""ingest: layout-aware PDF parsing (+OCR hook) and chunking/embedding."""

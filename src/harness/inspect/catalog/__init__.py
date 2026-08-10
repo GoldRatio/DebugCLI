@@ -1,0 +1,1 @@
+"""catalog package: curated register definitions parsed from YAML."""

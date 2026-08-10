@@ -1,0 +1,55 @@
+# Host inventory. Contains VAULT PATHS only -- NEVER inline credentials.
+# Each host: ssh domain (OS) and bmc domain (IPMI/BMC) use SEPARATE rotated creds.
+trust_level: prod   # lab | qa | prod; gates auto-propose + SOL, never relaxes no-write
+
+# LLM backend for reasoning (optional). The CLI flag --llm <provider> overrides
+# this block. provider: openai (any OpenAI-compatible endpoint, default) |
+# gemini (OpenAI-compat endpoint) | stub (no reasoning, pipeline-only).
+llm:
+  provider: gemini
+  model: gemini-2.5-flash
+  url: https://generativelanguage.googleapis.com/v1beta/openai   # optional; gemini default
+  api_key_vault_path: secret/harness/llm/gemini-key              # vault path, never inline
+  timeout: 120
+
+# Fleet console defaults: lets you target ANY server by rack/cable (e.g.
+# "Diagnose Q61 Cable 8" or --rack Q61 --cable 8) WITHOUT a per-server YAML
+# entry. The console block per host is still honored when present.
+# Requires a serial session against the rack-manager console: jumpin + BMC port.
+console_defaults:
+  address: 192.168.202.51     # rack manager
+  user: log
+  identity_vault_path: secret/harness/rackmgr/id_ed25519
+  known_hosts_path: config/rackmgr_known_hosts
+  tool: jumpin
+  trust_level: lab            # console targeting is prod-blocked by default
+  prompts: ["RScmCli#", "~#"]
+  port: 2200                  # BMC access port for the serial session
+  sudo_vault_path: secret/harness/bmc/sudo   # BMC sudo password (never inline)
+
+hosts:
+  - name: host-01
+    address: 10.0.0.10
+    model: model_x            # expected; verified via dmidecode at session start
+    ssh:
+      user: diagbot
+      identity_vault_path: secret/harness/diagbot/id_ed25519
+      known_hosts_path: config/known_hosts
+      bastion: null           # or secret/bastion config path for proxy jump
+    bmc:
+      address: 10.0.0.11
+      username: bmc-ro
+      password_vault_path: secret/harness/bmc/bmc-ro
+    collector_profile: model_x_diag
+    console:
+      address: 192.168.202.51     # rack manager
+      user: log
+      identity_vault_path: secret/harness/rackmgr/id_ed25519
+      known_hosts_path: config/rackmgr_known_hosts
+      rack: 03
+      cable: 12
+      tool: jumpin
+      trust_level: lab           # console fallback is prod-blocked by default
+      prompts: ["RScmCli#", "~#"]
+      port: 2200                 # BMC access port for the serial session
+      sudo_vault_path: secret/harness/bmc/sudo   # BMC sudo password (never inline)

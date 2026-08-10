@@ -1,0 +1,1 @@
+"""retrieval: hybrid BM25 + semantic search and RAG with page citations."""

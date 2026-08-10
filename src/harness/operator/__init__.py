@@ -1,0 +1,1 @@
+"""operator: CLI, human approval gate, ticketing, and supervision."""

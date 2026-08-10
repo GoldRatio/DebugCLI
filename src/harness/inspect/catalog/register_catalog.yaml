@@ -1,0 +1,32 @@
+# Curated register definitions -- SINGLE source of truth for bit-field decoding.
+# Versioned, reviewed, signed off. When a PDF table conflicts with this catalog,
+# THIS WINS and the PDF chunk is marked superseded. Unknown -> flagged, never guessed.
+schema_version: "1.0.0"
+owner: hardware-reliability-team
+signoff:
+  by: R.Gunn
+  date: "2026-07-01"
+  reviewed: true
+
+registers:
+  IA32_MC0_STATUS:
+    mnemonic: IA32_MC0_STATUS
+    addr: "0x401"
+    canonical_source: Server_Arch_v2.3.pdf
+    page_ref: "p. 78"
+    bit_fields:
+      - {name: valid,   msb: 63, lsb: 63, values: {"1": "error logged"}}
+      - {name: over,    msb: 62, lsb: 62, values: {"1": "overflow", "0": "no overflow"}}
+      - {name: mca_error_code,            msb: 15, lsb: 0}
+      - {name: model_specific_error_code, msb: 31, lsb: 16}
+      - {name: other_info,                msb: 60, lsb: 32}
+
+  IA32_MCG_STATUS:
+    mnemonic: IA32_MCG_STATUS
+    addr: "0x17A"
+    canonical_source: Server_Arch_v2.3.pdf
+    page_ref: "p. 80"
+    bit_fields:
+      - {name: ripv, msb: 0, lsb: 0, values: {"1": "RIPV set", "0": "RIPV clear"}}
+      - {name: eipv, msb: 1, lsb: 1, values: {"1": "EIPV set", "0": "EIPV clear"}}
+      - {name: mcip, msb: 2, lsb: 2, values: {"1": "machine check in progress"}}
