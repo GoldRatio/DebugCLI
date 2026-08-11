@@ -19,6 +19,7 @@ supervisor enforces the step/wall-clock budgets.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -62,6 +63,7 @@ class SessionEngine:
         self._topic_snippets: list[str] = []
         self._model = None
         self._plan = None
+        self._prompt_seq = 0
 
     def run(self, symptom: str, initial_answers: list[str] | tuple[str, ...] = ()) -> Diagnosis:
         _step = self.ctx.supervisor or (lambda _label: None)
@@ -189,6 +191,10 @@ class SessionEngine:
             parts_refs=parts,
             conversation=conversation,
         )})
+        if self.ctx.prompt_callback is not None:
+            self._prompt_seq += 1
+            self.ctx.prompt_callback(json.dumps(
+                {"turn": self._prompt_seq, "messages": messages}, indent=2))
         return messages
 
     def _forced_diagnosis(self, symptom: str) -> Diagnosis:

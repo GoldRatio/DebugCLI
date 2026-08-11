@@ -304,6 +304,20 @@ def _save_dumps(out: Path, dump_sets) -> None:
         json.dumps([asdict(d) for d in all_dumps], indent=2), encoding="utf-8")
 
 
+def _save_prompt(out: Path, content: str, session_mode: bool) -> None:
+    """Persist the exact prompt(s) sent to the LLM for end-to-end audit.
+
+    Single-shot runs write ``prompt.txt``; session runs append one JSON object
+    per turn to ``prompt_turns.jsonl`` (turn number + full message list, so the
+    conversation and evidence view are reproducible turn by turn).
+    """
+    if session_mode:
+        with (out / "prompt_turns.jsonl").open("a", encoding="utf-8") as f:
+            f.write(content + "\n")
+    else:
+        (out / "prompt.txt").write_text(content, encoding="utf-8")
+
+
 def _audit_commands(log: AuditLog, trace: SessionTrace, runner) -> None:
     for call in runner.calls:
         trace.record_command(call.argv, call.exit_code, call.elapsed_ms,
@@ -500,6 +514,7 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
         ),
         supervisor=_step,
         dump_callback=lambda dumps: _save_dumps(out, dumps),
+        prompt_callback=lambda content: _save_prompt(out, content, session_mode),
         progress=overrides.get("progress"),
         model_hook=(
             lambda model: log.append(trace.session_id, "model_detected", {
@@ -697,6 +712,7 @@ _MAIN_ACTIONS: list[tuple[str, str]] = [
     ("chat", "chat session  - natural language: describe symptoms, agent diagnoses"),
     ("diagnose", "diagnose      - one-shot read-only diagnosis of a target"),
     ("verify", "verify        - compare a run against a baseline"),
+    ("runs", "runs          - inspect a previous run (verdict, commands, prompt, dumps)"),
     ("console", "console       - read-only probes over the serial console (lab/qa)"),
     ("docs", "docs          - manage the RAG document library"),
     ("targets", "targets       - manage short target aliases"),
@@ -1028,6 +1044,92 @@ def _menu_secrets(args) -> int:
     return 0
 
 
+def _print_artifact(path: Path) -> None:
+    if not path.exists():
+        print(f"  (missing: {path})")
+        return
+    print(f"---- {path} ----")
+    print(path.read_text(encoding="utf-8"))
+
+
+def _menu_runs(args) -> int:
+    """Inspect a previous run end to end: verdict, command pathway, the exact
+    prompt(s) sent to the LLM, and the raw collector evidence."""
+    from .menu import select
+
+    out_dir = Path(getattr(args, "out_dir", "harness_runs"))
+    runs = sorted((p for p in out_dir.glob("*") if p.is_dir()),
+                  key=lambda p: p.stat().st_mtime, reverse=True)
+    if not runs:
+        print(f"  no runs yet under {out_dir}")
+        return 0
+    pick = select("Run (most recent first)", [str(p) for p in runs])
+    if pick is None:
+        return 0
+    run_dir = runs[pick]
+    views = [
+        ("verdict", "verdict  - diagnosis.json (state, text, confidence, actions)"),
+        ("commands", "commands - trace.json (every command run, in order)"),
+        ("prompt", "prompt   - the exact prompt(s) sent to the LLM"),
+        ("dumps", "dumps    - raw collector evidence files"),
+        (_BACK, _BACK),
+    ]
+    while True:
+        idx = select("Inspect", [label for _, label in views])
+        if idx is None:
+            return 0
+        key = views[idx][0]
+        if key == _BACK:
+            return 0
+        if key == "verdict":
+            _print_artifact(run_dir / "diagnosis.json")
+        elif key == "commands":
+            _print_artifact(run_dir / "trace.json")
+        elif key == "prompt":
+            _print_run_prompt(run_dir)
+        elif key == "dumps":
+            _print_run_dumps(run_dir)
+
+
+def _print_run_prompt(run_dir: Path) -> None:
+    from .menu import select
+
+    single = run_dir / "prompt.txt"
+    turns = run_dir / "prompt_turns.jsonl"
+    if single.exists():
+        _print_artifact(single)
+        return
+    if not turns.exists():
+        print("  (no prompt artifact in this run)")
+        return
+    entries = [json.loads(line) for line in
+               turns.read_text(encoding="utf-8").splitlines() if line.strip()]
+    options = [f"turn {e.get('turn', i + 1)}" for i, e in enumerate(entries)] + ["all turns"]
+    pick = select("Prompt", options)
+    if pick is None:
+        return
+    if pick == len(options) - 1:
+        for entry in entries:
+            print(f"---- turn {entry.get('turn', '?')} ----")
+            print(json.dumps(entry.get("messages", entry), indent=2))
+    else:
+        print(json.dumps(entries[pick].get("messages", entries[pick]), indent=2))
+
+
+def _print_run_dumps(run_dir: Path) -> None:
+    from .menu import select
+
+    dumps_dir = run_dir / "dumps"
+    files = sorted(dumps_dir.glob("*.txt")) if dumps_dir.is_dir() else []
+    if not files:
+        print("  (no dump files in this run)")
+        return
+    pick = select("Dump", [p.name for p in files])
+    if pick is None:
+        return
+    _print_artifact(files[pick])
+
+
 def run_menu(args) -> int:
     """Interactive launcher: pick the inventory, then drive every subcommand
     from one prompt. This is the default command when ``harness`` is run
@@ -1089,6 +1191,8 @@ def run_menu(args) -> int:
                 argv += _target_argv(spec)
                 argv += _wizard_flags(args, "verify")
                 _run_wizard_sub(argv)
+            elif key == "runs":
+                _menu_runs(args)
             elif key == "console":
                 spec = _pick_target(inv, store, args, console=True)
                 if spec is None:

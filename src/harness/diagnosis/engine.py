@@ -37,6 +37,7 @@ class EngineContext:
     scorer: Callable[[Diagnosis, dict[str, list[RegisterDump]]], Diagnosis] | None = None
     supervisor: Callable[[str], None] | None = None
     dump_callback: Callable[[dict[str, list[RegisterDump]]], None] | None = None
+    prompt_callback: Callable[[str], None] | None = None  # audit: exact prompt(s) sent to the LLM
     progress: Callable[[str], None] | None = None  # human-readable step events (UI streaming)
     model_hook: Callable[[DetectedModel | None], None] | None = None  # audit of detected model
 
@@ -93,6 +94,8 @@ class DiagnosticEngine:
             parts_refs=parts,
             symptom=symptom,
         )
+        if self.ctx.prompt_callback is not None:
+            self.ctx.prompt_callback(prompt)
         _step("reason")
         _emit("reason: agent reasoning over evidence")
         diagnosis = self.ctx.llm(prompt)

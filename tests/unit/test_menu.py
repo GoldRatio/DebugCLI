@@ -10,6 +10,7 @@ from harness.operator import cli as cli_mod
 from harness.operator.cli import (
     _baselines,
     _discover_inventory,
+    _menu_runs,
     _pick_inventory,
     _run_wizard_sub,
     run_menu,
@@ -222,8 +223,8 @@ def test_run_menu_lint_then_quit(tmp_path, monkeypatch, capsys):
     _write_inventory(tmp_path)
     monkeypatch.chdir(tmp_path)
     from harness.operator import menu as menu_mod
-    # main menu: 7 = lint, then 8 = quit
-    monkeypatch.setattr(menu_mod, "select", _scripted_select([7, 8]))
+    # main menu: 8 = lint, then 9 = quit
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([8, 9]))
 
     assert run_menu(_menu_args()) == 0
     out = capsys.readouterr().out
@@ -241,7 +242,7 @@ def test_run_menu_diagnose_builds_argv(tmp_path, monkeypatch, capsys):
         built.append(argv)
         return 0
 
-    monkeypatch.setattr(menu_mod, "select", _scripted_select([1, 0, 8]))
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([1, 0, 9]))
     monkeypatch.setattr(menu_mod, "ask_text",
                         lambda prompt, **kw: "ECC error on DIMM_A2")
     monkeypatch.setattr(cli_mod, "_run_wizard_sub", fake_sub)
@@ -250,6 +251,71 @@ def test_run_menu_diagnose_builds_argv(tmp_path, monkeypatch, capsys):
     assert built and built[0][:4] == ["diagnose", "--inventory", "inventory.yaml",
                                       "--symptom"]
     assert "--host" in built[0] and built[0][built[0].index("--host") + 1] == "h1"
+
+
+# ---- runs inspection menu ----
+
+def _fake_run_dir(base, run_id, files: dict):
+    run = base / "harness_runs" / run_id
+    run.mkdir(parents=True, exist_ok=True)
+    for rel, body in files.items():
+        path = run / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+    return base
+
+
+def test_menu_runs_verdict_view(tmp_path, monkeypatch, capsys):
+    from harness.operator import menu as menu_mod
+    base = _fake_run_dir(tmp_path, "abc123", {
+        "diagnosis.json": '{"state": "healthy", "confidence": 0.8}'})
+    args = SimpleNamespace(out_dir=str(base / "harness_runs"))
+    # 0 = run, 0 = verdict, 4 = back
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 0, 4]))
+    assert _menu_runs(args) == 0
+    out = capsys.readouterr().out
+    assert "healthy" in out
+
+
+def test_menu_runs_prompt_turns_view(tmp_path, monkeypatch, capsys):
+    from harness.operator import menu as menu_mod
+    base = _fake_run_dir(tmp_path, "def456", {
+        "prompt_turns.jsonl": '{"turn": 1, "messages": [{"role": "user", '
+                              '"content": "evidence block"}]}\n'})
+    args = SimpleNamespace(out_dir=str(base / "harness_runs"))
+    # 0 = run, 2 = prompt, 0 = turn 1, 4 = back
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 2, 0, 4]))
+    assert _menu_runs(args) == 0
+    assert "evidence block" in capsys.readouterr().out
+
+
+def test_menu_runs_dumps_view(tmp_path, monkeypatch, capsys):
+    from harness.operator import menu as menu_mod
+    base = _fake_run_dir(tmp_path, "ghi789", {
+        "dumps/ipmi_0.txt": "sensor data here"})
+    args = SimpleNamespace(out_dir=str(base / "harness_runs"))
+    # 0 = run, 3 = dumps, 0 = first dump file, 4 = back
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 3, 0, 4]))
+    assert _menu_runs(args) == 0
+    assert "sensor data here" in capsys.readouterr().out
+
+
+def test_menu_runs_empty(tmp_path, monkeypatch, capsys):
+    from harness.operator import menu as menu_mod
+    args = SimpleNamespace(out_dir=str(tmp_path / "harness_runs"))
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0]))
+    assert _menu_runs(args) == 0
+    assert "no runs yet" in capsys.readouterr().out
+
+
+def test_menu_runs_missing_artifact(tmp_path, monkeypatch, capsys):
+    from harness.operator import menu as menu_mod
+    base = _fake_run_dir(tmp_path, "jkl012", {})
+    args = SimpleNamespace(out_dir=str(base / "harness_runs"))
+    # 0 = run, 2 = prompt (missing artifact), 4 = back
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 2, 4]))
+    assert _menu_runs(args) == 0
+    assert "no prompt artifact" in capsys.readouterr().out
 
 
 def test_pick_target_named_host(tmp_path, monkeypatch, capsys):

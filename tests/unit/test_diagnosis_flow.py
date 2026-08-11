@@ -95,6 +95,25 @@ def test_engine_skips_none_collectors_and_calls_hooks():
     assert d.parts_discrepancies == []
 
 
+def test_engine_prompt_callback_receives_built_prompt():
+    runner = FakeRunner()
+    seen = []
+
+    engine = DiagnosticEngine(EngineContext(
+        runner=runner,
+        decoder=Decoder(),
+        collector_factory=make_collector,
+        llm=_fake_llm,
+        prompt_callback=seen.append,
+    ))
+    engine.run("MCE uncorrectable ECC error")
+    assert len(seen) == 1
+    prompt = seen[0]
+    assert "MCE uncorrectable ECC error" in prompt       # symptom present
+    assert "## Anomalous Evidence Summary" in prompt     # evidence block present
+    assert "## Evidence Notes" in prompt                 # kind notes present
+
+
 def _fake_llm(_prompt: str) -> Diagnosis:
     return Diagnosis(
         diagnosis="Memory ECC errors on DIMM_A2",
