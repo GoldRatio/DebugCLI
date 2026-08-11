@@ -185,6 +185,11 @@ class BackgroundTask:
         except KeyboardInterrupt:
             self.events.put(("error", "interrupted"))
         except Exception as exc:  # noqa: BLE001 - surfaced as an error event
+            import os
+            if os.environ.get("REPL_DEBUG"):
+                import traceback as _tb
+                with open(os.environ["REPL_DEBUG"], "a", encoding="utf-8") as _f:
+                    _tb.print_exc(file=_f)
             self.events.put(("error", f"{type(exc).__name__}: {exc}"))
 
 
@@ -449,33 +454,39 @@ def _launch(session: Session, cmd: SessionCommand, raw_text: str) -> BackgroundT
     """Start the background task for a routed command; returns it (None when
     the command only printed, e.g. status / a missing-baseline verify).
 
+    The new task is started BEFORE it is published as ``session.task``: while
+    it starts, ``session.task`` still names the routing worker (whose fn is
+    alive until ``_launch`` returns), so the REPL's dead-task cleanup can never
+    observe a not-yet-running task and clear it mid-launch.
+
     The launch announcement is queued on the NEW task (whose events the REPL
     drains) so it is rendered even though the worker that started it is a
     different thread whose own queue is already abandoned.
     """
     if cmd.intent == "diagnose":
-        session.task = _diagnose_task(session, cmd.symptom or raw_text, cmd.host)
+        task = _diagnose_task(session, cmd.symptom or raw_text, cmd.host)
     elif cmd.intent == "verify":
         if not cmd.baseline and (session.last_run is None or
                                  not (session.last_run / "dumps.json").exists()):
             _print_line(session, "  no baseline yet: run a diagnosis first "
                                  "(or pass a baseline path)")
             return None
-        session.task = _verify_task(session, cmd.metric, cmd.baseline)
+        task = _verify_task(session, cmd.metric, cmd.baseline)
     elif cmd.intent == "docs":
         if not session.docs_lib and not session.docs_dir:
             _print_line(session, "  no doc library (set --docs-lib / --docs-dir)")
             return None
-        session.task = _docs_task(session, cmd.query or raw_text)
+        task = _docs_task(session, cmd.query or raw_text)
     elif cmd.intent == "status":
         _print_line(session, _status_line(session))
         return None
     else:
-        session.task = _reply_task(session, cmd.text or raw_text)
-    session.task.start()
-    session.task.events.put(("progress",
+        task = _reply_task(session, cmd.text or raw_text)
+    task.start()
+    session.task = task
+    session.task.events.put(("progress", (
         f"started in the background: {session.task.label} -- keep typing "
-        f"(messages queue), /status for progress, /stop to cancel"))
+        f"(messages queue), /status for progress, /stop to cancel")))
     return session.task
 
 
@@ -517,11 +528,10 @@ def _route_task(session: Session, line: str) -> BackgroundTask:
         cmd = route_message(line, session.router_llm, session.transcript[-8:],
                             tuple(session.inv.host_names))
         if cancel.is_set():
-            return None
+            return
         if not _apply_cmd_target(session, cmd):
-            return None  # unresolved target: error already printed
-        _launch(session, cmd, line)
-        return None  # printed-only commands leave a done(None) the REPL drains
+            return  # unresolved target: error already printed
+        _launch(session, cmd, line)  # printed-only: leaves a done(None) for the REPL
 
     return BackgroundTask(label="routing to agent", fn=fn)
 
