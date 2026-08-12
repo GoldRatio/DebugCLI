@@ -909,6 +909,16 @@ def _secrets_entry(args) -> int:
     return run_secrets(args)
 
 
+def run_setup_cmd(args) -> int:
+    """Entry for ``harness setup`` (additive, non-agent credential flow)."""
+    from .setup_cli import SetupError, run_setup
+    try:
+        return run_setup(args, overrides={})
+    except SetupError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
 def run_calibrate(args) -> int:
     """Rebuild per-LLM-ident fix-rate calibration from verified case outcomes.
 
@@ -1234,6 +1244,7 @@ _MAIN_ACTIONS: list[tuple[str, str]] = [
     ("docs", "docs          - manage the RAG document library"),
     ("targets", "targets       - manage short target aliases"),
     ("secrets", "secrets       - register credentials (non-agent, never in prompts)"),
+    ("setup", "setup         - one-time wizard: API key, SSH key, inventory (first machine setup)"),
     ("lint", "lint          - validate this inventory"),
     ("quit", "quit"),
 ]
@@ -1255,6 +1266,7 @@ _ALLOWED_FLAGS: dict[str, tuple[str, ...]] = {
                 "--out-dir", "--session-dir", "--targets-file"),
     "console": ("--secret-dir", "--out-dir", "--targets-file"),
     "verify": ("--secret-dir", "--targets-file"),
+    "setup": ("--secret-dir",),
 }
 
 
@@ -1658,6 +1670,9 @@ def run_menu(args) -> int:
         return 2
     inv = load_inventory(inv_path)
     store = _make_store(args)
+    if not store.keys() and not getattr(inv, "llm", None):
+        print("  hint: nothing registered yet -- pick `setup` to register the "
+              "LLM API key and SSH identity", file=sys.stderr)
     console_default = bool(getattr(args, "console", False))
     print(f"harness menu | inventory: {inv_path} | {len(inv.hosts)} host(s)"
           + (" | console" if console_default else ""))
@@ -1732,6 +1747,9 @@ def run_menu(args) -> int:
                 _menu_targets(args)
             elif key == "secrets":
                 _menu_secrets(args)
+            elif key == "setup":
+                _run_wizard_sub(["setup", "--inventory", str(inv_path)]
+                                + _wizard_flags(args, "setup"))
             elif key == "lint":
                 _run_wizard_sub(["lint", "--inventory", str(inv_path)])
         except KeyboardInterrupt:
@@ -1921,6 +1939,16 @@ def build_parser() -> argparse.ArgumentParser:
     from .secrets_cli import build_secrets_parser as _build_secrets_parser
     _build_secrets_parser(p)
     p.set_defaults(func=_secrets_entry)
+
+    p = sub.add_parser(
+        "setup",
+        help="one-time interactive wizard: LLM API key, SSH key (+generate), "
+             "BMC creds, inventory, vault-path verification")
+    p.add_argument("--inventory", default=None,
+                   help="existing inventory (default: discover / create inventory.yaml)")
+    p.add_argument("--secret-dir", default=None,
+                   help="file-backed secret store dir (default: secrets)")
+    p.set_defaults(func=run_setup_cmd)
 
     p = sub.add_parser("targets", help="manage short target aliases (path-only file)")
     p.add_argument("--targets-file", default="config/targets.yaml",

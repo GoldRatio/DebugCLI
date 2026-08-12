@@ -45,6 +45,39 @@ harness secrets check 10.0.0.50 --secret-dir .\secrets
 SSH-by-IP identity lookup order: `--identity-vault-path` >
 `secret/harness/ssh/<ip>` > `secret/harness/diagbot/id_ed25519`.
 
+## 2b. One-time setup wizard (easier onboarding)
+
+On a fresh machine (e.g. a new laptop), instead of hand-writing
+`inventory.yaml` and registering vaults manually:
+
+```powershell
+harness setup            # interactive; defaults to .\inventory.yaml and .\secrets
+harness setup --inventory .\config\inventory.yaml --secret-dir .\secrets
+```
+
+What it does, in order:
+
+1. **Inventory** — reuses an existing `inventory.yaml` (patches only the `llm:`
+   block, host/BMC sections are left untouched) or creates a minimal one with a
+   `trust_level` prompt.
+2. **LLM API key** — prompts with `getpass` (never echoed), writes the key to
+   `secret/harness/llm/gemini-key`, and adds `provider` / `model` /
+   `api_key_vault_path` to the inventory `llm:` block. (Choose `stub` when no
+   credentials are available yet.)
+3. **SSH identity** — generates a fresh ed25519 pair with `ssh-keygen` if no
+   key exists, otherwise lets you register an existing one; it then prints the
+   `echo "<pub>" >> ~/.ssh/authorized_keys` command to run once from your
+   DIAG remote account. The private key lives under `--secret-dir` (0o600,
+   git-ignored) at `secret/harness/diagbot/id_ed25519` — it is shared by all
+   hosts; per-host keys still win (see lookup order above).
+4. **BMC credentials** (optional) — registers `bmc-ro` password and BMC `sudo`
+   password vaults when your inventory has BMC sections.
+5. **Verification** — resolves every vault path referenced by the inventory and
+   exits 1 if any is missing, printing which ones to register.
+
+Re-running `harness setup` never overwrites an existing SSH key and skips
+vaults that are already registered.
+
 ## 3. Add architecture PDFs to the RAG library
 
 ```powershell

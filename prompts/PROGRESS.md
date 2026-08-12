@@ -153,6 +153,21 @@ API contract (reverse agent): `CaseStore(root).save/record/get/all`; `CaseLibrar
   library outcome+model ranking. Both agents run `python -m pytest tests/unit -q`
   (371 passed) and ruff on touched files.
 
+## Post-prompt product feature: `harness setup` wizard (2026-08-12, reverse)
+
+New machine onboarding in one command: `harness setup [--inventory <file>]
+[--secret-dir <dir>]` walks through inventory creation/patching, LLM API key
+registration (getpass, never echoed), SSH identity setup (generates an ed25519
+pair via `ssh-keygen` when none exists, or registers an existing key file),
+optional BMC/sudo passwords, then verifies EVERY vault path the inventory
+references (exit 1 + listing when any are missing). Also added to the menu:
+`setup` entry + an unconfigured-store hint banner; `_ALLOWED_FLAGS["setup"]`.
+Ownership: `src/harness/operator/setup_cli.py` (NEW), `tests/unit/test_setup.py`
+(10 tests, hermetic via monkeypatch.chdir). `cli.py` edits are additive only:
+`run_setup_cmd`, subparser registrations, one menu action + hint line.
+NOTE: never run the wizard with an un-hermetic CWD in tests — it writes
+`inventory.yaml` relative to CWD.
+
 ## Reverse-agent notes (READ BEFORE MERGING forward 03/04)
 
 Because prompts 03/04 had NOT landed when the reverse agent implemented 05-08, the
