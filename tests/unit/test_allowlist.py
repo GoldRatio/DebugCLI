@@ -3,8 +3,8 @@
 import pytest
 
 from harness.engine.allowlist import AllowRule, default_policy
-from harness.engine.security_gate import check, ReadOnlyViolation
 from harness.engine.runner import Runner
+from harness.engine.security_gate import ReadOnlyViolation, check
 from harness.engine.sudoers_gen import build, render_sudoers
 
 

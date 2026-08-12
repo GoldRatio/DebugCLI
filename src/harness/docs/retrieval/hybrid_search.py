@@ -44,29 +44,45 @@ class HybridRetriever:
         self.chunks = chunks
         self.semantic_weight = semantic_weight
         self.k = k
-        self._stats = _corpus_stats(chunks)
 
-    def query(self, question: str, top_k: int = 5) -> list[Chunk]:
+    def query(self, question: str, top_k: int = 5,
+              platform: str | None = None) -> list[Chunk]:
+        """Rank chunks against ``question``, restricted to ``platform`` when given.
+
+        A chunk is eligible when its ``platforms`` list is empty (platform-
+        neutral knowledge applies everywhere) or contains the requested key.
+        An empty filtered corpus returns []. Stats are computed over the
+        eligible subset so ranking is not skewed by foreign platforms.
+        """
         terms = [t for t in question.lower().split() if len(t) > 2]
+        if platform is not None:
+            wanted = platform.lower()
+            candidates = [c for c in self.chunks
+                          if not c.platforms or wanted in {p.lower() for p in c.platforms}]
+        else:
+            candidates = self.chunks
+        if not candidates:
+            return []
         if not terms:
-            return self.chunks[:top_k]
+            return candidates[:top_k]
+        stats = _corpus_stats(candidates)
 
         # Lexical ranking.
-        lexical = sorted(self.chunks, key=lambda c: bm25_score(terms, c, self._stats), reverse=True)
+        lexical = sorted(candidates, key=lambda c: bm25_score(terms, c, stats), reverse=True)
         lexical_rank = {id(c): i for i, c in enumerate(lexical)}
 
         # Semantic ranking (embedding cosine, when embeddings exist).
         dense_rank: dict[int, int] = {}
-        with_embeds = [c for c in self.chunks if c.embedding]
+        with_embeds = [c for c in candidates if c.embedding]
         if with_embeds:
             qtok = _query_embedding(with_embeds)
             dense = sorted(with_embeds, key=lambda c: cosine(c.embedding, qtok), reverse=True)
             dense_rank = {id(c): i for i, c in enumerate(dense)}
 
         scored = []
-        for c in self.chunks:
-            lr = lexical_rank.get(id(c), len(self.chunks))
-            dr = dense_rank.get(id(c), len(self.chunks))
+        for c in candidates:
+            lr = lexical_rank.get(id(c), len(candidates))
+            dr = dense_rank.get(id(c), len(candidates))
             rrf = (1.0 / (self.k + lr)) + self.semantic_weight * (1.0 / (self.k + dr))
             scored.append((rrf, c))
         scored.sort(key=lambda t: t[0], reverse=True)

@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 
-from .allowlist import AllowRule, AllowPolicy
+from .allowlist import AllowPolicy, AllowRule
 
 
 def _secure_args(rule: AllowRule) -> str:

@@ -32,6 +32,7 @@ class TargetAlias:
     rack: str | None = None
     cable: str | None = None
     address: str | None = None
+    model: str | None = None  # canonical model key (falls back when detection fails)
 
     def __post_init__(self) -> None:
         if not isinstance(self.alias, str):
@@ -54,6 +55,8 @@ class TargetAlias:
             raise AliasError(f"invalid cable {self.cable!r}")
         if self.address is not None and not _IP4.match(self.address):
             raise AliasError(f"invalid address {self.address!r}")
+        if self.model is not None and not _SAFE_VALUE.match(self.model):
+            raise AliasError(f"invalid model {self.model!r}: allowed [A-Za-z0-9._:-]")
         if self.rack is None and self.cable is None and self.address is None:
             raise AliasError(f"alias {self.alias!r} needs --rack/--cable and/or --address")
         if (self.rack is None) != (self.cable is None):
@@ -73,6 +76,7 @@ def load_targets(path: str | Path) -> dict[str, TargetAlias]:
             rack=entry.get("rack"),
             cable=entry.get("cable"),
             address=entry.get("address"),
+            model=entry.get("model"),
         )
         out[alias.alias] = alias
     return out
@@ -82,7 +86,8 @@ def save_targets(path: str | Path, aliases: dict[str, TargetAlias]) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     body = {"targets": [
-        {"alias": a.alias, "rack": a.rack, "cable": a.cable, "address": a.address}
+        {"alias": a.alias, "rack": a.rack, "cable": a.cable, "address": a.address,
+         "model": a.model}
         for a in sorted(aliases.values(), key=lambda a: a.alias)
     ]}
     p.write_text(yaml.safe_dump(body, sort_keys=False), encoding="utf-8")

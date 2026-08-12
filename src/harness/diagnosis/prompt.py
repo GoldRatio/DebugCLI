@@ -47,7 +47,55 @@ SWB CPLD boot-state block: CPU/reset flags at 0x1b, power-sequence FSM at 0xa1),
 weigh current sensors over the SEL history, and state the most likely fault class
 and repair path -- or a clean verdict when nothing is anomalous. If a non-dumped
 register is flagged UNKNOWN, propose the read-only probe that would capture it
-rather than guessing its value."""
+rather than guessing its value.
+
+Prior Verified Cases are observed history from THIS fleet. Use them to weigh
+likelihoods, never as documentation: they MUST NOT be cited as a Reference
+source. If a prior case contradicts the vendor snippets, the snippets and
+catalog win.
+
+The System section is hardware-detected FACT with its source recorded. If you
+believe it is wrong based on the snippets, say so explicitly instead of
+silently assuming a different model."""
+
+def _model_key(model: DetectedModel | None) -> str | None:
+    if model is None or model.product_name == "unknown":
+        return None
+    return model.model_key.lower()
+
+
+def _decode_lines(decoded: list[RegisterDecode], model_key: str | None) -> list[str]:
+    """Register lines with catalog provenance; platform-mismatched decodes are
+    flagged so the LLM distrusts them instead of silently assuming scope."""
+    out: list[str] = []
+    for d in decoded:
+        mismatch = ""
+        if d.platforms and model_key is not None \
+                and model_key not in {p.lower() for p in d.platforms}:
+            mismatch = " [PLATFORM MISMATCH - verify]"
+        out.append(f"- {d.mnemonic} = {d.raw_hex}"
+                   + (f" (UNKNOWN, manual lookup){mismatch}" if d.unknown
+                      else f" [catalog {d.catalog_version}]{mismatch}"))
+        for f in d.decoded_fields:
+            out.append(f"    {f.name}: value={f.raw_value}"
+                       + (f" -> {f.meaning}" if f.meaning else ""))
+    return out
+
+
+def _snippets_section(doc_snippets: list[str], model_key: str | None) -> list[str]:
+    lines = ["## Relevant Architecture Snippets"]
+    lines.extend(doc_snippets or ["(none)"])
+    if doc_snippets:
+        lines.append(f"(retrieved for platform {model_key})" if model_key
+                     else "(retrieved with no platform filter)")
+    return lines
+
+
+def _prior_cases_section(prior_cases: list[str]) -> list[str]:
+    lines = ["## Prior Verified Cases (fleet history, NOT vendor documentation)"]
+    lines.extend(prior_cases or ["(none yet)"])
+    return lines
+
 
 def build_prompt(*,
                  model: DetectedModel | None,
@@ -55,32 +103,37 @@ def build_prompt(*,
                  summaries: EvidenceSummary,
                  doc_snippets: list[str],
                  parts_refs: list[str],
-                 symptom: str) -> str:
+                 symptom: str,
+                 prior_cases: list[str] | None = None) -> str:
+    model_key = _model_key(model)
     lines = [
         SYSTEM_PREAMBLE,
         "",
         "## System",
         f"model={model.product_name if model else 'unknown'}",
+        f"model_source={model.source if model else 'unknown'}",
+    ]
+    if model is None:
+        lines.append("model_note=detection failed; treat register/bit meanings as unverified")
+    lines.extend([
         f"bios_vendor={model.bios_vendor if model else 'unknown'}",
         f"bios_version={model.bios_version if model else 'unknown'}",
+        f"rag_platform_filter={model_key or 'none'}",
         "",
         "## Symptom",
         symptom,
         "",
         "## Decoded Registers",
-    ]
-    for d in decoded:
-        lines.append(f"- {d.mnemonic} = {d.raw_hex}" + (" (UNKNOWN, manual lookup)" if d.unknown else f" [catalog {d.catalog_version}]"))
-        for f in d.decoded_fields:
-            lines.append(f"    {f.name}: value={f.raw_value}" + (f" -> {f.meaning}" if f.meaning else ""))
+    ])
+    lines.extend(_decode_lines(decoded, model_key))
     lines.extend(["", "## Evidence Notes"])
     lines.extend(summaries.notes or ["(none)"])
     lines.extend(["", "## Anomalous Evidence Summary"])
     lines.extend(summaries.interesting or ["(none)"])
-    lines.extend(["", "## Relevant Architecture Snippets"])
-    lines.extend(doc_snippets or ["(none)"])
+    lines.extend(_snippets_section(doc_snippets, model_key))
     lines.extend(["", "## Parts List References"])
     lines.extend(parts_refs or ["(none)"])
+    lines.extend(["", *_prior_cases_section(prior_cases or [])])
     lines.extend([
         "",
         "Produce a Diagnosis. Every Action.rationale must cite a Reference with source and page.",
@@ -124,7 +177,16 @@ Evidence kind rules:
   are nominal and only historical log entries reference past faults (the server is
   fixed); "fault" ONLY when current-state evidence shows a live problem;
   "degraded" for an active non-fatal issue; "unknown" only when evidence is
-  insufficient. The "diagnosis" text must match the chosen state."""
+  insufficient. The "diagnosis" text must match the chosen state.
+
+The System section is hardware-detected FACT with its source recorded. If you
+believe it is wrong based on the snippets, say so explicitly instead of
+silently assuming a different model.
+
+Prior Verified Cases are observed history from THIS fleet. Use them to weigh
+likelihoods, never as documentation: they MUST NOT be cited as a Reference
+source. If a prior case contradicts the vendor snippets, the snippets and
+catalog win."""
 
 TURN_CONTRACT = """Respond with STRICT JSON, exactly one of:
 {"kind": "question", "question": "..."}
@@ -148,31 +210,36 @@ def build_turn_evidence(*,
                         summaries: EvidenceSummary,
                         doc_snippets: list[str],
                         parts_refs: list[str],
-                        conversation: list[str]) -> str:
+                        conversation: list[str],
+                        prior_cases: list[str] | None = None) -> str:
     """User-message block for one session turn: current evidence + conversation."""
+    model_key = _model_key(model)
     lines = [
         "## System",
         f"model={model.product_name if model else 'unknown'}",
+        f"model_source={model.source if model else 'unknown'}",
+    ]
+    if model is None:
+        lines.append("model_note=detection failed; treat register/bit meanings as unverified")
+    lines.extend([
         f"bios_vendor={model.bios_vendor if model else 'unknown'}",
         f"bios_version={model.bios_version if model else 'unknown'}",
+        f"rag_platform_filter={model_key or 'none'}",
         "",
         "## Symptom",
         symptom,
         "",
         "## Decoded Registers",
-    ]
-    for d in decoded:
-        lines.append(f"- {d.mnemonic} = {d.raw_hex}" + (" (UNKNOWN, manual lookup)" if d.unknown else f" [catalog {d.catalog_version}]"))
-        for f in d.decoded_fields:
-            lines.append(f"    {f.name}: value={f.raw_value}" + (f" -> {f.meaning}" if f.meaning else ""))
+    ])
+    lines.extend(_decode_lines(decoded, model_key))
     lines.extend(["", "## Evidence Notes"])
     lines.extend(summaries.notes or ["(none)"])
     lines.extend(["", "## Anomalous Evidence Summary"])
     lines.extend(summaries.interesting or ["(none)"])
-    lines.extend(["", "## Relevant Architecture Snippets"])
-    lines.extend(doc_snippets or ["(none)"])
+    lines.extend(_snippets_section(doc_snippets, model_key))
     lines.extend(["", "## Parts List References"])
     lines.extend(parts_refs or ["(none)"])
+    lines.extend(["", *_prior_cases_section(prior_cases or [])])
     lines.extend(["", "## Conversation So Far"])
     lines.extend(conversation or ["(none yet)"])
     lines.extend(["", TURN_CONTRACT])

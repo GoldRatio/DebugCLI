@@ -11,7 +11,7 @@ import hashlib
 import json
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .redact import Redactor
@@ -48,7 +48,7 @@ class AuditLog:
     def append(self, session_id: str, kind: str, payload: dict) -> AuditEvent:
         with self._lock:
             self._seq += 1
-            ts = datetime.now(timezone.utc).isoformat()
+            ts = datetime.now(UTC).isoformat()
             body = {"session_id": session_id, "seq": self._seq, "ts": ts, "kind": kind,
                     "payload": payload, "prev_hash": self._last_hash}
             # Hash over the canonical body (no hash field), exactly what verify recomputes.

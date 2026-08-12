@@ -21,7 +21,7 @@ from ..engine.runner import Runner
 from ..inspect.base import RegisterDecode, RegisterDump
 from ..inspect.collectors import Collector
 from ..inspect.decoder import Decoder
-from ..inspect.model import DetectedModel, detect_model
+from ..inspect.model import DetectedModel, detect_model, from_alias, from_operator
 from ..plan.profile import plan_collection
 from .parts_validate import PartsCheckResult
 from .prompt import build_prompt
@@ -34,7 +34,7 @@ class EngineContext:
     decoder: Decoder
     collector_factory: Callable[[str, Runner], Collector | None]  # name -> collector (None = skip)
     llm: Callable[[str], Diagnosis]                              # prompt -> validated Diagnosis
-    docs_retriever: Callable[[str], list[str]] | None = None
+    docs_retriever: Callable[[str, str | None], list[str]] | None = None  # query, model_key
     parts_refs: Callable[[], list[str]] | None = None
     parts_validate: Callable[[dict[str, list[RegisterDump]]], PartsCheckResult] | None = None
     scorer: Callable[[Diagnosis, dict[str, list[RegisterDump]]], Diagnosis] | None = None
@@ -42,7 +42,17 @@ class EngineContext:
     dump_callback: Callable[[dict[str, list[RegisterDump]]], None] | None = None
     prompt_callback: Callable[[str], None] | None = None  # audit: exact prompt(s) sent to the LLM
     progress: Callable[[str], None] | None = None  # human-readable step events (UI streaming)
-    model_hook: Callable[[DetectedModel | None], None] | None = None  # audit of detected model
+    model_hook: Callable[[DetectedModel | None, bool], None] | None = None  # audit of detected model + drift
+    model_hint: str | None = None  # canonical key from target alias / inventory (fallback only)
+    model_ask: Callable[[], str | None] | None = None  # optional, non-blocking operator fallback
+    case_library: Callable[[str, str | None], list[str]] | None = None  # symptom, model_key -> prior-case lines
+    # Prompt 05 contract (optional field only): outcome-fed subsystem priors.
+    # None keeps the static heuristic table (plan_collection/classify).
+    priors: object | None = None  # plan.subsystem.PriorModel | None (lazy import)
+    # Prompt 06 contract (optional field only): which model produced the diagnosis
+    # and where its fix-rate calibration lives. Missing store -> 0.5, never an error.
+    llm_ident: Callable[[], str] | None = None
+    calibration_root: str | None = None
 
 
 def prebatch_console_plan(ctx: EngineContext, plan, collectors) -> None:
@@ -80,6 +90,35 @@ def prebatch_console_plan(ctx: EngineContext, plan, collectors) -> None:
         ctx.runner.batch_execute(ordered)
 
 
+def detect_with_fallback(runner: Runner,
+                         model_hint: str | None = None,
+                         model_ask: Callable[[], str | None] | None = None
+                         ) -> tuple[DetectedModel | None, bool]:
+    """Fallback chain: live detection -> alias hint -> operator question.
+
+    Returns ``(model, drifted)``; ``drifted`` is True when a live detection
+    disagrees with the alias hint (a hardware swap under us) and the live
+    value is authoritative. Shared by the single-shot and session engines so
+    both always know how the model was learned.
+    """
+    model = detect_model(runner)
+    if model is not None and model_hint:
+        drifted = model.model_key.lower() != model_hint.strip().lower()
+        return model, drifted
+    if model is not None:
+        return model, False
+    if model_hint:
+        return from_alias(model_hint), False
+    if model_ask is not None:
+        try:
+            name = model_ask()
+        except Exception:  # noqa: BLE001 - a failed question is a skip, never fatal
+            name = None
+        if name:
+            return from_operator(name), False
+    return None, False
+
+
 class DiagnosticEngine:
     def __init__(self, ctx: EngineContext) -> None:
         self.ctx = ctx
@@ -88,13 +127,27 @@ class DiagnosticEngine:
         _step = self.ctx.supervisor or (lambda _label: None)
         _emit = self.ctx.progress or (lambda _text: None)
 
+        # Model facts FIRST: detection (dmidecode/FRU) -> alias hint -> optional
+        # operator fallback. Everything downstream (retrieval filter, prompt,
+        # case library) is model-consistent because it always knows the source.
+        model, model_drifted = self._detect_model()
+        if self.ctx.model_hook is not None:
+            self.ctx.model_hook(model, model_drifted)
+        model_key = model.model_key if model is not None else None
+        if model is None:
+            _emit("model=unknown (detection failed; no alias hint)")
+        elif model_drifted:
+            _emit(f"model={model.model_key} (differs from alias hint "
+                  f"{self.ctx.model_hint!r}; detected value wins)")
+
         # 0. Retrieve docs FIRST so doc-named probes join the plan (the heuristic
         # cannot know which registers a failure mode needs). Reused for the prompt.
-        snippets = self.ctx.docs_retriever(symptom) if self.ctx.docs_retriever else []
+        snippets = (self.ctx.docs_retriever(symptom, model_key)
+                    if self.ctx.docs_retriever else [])
         _step("retrieve")
         _emit(f"retrieve: {len(snippets)} doc snippet(s)")
 
-        plan = plan_collection(symptom, snippets)
+        plan = plan_collection(symptom, snippets, priors=self.ctx.priors)
         _step("plan")
         _emit(f"plan: {len(plan.collectors)} collector(s), "
               f"{len(plan.doc_probes)} doc-named probe(s), "
@@ -108,10 +161,6 @@ class DiagnosticEngine:
             is not None
         ]
         prebatch_console_plan(self.ctx, plan, collectors)
-
-        model = detect_model(self.ctx.runner)
-        if self.ctx.model_hook is not None:
-            self.ctx.model_hook(model)
 
         # 1. Collect the minimal targetted set for the primary subsystem.
         dump_sets: dict[str, list[RegisterDump]] = {}
@@ -140,6 +189,8 @@ class DiagnosticEngine:
         parts = self.ctx.parts_refs() if self.ctx.parts_refs else []
 
         # 5. Build prompt and call the LLM.
+        prior_cases = (self.ctx.case_library(symptom, model_key)
+                       if self.ctx.case_library else None)
         prompt = build_prompt(
             model=model,
             decoded=decoded,
@@ -147,6 +198,7 @@ class DiagnosticEngine:
             doc_snippets=snippets,
             parts_refs=parts,
             symptom=symptom,
+            prior_cases=prior_cases,
         )
         if self.ctx.prompt_callback is not None:
             self.ctx.prompt_callback(prompt)
@@ -166,6 +218,10 @@ class DiagnosticEngine:
             diagnosis = self.ctx.scorer(diagnosis, dump_sets)
         _emit(f"score: confidence {diagnosis.confidence:.2f}")
         return diagnosis
+
+    def _detect_model(self) -> tuple[DetectedModel | None, bool]:
+        return detect_with_fallback(self.ctx.runner, self.ctx.model_hint,
+                                    self.ctx.model_ask)
 
     def _decode_all(self, dump_sets: dict[str, list[RegisterDump]]):
         return decode_dumps(

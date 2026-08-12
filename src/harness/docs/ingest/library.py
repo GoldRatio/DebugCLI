@@ -60,6 +60,7 @@ class DocEntry:
     chunks: int
     ingested_at: str
     error: str | None = None
+    platform: str | None = None
 
 
 def _sha256(path: Path) -> str:
@@ -116,13 +117,19 @@ class DocLibrary:
         with tmp.open("w", encoding="utf-8") as fh:
             for c in chunks:
                 fh.write(json.dumps({"text": c.text, "title": c.title,
-                                     "page": c.page, "index": c.index}) + "\n")
+                                     "page": c.page, "index": c.index,
+                                     "platforms": c.platforms}) + "\n")
         tmp.replace(self.chunks_path)
 
     # ---- operations ----
 
-    def add(self, files: list[str | Path]) -> list[str]:
-        """Upload documents into the library and index them. Returns status lines."""
+    def add(self, files: list[str | Path], platform: str | None = None) -> list[str]:
+        """Upload documents into the library and index them. Returns status lines.
+
+        ``platform`` tags every chunk of those documents with a canonical model
+        key so retrieval can be filtered to the detected server model. None
+        leaves the documents untagged (platform-neutral knowledge).
+        """
         self.root.mkdir(parents=True, exist_ok=True)
         self.pdfs_dir.mkdir(parents=True, exist_ok=True)
         manifest = self._manifest()
@@ -145,17 +152,19 @@ class DocLibrary:
                 status.append(f"unchanged {src.name} (already indexed)")
                 continue
             shutil.copy2(src, self.pdfs_dir / src.name)
-            chunks, error = self._parse_doc(src.name)
+            chunks, error = self._parse_doc(src.name, platform)
             if error:
                 manifest[src.name] = {
                     "sha256": digest, "size": src.stat().st_size,
                     "chunks": 0, "ingested_at": _now(), "error": error,
+                    "platform": platform,
                 }
                 status.append(f"FAILED {src.name}: {error}")
             else:
                 manifest[src.name] = {
                     "sha256": digest, "size": src.stat().st_size,
                     "chunks": len(chunks), "ingested_at": _now(),
+                    "platform": platform,
                 }
                 self._save_chunks(self._all_chunks(manifest))
                 status.append(f"indexed {src.name}: {len(chunks)} chunk(s)")
@@ -224,7 +233,7 @@ class DocLibrary:
 
     # ---- internals ----
 
-    def _parse_doc(self, name: str) -> tuple[list[Chunk], str | None]:
+    def _parse_doc(self, name: str, platform: str | None = None) -> tuple[list[Chunk], str | None]:
         """Parse any supported source file (PDF / markdown / text / CSV) into chunks."""
         path = self.pdfs_dir / name
         try:
@@ -232,6 +241,9 @@ class DocLibrary:
         except Exception as exc:  # noqa: BLE001 - record per-file, never fatal
             return [], str(exc)
         chunks = Chunker(CharTokenizer()).chunk_pages(pages, title=name)
+        if platform:
+            for chunk in chunks:
+                chunk.platforms = [platform]
         return chunks, None
 
     def _pages(self, path: Path) -> list[PageText]:
@@ -243,7 +255,7 @@ class DocLibrary:
         for name, entry in manifest.items():
             if entry.get("error"):
                 continue
-            parsed, error = self._parse_doc(name)
+            parsed, error = self._parse_doc(name, entry.get("platform"))
             if error or not parsed:
                 continue
             chunks.extend(parsed)

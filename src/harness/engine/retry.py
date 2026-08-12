@@ -7,9 +7,9 @@ but we still only retry when the target explicitly allows it).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import random
 import time
+from dataclasses import dataclass
 
 from .runner import CommandResult, Runner
 
@@ -30,7 +30,7 @@ class RetryExecutor:
         "dmesg", "lsblk", "lsmod",
     })
 
-    def __init__(self, runner: "Runner", policy: RetryPolicy | None = None) -> None:
+    def __init__(self, runner: Runner, policy: RetryPolicy | None = None) -> None:
         self.runner = runner
         self.policy = policy or RetryPolicy()
 

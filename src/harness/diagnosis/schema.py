@@ -70,6 +70,10 @@ class ConfidenceBreakdown(BaseModel):
     evidence_fit: float = 0.0
     model_agreement: float = 0.0
     penalty: float = 0.0
+    calibration_llm: str | None = None  # LLM ident whose calibration resolved model_agreement
+
+
+CaseOutcomeValues = Literal["fixed", "partial", "not_fixed", "inconclusive", "unknown"]
 
 
 class Diagnosis(BaseModel):
@@ -99,3 +103,44 @@ class TurnResponse(BaseModel):
     subsystems: list[str] = Field(default_factory=list)
     doc_topics: list[str] = Field(default_factory=list)
     diagnosis: Diagnosis | None = None
+
+
+OUTCOMES = ("fixed", "partial", "not_fixed", "inconclusive", "unknown")
+
+
+class CaseOutcome(BaseModel):
+    """Append-only record of ONE diagnosis run and its verified outcome.
+
+    This is the fleet-learning loop's ground truth: only records with
+    ``outcome`` in ("fixed", "partial", "not_fixed") count as verified
+    (``inconclusive``/``unknown`` are unverified). ``llm_ident`` records WHICH
+    model produced the diagnosis so calibration stays per-model (swap-safe).
+    Written once via ``CaseStore``; nothing here is ever overwritten.
+    """
+
+    schema_version: int = 1
+    run_id: str
+    target_id: str
+    model_key: str | None = None
+    model_source: str | None = None
+    symptom: str
+    subsystem_primary: str | None = None
+    actions_recommended: list[str] = Field(default_factory=list)
+    actions_taken: list[str] = Field(default_factory=list)
+    outcome: Literal["fixed", "partial", "not_fixed", "inconclusive", "unknown"] = "unknown"
+    verification_verdict: str | None = None
+    verification_delta: dict = Field(default_factory=dict)
+    llm_ident: str = "stub"
+    evidence_hash: str = ""
+    created_at: str = ""
+    # Prompt 07 contract (optional; replay builds deterministic evidence blocks):
+    evidence_summary: list[str] = Field(default_factory=list)
+    cited_titles: list[str] = Field(default_factory=list)
+    # Prompt 06 contract (optional): the diagnosis confidence at report time;
+    # the per-bin predicted value calibration bins against.
+    confidence: float | None = None
+
+    @property
+    def verified(self) -> bool:
+        """True when the outcome carries verified signal (not inconclusive/unknown)."""
+        return self.outcome in ("fixed", "partial", "not_fixed")

@@ -26,15 +26,18 @@ class CollectionPlan:
         return self.subsystem_order[0].subsystem if self.subsystem_order else None
 
 
-def plan_collection(symptom_text: str, doc_snippets: list[str] | None = None) -> CollectionPlan:
+def plan_collection(symptom_text: str, doc_snippets: list[str] | None = None,
+                    priors: object | None = None) -> CollectionPlan:
     """Return the minimal ordered collector set for the classified subsystem(s).
 
     If a clear primary subsystem exists, collect only that profile's collectors and
     defer the rest (differential keeps them in ``subsystem_order`` for later). If
     ambiguous (generic), fall back to the broad set. ``doc_snippets`` are mined for
     probe commands the docs name; each is probe-gate validated before it joins the plan.
+    ``priors`` optionally re-weights keyword hits (Prompt 05); when None the static
+    heuristic table alone decides.
     """
-    ranking = classify_subsystems(symptom_text)
+    ranking = classify_subsystems(symptom_text, priors)
     primary = ranking[0].subsystem if ranking else "generic"
     if primary == "generic" or primary not in PROFILE_COLLECTORS:
         collectors = PROFILE_COLLECTORS["generic"]
@@ -45,6 +48,6 @@ def plan_collection(symptom_text: str, doc_snippets: list[str] | None = None) ->
                           doc_probes=doc_probes)
 
 
-def classify_subsystems(text: str) -> list[SubsystemRanking]:
+def classify_subsystems(text: str, priors: object | None = None) -> list[SubsystemRanking]:
     from .subsystem import classify
-    return classify(text)
+    return classify(text, priors)

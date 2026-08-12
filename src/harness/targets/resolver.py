@@ -53,6 +53,7 @@ class Target:
     host: Host
     console: ConsoleDomain | None = None
     ip: str | None = None
+    model_hint: str | None = None  # canonical model key from a target alias
 
 
 def _dummy_bmc() -> BMCDomain:
@@ -173,10 +174,13 @@ def resolve_target(
             raise TargetError(
                 f"unknown target alias {spec.alias!r} (see 'harness targets ls'; "
                 f"file: {targets_path or 'none'})")
+        alias_model = entry.model
         if entry.address is not None:
             spec = TargetSpec(ip=entry.address)
         else:
             spec = TargetSpec(rack=entry.rack, cable=entry.cable)
+    else:
+        alias_model = None
 
     if spec.rack is not None and spec.cable is not None:
         console = _console_domain(inv, spec.rack, spec.cable)
@@ -184,6 +188,7 @@ def resolve_target(
         return Target(
             kind="console", label=label, trust_level=console.trust_level,
             host=_synthetic_console_host(label, console), console=console,
+            model_hint=alias_model,
         )
 
     if spec.ip is not None:
@@ -193,6 +198,7 @@ def resolve_target(
         return Target(
             kind="ssh", label=spec.ip, trust_level=inv.trust_level,
             host=_synthetic_ssh_host(spec.ip, ssh, inv.trust_level), ip=spec.ip,
+            model_hint=alias_model,
         )
 
     raise TargetError(

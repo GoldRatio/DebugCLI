@@ -15,8 +15,8 @@ import paramiko
 
 from ..config.models import Host
 from ..config.vault import SecretStore, load_key_material
-from .runner import Runner, CommandResult
 from .allowlist import AllowPolicy
+from .runner import CommandResult, Runner
 
 
 class HostKeyMismatch(RuntimeError):
@@ -66,7 +66,7 @@ class SSHSession(Runner):
             self._client.close()
             self._client = None
 
-    def __enter__(self) -> "SSHSession":
+    def __enter__(self) -> SSHSession:
         self.open()
         return self
 

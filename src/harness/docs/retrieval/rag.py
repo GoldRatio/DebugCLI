@@ -25,9 +25,11 @@ class RagPipeline:
     def __init__(self, retriever: HybridRetriever) -> None:
         self.retriever = retriever
 
-    def retrieve(self, query: str, top_k: int = 5) -> list[CitedSnippet]:
-        chunks = self.retriever.query(query, top_k=top_k)
+    def retrieve(self, query: str, top_k: int = 5,
+                 platform: str | None = None) -> list[CitedSnippet]:
+        chunks = self.retriever.query(query, top_k=top_k, platform=platform)
         return [CitedSnippet(text=c.text, title=c.title, page=c.page) for c in chunks]
 
-    def lines(self, query: str, top_k: int = 5) -> list[str]:
-        return [s.as_line() for s in self.retrieve(query, top_k)]
+    def lines(self, query: str, top_k: int = 5,
+              platform: str | None = None) -> list[str]:
+        return [s.as_line() for s in self.retrieve(query, top_k, platform)]

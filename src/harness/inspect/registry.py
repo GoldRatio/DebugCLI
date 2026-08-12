@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from .collectors import Collector
 from .collectors.cpu_msr import CpuMsrCollector
-from .collectors.pcie import PcieCollector
 from .collectors.ipmi import IpmiCollector
 from .collectors.kernel import KernelCollector
+from .collectors.pcie import PcieCollector
 from .collectors.storage import StorageCollector
 
 _COLLECTORS: dict[str, type[Collector]] = {

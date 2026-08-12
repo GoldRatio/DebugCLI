@@ -141,6 +141,7 @@ _NON_DOC_SOURCES = frozenset({
     "evidence notes", "symptom", "anomalous evidence summary",
     "decoded registers", "relevant architecture snippets",
     "parts list references", "conversation so far", "system",
+    "prior verified cases",
 })
 
 
@@ -151,7 +152,9 @@ def _is_doc_ref(ref) -> bool:
 def score_diagnosis(diagnosis: Diagnosis, *,
                     retrieved_snippets: list[str] | None = None,
                     evidence_fit: float | None = None,
-                    model_agreement: float = 0.5) -> Diagnosis:
+                    model_agreement: float | None = None,
+                    calibration_root=None,
+                    llm_ident: str | None = None) -> Diagnosis:
     """Compute the transparent confidence breakdown from the actual run data.
 
     ``retrieval_citation_support`` = fraction of the diagnosis's cited references
@@ -170,9 +173,20 @@ def score_diagnosis(diagnosis: Diagnosis, *,
     ``evidence_fit`` defaults to the fraction of decoded registers that are known
     (not flagged unknown); 0.3 when the run produced no decoded registers at all.
 
+    ``model_agreement`` (prompt 06): None resolves through the calibration store
+    at ``calibration_root`` for ``llm_ident`` using the primary subsystem;
+    any failure resolves to the historical 0.5 default (never an exception to
+    callers). ``ConfidenceBreakdown.calibration_llm`` records which ident the
+    agreement came from (None when uncalibrated).
+
     Penalties: unknown registers (0.1 each, capped at 0.3) and an empty action
     list (0.05).
     """
+    if model_agreement is None:
+        model_agreement, calibration_llm = _resolved_agreement(
+            diagnosis, calibration_root, llm_ident)
+    else:
+        calibration_llm = None
     support = 0.0
     weights = dict(WEIGHTS)
     if retrieved_snippets:
@@ -221,4 +235,37 @@ def score_diagnosis(diagnosis: Diagnosis, *,
         model_agreement=model_agreement,
         penalty=penalty,
     )
+    breakdown.calibration_llm = calibration_llm
     return apply_to(diagnosis, breakdown, weights)
+
+
+def _resolved_agreement(diagnosis: Diagnosis, calibration_root,
+                        llm_ident: str | None) -> tuple[float, str | None]:
+    """Calibrated ``model_agreement`` via the per-ident fix-rate store.
+
+    Never raises: any failure (missing store, unknown ident, unreadable file)
+    resolves to the historical 0.5 default with ``calibration_llm=None``.
+    A calibration store is only consulted when its directory already exists
+    (a diagnose run must never CREATE calibration data). The primary subsystem
+    (``subsystems_considered[0]``) selects the subsystem histogram; unknown
+    subsystems fall back to the aggregate bin.
+    """
+    if calibration_root is None:
+        return 0.5, None
+    try:
+        from pathlib import Path
+        if not Path(calibration_root).is_dir():
+            return 0.5, None
+        from .calibration import CalibrationStore, agreement_for
+        ident = llm_ident or "stub"
+        cal = CalibrationStore(calibration_root).load(ident)
+        if cal is None:
+            return 0.5, None
+        primary = None
+        if diagnosis.subsystems_considered:
+            primary = diagnosis.subsystems_considered[0].value
+        agreement = agreement_for(
+            cal, diagnosis.confidence if diagnosis.confidence else 0.5, primary)
+        return agreement, ident
+    except Exception:  # noqa: BLE001 - calibration must never break scoring
+        return 0.5, None

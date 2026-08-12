@@ -3,14 +3,18 @@
 After a human approves and applies an action, rerun the relevant collectors and
 compare error counters to confirm the fix (or detect no-progress). Returns a verdict
 so the ticket can be closed or escalated. Never takes actions itself.
+``record`` closes the learning loop: a verified outcome is persisted to the case
+store (append-only) and hash-linked into the audit chain.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from ..inspect.base import RegisterDump
 from ..inspect.decoder import Decoder
+from .schema import CaseOutcome
 
 
 @dataclass
@@ -44,6 +48,21 @@ class Verifier:
             after=after_counts,
             delta=delta,
         )
+
+    def record(self, case: CaseOutcome, store, *,
+               audit=None, session_id: str | None = None) -> Path:
+        """Persist a verified outcome exactly once (WORM) + audit linkage.
+
+        ``store`` is a ``CaseStore`` (its ``record`` appends the audit entry
+        whose hash covers the record bytes). A missing ``evidence_hash`` is
+        derived deterministically from ``evidence_summary`` so identical
+        evidence fingerprints identically across runs.
+        """
+        if not case.evidence_hash:
+            from .case_store import evidence_hash
+            case.evidence_hash = evidence_hash(case.evidence_summary)
+        return store.record(case, audit=audit,
+                            session_id=session_id or case.run_id)
 
     @staticmethod
     def _metric(raw: str, key: str) -> int:

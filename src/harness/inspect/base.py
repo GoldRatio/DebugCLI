@@ -8,7 +8,7 @@ human-readable fields with bit ranges and meanings.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 
 @dataclass
@@ -17,7 +17,7 @@ class RegisterDump:
     source: str                      # e.g. "rdmsr -a", "ipmitool sensor"
     raw: str
     cmd_argv: list[str]
-    ts: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    ts: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     ok: bool = True
     meta: dict = field(default_factory=dict)
 
@@ -46,3 +46,4 @@ class RegisterDecode:
     catalog_version: str | None = None
     page_ref: str | None = None
     unknown: bool = False            # True when catalog has no entry -> flag, don't guess
+    platforms: list[str] = field(default_factory=list)  # catalog scope, empty = any

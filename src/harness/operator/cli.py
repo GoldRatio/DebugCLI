@@ -54,6 +54,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shlex
 import sys
@@ -160,6 +161,25 @@ def _resolve_llm(args, inv: Inventory, store: SecretStore) -> object:
     return OpenAICompatLLM(url=url, api_key=api_key, model=model, timeout=timeout)
 
 
+def _llm_ident_for(args, inv: Inventory) -> str:
+    """Stable identity of the resolved LLM backend (calibration key).
+
+    Matches ``_resolve_llm`` resolution order; e.g. ``stub``,
+    ``openai/gpt-4o`` or ``gemini/gemini-2.5-flash``. The ident is what the
+    per-model calibration store is keyed on -- it must not change for the same
+    configured model, or calibration silently goes inactive (0.5).
+    """
+    provider = args.llm or (inv.llm.provider if inv.llm else None) or "openai"
+    if provider == "stub":
+        return "stub"
+    model = inv.llm.model if inv.llm is not None and inv.llm.model else None
+    if not model:
+        env_model = os.environ.get("HARNESS_LLM_MODEL")
+        model = env_model or ("gemini-2.5-flash" if provider == "gemini"
+                              else "harness-diag")
+    return f"{provider}/{model}"
+
+
 def _console_overrides(domain: ConsoleDomain, args) -> ConsoleDomain:
     """Per-launch console selection: rack manager console (address), rack id and
     cable are chosen at each launch and layered over the inventory defaults.
@@ -223,7 +243,7 @@ def _build_retriever(docs_dir: str | None):
               file=sys.stderr)
         return None
     rag = RagPipeline(HybridRetriever(chunks))
-    return lambda query: rag.lines(query, top_k=5)
+    return lambda query, model_key: rag.lines(query, top_k=5, platform=model_key)
 
 
 def _build_docs_retriever(args):
@@ -252,7 +272,8 @@ def _build_docs_retriever(args):
             return None, None
         total = sum(e.chunks for e in library.entries())
         print(f"  [docs] using library {lib_dir!r}: {total} chunk(s)", file=sys.stderr)
-        return lambda query: rag.lines(query, top_k=5), lib_dir
+        return (lambda query, model_key: rag.lines(query, top_k=5,
+                                                   platform=model_key)), lib_dir
     if docs_dir:
         return _build_retriever(docs_dir), None
     print("  [docs] proceeding without RAG (run 'harness docs add' or pass --docs-lib)",
@@ -337,6 +358,69 @@ def _save_prompt(out: Path, content: str, session_mode: bool) -> None:
         (out / "prompt.txt").write_text(content, encoding="utf-8")
 
 
+def _seat_pending_case(out: Path, diagnosis: Diagnosis, target_label: str,
+                       ident: str, symptom: str, session_id: str) -> None:
+    """Seed ``pending_case.json`` (outcome="unknown") in a run dir.
+
+    ``harness report`` fills this base instead of inventing a record from
+    artifacts, so actions_taken/outcome are added to (never overwrite) what the
+    run itself observed. Deterministic pieces the learning loop needs are
+    pre-computed here: evidence_hash over the collected dumps, the decoded
+    register lines (~ evidence block), and the cited doc titles.
+    """
+    from ..diagnosis.schema import CaseOutcome
+
+    evidence_lines = [
+        f"- {d.get('mnemonic', '?')} = {d.get('raw_hex', '?')}"
+        for d in diagnosis.evidence if isinstance(d, dict)]
+    cited = list(dict.fromkeys(
+        r.get("source", "") for r in diagnosis.references
+        if r.get("source")))
+    for action in diagnosis.actions:
+        for r in action.references:
+            if r.get("source"):
+                cited.append(r.get("source", ""))
+    cited = [s for s in dict.fromkeys(cited) if _is_doc_source(s)]
+    pending = CaseOutcome(
+        run_id=session_id,
+        target_id=target_label,
+        model_key=None,  # filled at report time from audit; unknown here is honest
+        model_source=None,
+        symptom=symptom,
+        subsystem_primary=(
+            diagnosis.subsystems_considered[0].value
+            if diagnosis.subsystems_considered else None),
+        actions_recommended=[f"{a.step}. {a.action}" for a in diagnosis.actions],
+        outcome="unknown",
+        llm_ident=ident,
+        evidence_hash=_evidence_hash(out / "dumps.json"),
+        evidence_summary=evidence_lines,
+        cited_titles=cited,
+        confidence=diagnosis.confidence,
+    )
+    (out / "pending_case.json").write_text(
+        pending.model_dump_json(indent=2), encoding="utf-8")
+
+
+def _is_doc_source(source: str) -> bool:
+    from ..diagnosis.scorer import _NON_DOC_SOURCES
+    return source.strip().lower() not in _NON_DOC_SOURCES
+
+
+def _evidence_hash(dumps_path: Path) -> str:
+    """sha256 over the canonical JSON of the collected RegisterDumps."""
+    import hashlib
+
+    if not dumps_path.exists():
+        return ""
+    try:
+        dumps = json.loads(dumps_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return ""
+    canonical = json.dumps(dumps, sort_keys=True, indent=2)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _audit_commands(log: AuditLog, trace: SessionTrace, runner) -> None:
     for call in runner.calls:
         trace.record_command(call.argv, call.exit_code, call.elapsed_ms,
@@ -385,8 +469,11 @@ def run_docs(args) -> int:
     lib = DocLibrary(args.lib)
     action = args.docs_action
     if action == "add":
-        for line in lib.add(args.files):
+        platform = getattr(args, "platform", None)
+        for line in lib.add(args.files, platform=platform):
             print(line)
+        if platform:
+            print(f"  tagged {len(args.files)} document(s) as platform={platform}")
     elif action == "reindex":
         for line in lib.reindex():
             print(line)
@@ -402,9 +489,10 @@ def run_docs(args) -> int:
             print(f"(empty library at {args.lib!r})")
             return 0
         for e in entries:
+            platform = f"  platform={e.platform}" if e.platform else ""
             suffix = f"  ERROR: {e.error}" if e.error else ""
             print(f"{e.name}  sha256={e.sha256[:12]}  {e.chunks} chunk(s)  "
-                  f"{e.ingested_at}{suffix}")
+                  f"{e.ingested_at}{platform}{suffix}")
     return 0
 
 
@@ -424,6 +512,41 @@ def _probe_line(res: CommandResult) -> str:
     outcome = "ok" if res.ok else f"exit {res.exit_code}"
     elapsed = f"{res.elapsed_ms / 1000:.1f}s" if res.elapsed_ms else ""
     return f"{cmd} -> {outcome} {elapsed}"
+
+
+def _audit_model(log: AuditLog, trace: SessionTrace, model, drifted: bool,
+                 progress: Callable[[str], None]) -> None:
+    """Audit the detected model and surface alias drift to the operator."""
+    if model is None:
+        log.append(trace.session_id, "model_detected", {"model": None,
+                                                        "drifted_from_hint": False})
+        return
+    log.append(trace.session_id, "model_detected", {
+        "model": model.model_key, "product_name": model.product_name,
+        "bios_vendor": model.bios_vendor, "bios_version": model.bios_version,
+        "source": model.source, "drifted_from_hint": drifted,
+    })
+    if drifted:
+        progress(f"model={model.model_key} (alias drift: detected value wins)")
+
+
+def _build_case_retriever(out_dir: str | Path):
+    """Verified-fleet-history hook: symptom, model_key -> prior-case prompt lines.
+
+    Returns None when no case records exist yet (a fresh fleet learns nothing
+    before its first outcome is recorded -- by design).
+    """
+    try:
+        from ..diagnosis.case_library import CaseLibrary, render
+        from ..diagnosis.case_store import CaseStore
+    except ImportError:
+        return None
+    store = CaseStore(Path(out_dir) / "cases")
+    if not store.all():
+        return None
+    lib = CaseLibrary(store)
+    return lambda symptom, model_key: render(
+        lib.similar(symptom, model_key, top_k=5))
 
 
 def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
@@ -464,6 +587,20 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
     docs_lib_used = None
     if retriever is None:
         retriever, docs_lib_used = _build_docs_retriever(args)
+
+    # Optional operator fallback when model detection fails: only in
+    # interactive runs; one-shot/automated paths never block on the question.
+    model_ask = None
+    if getattr(args, "interactive", False):
+        def _ask_model() -> str | None:
+            try:
+                answer = input(
+                    "Model not detected. Enter product name "
+                    "(Enter to skip): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return None
+            return answer or None
+        model_ask = _ask_model
 
     log = AuditLog(out / "audit.jsonl", Redactor(secrets))
     log.append(trace.session_id, "run_start", {
@@ -536,6 +673,8 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
         return make_collector(name, _runner)
 
     llm = overrides.get("llm") or _resolve_llm(args, inv, store)
+    calibration_root = Path(args.out_dir) / "calibration"
+    ident = _llm_ident_for(args, inv)
 
     ctx = EngineContext(
         runner=runner,
@@ -552,10 +691,14 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
         scorer=(
             lambda d, dump_sets: score_diagnosis(
                 d,
-                retrieved_snippets=retriever(args.symptom) if retriever else None,
+                retrieved_snippets=(
+                    retriever(args.symptom, None) if retriever else None
+                ),
                 evidence_fit=(
                     None if d.evidence else evidence_fit_from_dumps(d, dump_sets)
                 ),
+                calibration_root=calibration_root,
+                llm_ident=ident,
             )
         ),
         supervisor=_step,
@@ -563,12 +706,17 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
         prompt_callback=lambda content: _save_prompt(out, content, session_mode),
         progress=progress,
         model_hook=(
-            lambda model: log.append(trace.session_id, "model_detected", {
-                "model": model.model_key if model is not None else None,
-                "product_name": model.product_name if model is not None else None,
-                "bios_vendor": model.bios_vendor if model is not None else None,
-            })
+            lambda model, drifted: _audit_model(log, trace, model, drifted,
+                                                progress)
         ),
+        model_hint=(
+            target.model_hint
+            or (host.model if host.model not in ("", "unknown") else None)
+        ),
+        model_ask=model_ask,
+        llm_ident=lambda: ident,
+        calibration_root=str(calibration_root),
+        priors=_load_priors(args.out_dir),
     )
     if session_mode:
         engine = SessionEngine(
@@ -600,6 +748,13 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
         else:
             decision = ApprovalDecision(action=action, approved=False, note="not prompted")
         gate.record(decision, trace.session_id, log)
+
+    _seat_pending_case(out, diagnosis, target.label, ident, args.symptom,
+                       trace.session_id)
+    print(f"\npending case: {out / 'pending_case.json'}")
+    print("close the learning loop after the repair with:")
+    print(f"  harness report --run {trace.session_id} --outcome fixed "
+          f"[--taken \"...\"]")
 
     _print_diagnosis(diagnosis, out, trace.session_id)
     return diagnosis
@@ -716,7 +871,8 @@ def run_targets(args) -> int:
     if args.target_action == "add":
         try:
             entry = TargetAlias(alias=args.alias, rack=args.rack,
-                                cable=args.cable, address=args.address)
+                                cable=args.cable, address=args.address,
+                                model=getattr(args, "model", None))
         except AliasError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
@@ -724,6 +880,8 @@ def run_targets(args) -> int:
         save_targets(path, aliases)
         where = entry.address or f"{entry.rack}-cable{entry.cable}"
         print(f"added target {entry.alias!r} -> {where} ({path})")
+        if entry.model:
+            print(f"  model: {entry.model} (fallback when detection fails)")
         return 0
     if args.target_action == "ls":
         if not aliases:
@@ -732,7 +890,8 @@ def run_targets(args) -> int:
         for alias in sorted(aliases):
             e = aliases[alias]
             where = e.address or (f"rack {e.rack}, cable {e.cable}" if e.rack else "-")
-            print(f"{alias}  {where}")
+            extra = f"  model={e.model}" if e.model else ""
+            print(f"{alias}  {where}{extra}")
         return 0
     if args.target_action == "rm":
         if args.alias not in aliases:
@@ -748,6 +907,315 @@ def run_targets(args) -> int:
 def _secrets_entry(args) -> int:
     from .secrets_cli import run_secrets
     return run_secrets(args)
+
+
+def run_calibrate(args) -> int:
+    """Rebuild per-LLM-ident fix-rate calibration from verified case outcomes.
+
+    ``harness calibrate --cases <dir> [--llm <ident>] [--out <dir>]`` -- loads
+    the case store, builds a histogram per ident (or the given one) and saves it
+    to the calibration store (default <out-dir>/calibration). Each model
+    calibrates from ITS OWN recorded outcomes, so a model swap never inherits
+    another model's calibration.
+    """
+    from ..diagnosis.calibration import CalibrationStore, build_calibration
+    from ..diagnosis.case_store import CaseStore
+
+    store = CaseStore(args.cases)
+    cases = store.all()
+    if not cases:
+        print("no case records found; run 'harness report' after diagnoses",
+              file=sys.stderr)
+        return 1
+    idents = [args.llm] if args.llm else sorted({c.llm_ident for c in cases})
+    out = CalibrationStore(args.out)
+    built = 0
+    for ident in idents:
+        cal = build_calibration(cases, ident)
+        if cal is None:
+            print(f"{ident}: insufficient verified cases for {ident!r} "
+                  f"(need >=3) -- calibration stays inactive (0.5 fallback)")
+            continue
+        out.save(cal)
+        built += 1
+        print(f"{ident}: {cal.total_samples()} verified case(s), "
+              f"created {cal.created_at}")
+        _print_calibration_tables(cal)
+    if built == 0:
+        print("no calibration written (insufficient verified outcomes)",
+              file=sys.stderr)
+        return 1
+    print(f"calibration store: {out.root}")
+    return 0
+
+
+def _print_calibration_tables(cal) -> None:
+    """Per-ident bin tables: (subsystem, bin_max, observed_rate, n)."""
+    header = f"  {'subsystem':<10} {'bin_max':<8} {'rate':<6} n"
+    print(header)
+    rows = [(None, *entry) for entry in cal.aggregate]
+    for subsystem, entries in sorted(cal.subsystem_bins.items()):
+        rows += [(subsystem, *entry) for entry in entries]
+    for subsystem, bin_max, rate, n in rows:
+        name = subsystem if subsystem else "(aggregate)"
+        print(f"  {name:<10} {bin_max:<8.2f} {rate:<6.3f} {n}")
+        if subsystem and n == 0:
+            print("  insufficient data - calibration falls back to aggregate",
+                  file=sys.stderr)
+
+
+def run_report(args) -> int:
+    """Turn a diagnosis run into a verified case record (prompt 03 contract).
+
+    ``harness report --run <run_id> --outcome {fixed,partial,not_fixed,
+    inconclusive} [--taken ...] [--cases <dir>]`` fills the run's
+    ``pending_case.json`` (seeded at the end of every diagnosis) with the
+    operator-reported outcome and the actions that were actually taken, then
+    persists it via the ``CaseStore`` (append-only: a second report for the same
+    run is rejected). ``--status`` prints any existing record for the run.
+    """
+    from ..diagnosis.case_store import CaseStore
+    from ..diagnosis.schema import CaseOutcome
+
+    runs_root = Path(args.out_dir)
+    run_dir = runs_root / args.run
+    pending = run_dir / "pending_case.json"
+    store = CaseStore(args.cases)
+
+    if args.status:
+        record = store.get(args.run)
+        if record is None:
+            print(f"no case record for run {args.run!r}", file=sys.stderr)
+            return 1
+        print(record.model_dump_json(indent=2))
+        return 0
+
+    if not pending.exists():
+        print(f"no pending_case.json in {run_dir} (was this run a diagnosis?)",
+              file=sys.stderr)
+        return 1
+    base = CaseOutcome.model_validate_json(pending.read_text(encoding="utf-8"))
+
+    model_key, model_source = _model_from_audit(run_dir / "audit.jsonl")
+    record = CaseOutcome(
+        **{**base.model_dump(),
+           "model_key": model_key or base.model_key,
+           "model_source": model_source or base.model_source,
+           "outcome": args.outcome,
+           "actions_taken": list(args.taken),
+           "verification_verdict": args.verdict,
+           "created_at": "",  # CaseStore stamps it
+        })
+    try:
+        path = store.record(record, audit=AuditLog(run_dir / "audit.jsonl"))
+    except (FileExistsError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"recorded case {record.run_id}: outcome={record.outcome} "
+          f"llm={record.llm_ident} evidence_hash={record.evidence_hash[:12]}")
+    print(f"  {path}")
+    return 0
+
+
+def _model_from_audit(audit_path: Path) -> tuple[str | None, str | None]:
+    """Model facts from the run's audit log (model_detected event), if any."""
+    if not audit_path.exists():
+        return None, None
+    try:
+        for line in reversed(audit_path.read_text(encoding="utf-8").splitlines()):
+            if not line.strip():
+                continue
+            event = json.loads(line)
+            if event.get("kind") == "model_detected":
+                payload = event["payload"] or {}
+                return payload.get("model"), payload.get("source")
+    except (json.JSONDecodeError, OSError):
+        return None, None
+    return None, None
+
+
+def _load_priors(out_dir: str | Path) -> object | None:
+    """Load ``priors.json`` from the run out-dir when present.
+
+    Failures to load are warnings, never errors: priors are an optimization,
+    and a corrupt/missing file must not block a diagnosis.
+    """
+    path = Path(out_dir) / "priors.json"
+    if not path.exists():
+        return None
+    try:
+        from ..plan.subsystem import PriorModel
+        data = json.loads(path.read_text(encoding="utf-8"))
+        priors = PriorModel(keyword_multipliers=data.get("keyword_multipliers"))
+    except Exception as exc:  # noqa: BLE001 - corrupt priors degrade to static table
+        print(f"  [priors] {path}: {exc}; using the static heuristic table",
+              file=sys.stderr)
+        return None
+    if priors.empty:
+        return None
+    return priors
+
+
+def run_priors_update(args) -> int:
+    """Build outcome-fed subsystem priors from VERIFIED case outcomes.
+
+    ``harness priors update --cases <dir> [--out priors.json]`` -- reads the
+    case store, Laplace-smooths per-keyword subsystem multipliers over
+    verified outcomes only, and writes the prior file. Prints the
+    ``min_verified`` gate state so callers see when priors are inactive.
+    """
+    from ..diagnosis.case_store import CaseStore
+    from ..plan.priors_build import build_priors
+
+    store = CaseStore(args.cases)
+    cases = store.all()
+    gate = len({c.run_id for c in cases
+                if c.outcome in ("fixed", "partial", "not_fixed",
+                                 "inconclusive")})
+    priors = build_priors(cases, min_verified=args.min_verified)
+    if priors is None:
+        print(f"{gate}/{args.min_verified} outcome-recorded cases, "
+              "priors inactive (static heuristic table in use)")
+        return 1
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({
+        "min_verified": args.min_verified,
+        "verified_cases": gate,
+        "keyword_multipliers": priors.keyword_multipliers,
+    }, indent=2, sort_keys=True), encoding="utf-8")
+    print(f"{gate}/{args.min_verified} outcome-recorded cases, "
+          f"priors active for {len(priors.keyword_multipliers)} keyword(s): {out}")
+    return 0
+
+
+def _eval_llm(args) -> tuple:
+    """LLM backend for eval replay: ``--llm {stub,openai,gemini}`` only.
+
+    Eval needs no inventory; the adapter is constructed directly so a
+    misconfigured pipeline reports a hard error instead of a silent pass.
+    """
+    provider = getattr(args, "llm", None) or "stub"
+    if provider == "stub":
+        return StubLLM(), "stub"
+    if provider == "gemini":
+        model = os.environ.get("HARNESS_LLM_MODEL") or "gemini-2.5-flash"
+        return GeminiLLM(model=model), f"gemini/{model}"
+    model = os.environ.get("HARNESS_LLM_MODEL") or "harness-diag"
+    return OpenAICompatLLM(model=model), f"openai/{model}"
+
+
+def run_eval(args) -> int:
+    """Offline regression: replay held-out verified cases through the CURRENT
+    pipeline (retrieval -> prompt -> LLM -> scorer) and diff against the
+    stored baseline.
+
+    ``harness eval --cases <dir> [--lib <dir>] [--llm {stub,openai,gemini}]
+    [--holdout-frac 0.25] [--out eval_report.json] [--update-baseline]
+    [--tolerance 0.05]``
+
+    The holdout is deterministic (sha256 of run_id) and excluded from case
+    retrieval, priors, and calibration during the eval. Exits 1 when verdict
+    accuracy or ECE regresses beyond ``--tolerance``; ``--update-baseline``
+    rewrites the baseline deliberately.
+    """
+    from ..diagnosis.case_store import CaseStore
+    from ..diagnosis.eval import evaluate
+    from ..docs.ingest.library import DocLibrary
+
+    store = CaseStore(args.cases)
+    cases = store.all()
+    verified = [c for c in cases if c.verified]
+    if not verified:
+        print("no verified cases to evaluate; run 'harness report' after "
+              "diagnoses first", file=sys.stderr)
+        return 1
+
+    lib_dir = getattr(args, "lib", None)
+    if lib_dir is None and Path("harness_docs").is_dir():
+        lib_dir = "harness_docs"
+    if lib_dir is None:
+        print("eval: no doc library -- construct one with 'harness docs add' "
+              "or pass --lib <dir> (hard error, not a silent pass)",
+              file=sys.stderr)
+        return 1
+    try:
+        rag = DocLibrary(lib_dir).build_retriever()
+    except Exception as exc:  # noqa: BLE001 - pipeline construction failures are hard errors
+        print(f"eval: library error: {exc}", file=sys.stderr)
+        return 1
+    if rag is None:
+        print(f"eval: library {lib_dir!r} is empty; cannot construct the "
+              "retrieval pipeline (hard error, not a silent pass)",
+              file=sys.stderr)
+        return 1
+
+    llm, ident = _eval_llm(args)
+    try:
+        report = evaluate(store, llm, rag, ident,
+                          frac=args.holdout_frac)
+    except Exception as exc:  # noqa: BLE001 - any replay failure is a hard error
+        print(f"eval: replay failed: {exc}", file=sys.stderr)
+        return 1
+    if not report["cases"]:
+        print("eval: holdout split produced no replayed cases "
+              f"(--holdout-frac {args.holdout_frac})", file=sys.stderr)
+        return 1
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    baseline = out.with_name("baseline.json")
+    _print_eval_report(report)
+
+    summary = {"verdict_accuracy": report["verdict_accuracy"],
+               "ece": report["ece"],
+               "n_replayed": report["n_replayed"]}
+    if args.update_baseline or not baseline.exists():
+        baseline.write_text(json.dumps(summary, indent=2, sort_keys=True),
+                            encoding="utf-8")
+        print(f"baseline written: {baseline}")
+        return 0
+
+    try:
+        saved = json.loads(baseline.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        print(f"eval: baseline {baseline} unreadable; run "
+              "--update-baseline to rewrite", file=sys.stderr)
+        return 1
+    tol = args.tolerance
+    regressions = []
+    if report["verdict_accuracy"] < saved["verdict_accuracy"] - tol:
+        regressions.append(
+            f"verdict accuracy {report['verdict_accuracy']:.3f} regressed "
+            f"from {saved['verdict_accuracy']:.3f} (tolerance {tol})")
+    if report["ece"] > saved["ece"] + tol:
+        regressions.append(
+            f"ECE {report['ece']:.3f} regressed from {saved['ece']:.3f} "
+            f"(tolerance {tol})")
+    if regressions:
+        for line in regressions:
+            print(f"  regression: {line}")
+        print("eval FAILED -- rerun with --update-baseline to accept the new "
+              "numbers", file=sys.stderr)
+        return 1
+    print("no regressions vs baseline")
+    return 0
+
+
+def _print_eval_report(report: dict) -> None:
+    """Human table from the eval report dict (per-subsystem + overall)."""
+    print(f"eval: {report['n_replayed']} holdout case(s) replayed with "
+          f"{report['llm_ident']}")
+    header = f"  {'subsystem':<10} {'acc':<6} {'ece':<6} {'cite':<6} {'recall':<7} n"
+    print(header)
+    for subsystem, metrics in sorted(report["per_subsystem"].items()):
+        print(f"  {subsystem:<10} {metrics['verdict_accuracy']:<6.3f} "
+              f"{metrics['ece']:<6.3f} {metrics['mean_citation_support']:<6.3f} "
+              f"{metrics['mean_retrieval_recall']:<7.3f} {metrics['n']}")
+    print(f"  {'(overall)':<10} {report['verdict_accuracy']:<6.3f} "
+          f"{report['ece']:<6.3f} {report['mean_citation_support']:<6.3f} "
+          f"{report['mean_retrieval_recall']:<7.3f} {report['n_replayed']}")
 
 
 # ---- interactive menu (bare `harness` / `harness menu`) ----
@@ -1342,6 +1810,9 @@ def build_parser() -> argparse.ArgumentParser:
     docs_sub = p.add_subparsers(dest="docs_action", required=True)
     a = docs_sub.add_parser("add", help="upload document(s) into the library and index them")
     a.add_argument("files", nargs="+", help="file(s) to upload (pdf, md, txt, csv)")
+    a.add_argument("--platform", default=None,
+                   help="canonical model key to tag the documents with (retrieval "
+                        "is filtered to the detected server model)")
     r = docs_sub.add_parser("rm", help="remove a document from the library")
     r.add_argument("name", help="filename as shown by 'docs ls'")
     docs_sub.add_parser("ls", help="list indexed documents")
@@ -1460,10 +1931,75 @@ def build_parser() -> argparse.ArgumentParser:
     t_add.add_argument("--rack", default=None)
     t_add.add_argument("--cable", default=None)
     t_add.add_argument("--address", default=None)
+    t_add.add_argument("--model", default=None,
+                       help="canonical model key (fallback when detection fails)")
     t_sub.add_parser("ls", help="list aliases")
     t_rm = t_sub.add_parser("rm", help="remove an alias")
     t_rm.add_argument("alias")
     p.set_defaults(func=run_targets)
+
+    p = sub.add_parser(
+        "calibrate",
+        help="rebuild per-LLM fix-rate calibration from verified case outcomes")
+    p.add_argument("--cases", default="harness_runs/cases",
+                   help="case store directory (default: harness_runs/cases)")
+    p.add_argument("--llm", default=None,
+                   help="ident to calibrate (default: every ident present in the store)")
+    p.add_argument("--out", default="harness_runs/calibration",
+                   help="calibration store directory (default: harness_runs/calibration)")
+    p.set_defaults(func=run_calibrate)
+
+    p = sub.add_parser(
+        "report",
+        help="record a diagnosis run's verified outcome (learning-loop ground truth)")
+    p.add_argument("--run", required=True, help="harness run directory id")
+    p.add_argument("--outcome",
+                   choices=("fixed", "partial", "not_fixed", "inconclusive"),
+                   help="verified outcome after the repair attempt")
+    p.add_argument("--taken", action="append", default=[],
+                   help="action that was actually taken (repeatable)")
+    p.add_argument("--verdict", default=None,
+                   help="verification verdict, e.g. resolved / no_change")
+    p.add_argument("--cases", default="harness_runs/cases",
+                   help="case store directory (default: harness_runs/cases)")
+    p.add_argument("--out-dir", default="harness_runs",
+                   help="run directory root (default: harness_runs)")
+    p.add_argument("--status", action="store_true",
+                   help="print the recorded case for the run, if any")
+    p.set_defaults(func=run_report)
+
+    p = sub.add_parser(
+        "priors",
+        help="build outcome-fed subsystem priors from verified case outcomes")
+    priors_sub = p.add_subparsers(dest="priors_action", required=True)
+    priors_update = priors_sub.add_parser(
+        "update", help="rebuild priors.json from the case store")
+    priors_update.add_argument("--cases", default="harness_runs/cases",
+                               help="case store directory (default: harness_runs/cases)")
+    priors_update.add_argument("--out", default="priors.json",
+                               help="prior file path (default: priors.json)")
+    priors_update.add_argument("--min-verified", type=int, default=10,
+                               help="minimum outcome-recorded cases before priors activate")
+    priors_update.set_defaults(func=run_priors_update)
+
+    p = sub.add_parser(
+        "eval",
+        help="offline regression: replay held-out verified cases through the CURRENT pipeline")
+    p.add_argument("--cases", default="harness_runs/cases",
+                   help="case store directory (default: harness_runs/cases)")
+    p.add_argument("--lib", default=None,
+                   help="doc library directory (default: harness_docs when present)")
+    p.add_argument("--llm", choices=("stub", "openai", "gemini"), default="stub",
+                   help="LLM backend for the replay (default: stub)")
+    p.add_argument("--holdout-frac", type=float, default=0.25,
+                   help="deterministic holdout fraction (default: 0.25)")
+    p.add_argument("--out", default="eval_report.json",
+                   help="report output path (default: eval_report.json)")
+    p.add_argument("--update-baseline", action="store_true",
+                   help="rewrite baseline.json to the current numbers")
+    p.add_argument("--tolerance", type=float, default=0.05,
+                   help="max absolute verdict-accuracy/ECE regression (default: 0.05)")
+    p.set_defaults(func=run_eval)
 
     return parser
 

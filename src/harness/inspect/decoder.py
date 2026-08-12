@@ -40,6 +40,7 @@ class Decoder:
             catalog_version=self.catalog.schema_version,
             page_ref=defn.page_ref,
             unknown=False,
+            platforms=list(defn.platforms),
         )
 
     def decode_many(self, raw_lines: str, mnemonic_pattern: str = r"([A-Za-z0-9_\.]+)\s+=\s+0x([0-9a-fA-F]+)") -> list[RegisterDecode]:
@@ -78,6 +79,7 @@ class Decoder:
                 catalog_version=self.catalog.schema_version,
                 page_ref=defn.page_ref,
                 unknown=False,
+                platforms=list(defn.platforms),
             ))
         return out
 
@@ -128,6 +130,7 @@ class Decoder:
                 catalog_version=self.catalog.schema_version,
                 page_ref=defn.page_ref,
                 unknown=False,
+                platforms=list(defn.platforms),
             ))
         return out
 
@@ -164,6 +167,7 @@ class Decoder:
             catalog_version=self.catalog.schema_version,
             page_ref=defn.page_ref,
             unknown=False,
+            platforms=list(defn.platforms),
         )]
 
     @staticmethod

@@ -73,7 +73,7 @@ def _ctx(dump_sets_seen=None, snippets=False) -> EngineContext:
         decoder=Decoder(),
         collector_factory=make_collector,
         llm=_stub_diagnosis,  # unused by the session loop itself
-        docs_retriever=(lambda q: [f"[doc p.3] {q} related section"]) if snippets else None,
+        docs_retriever=(lambda q, _model_key: [f"[doc p.3] {q} related section"]) if snippets else None,
         supervisor=lambda label: None,
         dump_callback=(lambda dumps: dump_sets_seen.update(dumps))
         if dump_sets_seen is not None else None,
@@ -237,7 +237,7 @@ GB_HANGUP_I2C = (
 def test_session_initial_doc_probe_runs_and_decodes():
     runner = FakeConsoleRunner()
     ctx = _console_ctx(runner)
-    ctx.docs_retriever = lambda q: [GB_HANGUP_I2C]
+    ctx.docs_retriever = lambda q, _model_key: [GB_HANGUP_I2C]
     llm = ScriptedLLM({"kind": "diagnosis", "diagnosis": _stub_diagnosis().model_dump()})
     engine = SessionEngine(ctx, llm=llm)
     diag = engine.run("amber light, server stuck no boot")
@@ -257,7 +257,7 @@ def test_session_doc_topic_mines_new_probes():
         "a1: 05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n"
     )
     ctx = _console_ctx(runner)
-    ctx.docs_retriever = lambda q: [
+    ctx.docs_retriever = lambda q, _model_key: [
         ("[GB_HangUp_troubleshooting_v1.2.pdf p.1] "
          'dump "i2cdump -y 9 0xb" to get the boot state.'),
     ]

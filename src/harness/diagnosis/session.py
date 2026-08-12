@@ -24,7 +24,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ..inspect.base import RegisterDecode, RegisterDump
-from ..inspect.model import PROFILE_COLLECTORS, detect_model
+from ..inspect.model import PROFILE_COLLECTORS
 from ..plan.doc_guided import mine_probe_commands
 from ..plan.profile import plan_collection
 from .engine import EngineContext, _to_subsystems, decode_dumps
@@ -113,20 +113,35 @@ class SessionEngine:
     def _ensure_initial(self, symptom: str) -> None:
         if self._plan is not None:
             return
+        # Model facts FIRST (same fallback chain as the single-shot engine) so
+        # retrieval, decoding scope, and the prompt are model-consistent.
         from ..inspect.model import DetectedModel
-        self._base_snippets = (self.ctx.docs_retriever(symptom)
+        from .engine import detect_with_fallback
+        self._model, _drifted = detect_with_fallback(
+            self.ctx.runner, self.ctx.model_hint, self.ctx.model_ask)
+        if self._model is None:
+            self._model = DetectedModel(
+                product_name="unknown", bios_vendor="unknown",
+                bios_version=None, raw="")
+            self._note("model=unknown (detection failed; no alias hint)")
+        model_key = self._model.model_key if self._model.product_name != "unknown" else None
+        self._base_snippets = (self.ctx.docs_retriever(symptom, model_key)
                                if self.ctx.docs_retriever else [])
-        self._plan = plan_collection(symptom, self._base_snippets)
+        self._plan = plan_collection(symptom, self._base_snippets,
+                                     priors=self.ctx.priors)
         # Console runners: run the whole plan's probes in ONE serial session
         # (~35s each) and let the collectors dedupe against the probe cache.
         from .engine import prebatch_console_plan
         planned = [(name, self.ctx.collector_factory(name, self.ctx.runner))
                    for name in self._plan.collectors]
         prebatch_console_plan(self.ctx, self._plan, planned)
-        self._model = detect_model(self.ctx.runner) or DetectedModel(
-            product_name="unknown", bios_vendor="unknown", bios_version=None, raw="")
         self._collect_all(self._plan.collectors)
         self._collect_doc_probes(self._plan.doc_probes)
+
+    def _model_key(self) -> str | None:
+        if self._model is None or self._model.product_name == "unknown":
+            return None
+        return self._model.model_key
 
     def _collect_all(self, names: list[str]) -> list[str]:
         added: list[str] = []
@@ -178,7 +193,7 @@ class SessionEngine:
             if not self.ctx.docs_retriever:
                 lines.append(f"doc topic {topic!r}: no doc library (skipped)")
                 continue
-            snippets = self.ctx.docs_retriever(topic)
+            snippets = self.ctx.docs_retriever(topic, None)
             self._topic_snippets.extend(snippets)
             lines.append(f"doc topic {topic!r}: {len(snippets)} snippet(s) retrieved")
             probes = mine_probe_commands(snippets)
@@ -216,6 +231,8 @@ class SessionEngine:
             messages.append({"role": role, "content": content})
         parts = self.ctx.parts_refs() if self.ctx.parts_refs else []
         conversation = [f"{t['role']}: {t['content']}" for t in self.transcript]
+        prior = (self.ctx.case_library(symptom, self._model_key())
+                 if self.ctx.case_library else None)
         messages.append({"role": "user", "content": build_turn_evidence(
             model=self._model,
             symptom=symptom,
@@ -224,6 +241,7 @@ class SessionEngine:
             doc_snippets=self._snippets(symptom),
             parts_refs=parts,
             conversation=conversation,
+            prior_cases=prior or [],
         )})
         if self.ctx.prompt_callback is not None:
             self._prompt_seq += 1

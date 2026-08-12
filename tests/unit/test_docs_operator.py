@@ -2,13 +2,13 @@
 
 import csv
 
-from harness.docs.ingest.chunk import Chunk, CharTokenizer, Chunker
+from harness.diagnosis.schema import Action, Diagnosis, Risk
+from harness.docs.ingest.chunk import CharTokenizer, Chunk, Chunker
 from harness.docs.ingest.pdf_parser import PageText
+from harness.docs.parts.parts_graph import load_parts_csv
 from harness.docs.retrieval.hybrid_search import HybridRetriever, bm25_score
 from harness.docs.retrieval.rag import RagPipeline
-from harness.docs.parts.parts_graph import load_parts_csv
 from harness.operator.tickets import NoOpTicketing
-from harness.diagnosis.schema import Diagnosis, Action, Risk
 
 
 def test_chunker_overlap_metadata():

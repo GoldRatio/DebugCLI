@@ -34,6 +34,7 @@ class RegisterDef:
     canonical_source: str | None
     page_ref: str | None
     bit_fields: tuple[BitField, ...]
+    platforms: tuple[str, ...] = ()  # canonical model keys this register applies to
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,7 @@ def load_catalog(path: str | Path | None = None) -> RegisterCatalog:
             canonical_source=reg.get("canonical_source"),
             page_ref=reg.get("page_ref"),
             bit_fields=fields,
+            platforms=tuple(reg.get("platforms") or []),
         )
     return RegisterCatalog(
         schema_version=str(data["schema_version"]),

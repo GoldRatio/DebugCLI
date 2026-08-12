@@ -9,6 +9,7 @@ forward socket; a full implementation would open a tunnel to the bastion first.
 from __future__ import annotations
 
 import socket
+
 import paramiko
 
 

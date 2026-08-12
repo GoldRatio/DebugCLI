@@ -216,7 +216,7 @@ def test_console_doc_named_probe_runs_and_decodes():
         decoder=Decoder(),
         collector_factory=factory,
         llm=_fake_llm,
-        docs_retriever=lambda q: docs,
+        docs_retriever=lambda q, _model_key: docs,
     ))
     d = engine.run("amber light, server stuck in no boot")
     assert any(c.ok and "i2cdump -y 9 0xb" in " ".join(c.argv) for c in runner.calls)
@@ -238,7 +238,7 @@ def test_doc_named_probe_denied_on_host_continues():
         decoder=Decoder(),
         collector_factory=make_collector,
         llm=_fake_llm,
-        docs_retriever=lambda q: docs,
+        docs_retriever=lambda q, _model_key: docs,
         dump_callback=lambda dumps: dump_sets_seen.update(dumps),
     ))
     d = engine.run("MCE uncorrectable ECC error")

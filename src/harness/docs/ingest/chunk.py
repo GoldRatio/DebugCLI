@@ -20,10 +20,12 @@ class Chunk:
     page: int
     index: int
     embedding: list[float] | None = field(default=None)
+    platforms: list[str] = field(default_factory=list)  # canonical model keys this chunk applies to
 
     @property
     def meta(self) -> dict:
-        return {"title": self.title, "page": self.page, "idx": self.index}
+        return {"title": self.title, "page": self.page, "idx": self.index,
+                "platforms": self.platforms}
 
 
 class Tokenizer(ABC):

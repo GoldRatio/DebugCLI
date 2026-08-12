@@ -8,9 +8,9 @@ a value (e.g. a device path). This is the sudoers-aligned model the spec calls
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from functools import lru_cache
-import hashlib
 
 
 @dataclass(frozen=True)
