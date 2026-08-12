@@ -1,7 +1,10 @@
 # Curated register definitions -- SINGLE source of truth for bit-field decoding.
 # Versioned, reviewed, signed off. When a PDF table conflicts with this catalog,
 # THIS WINS and the PDF chunk is marked superseded. Unknown -> flagged, never guessed.
-schema_version: "1.0.0"
+# v1.1.0 adds the SWB CPLD I2C boot-state/critical/fault block (C4A14/C4A15),
+# decoded from `i2cdump -y 8 0xb`; bit fields taken verbatim from
+# "SWB CPLD Specifications C4A14 Server_RevG_1.2" (M1330863 RevG) tables 3-7..3-27.
+schema_version: "1.1.0"
 owner: hardware-reliability-team
 signoff:
   by: R.Gunn
@@ -30,3 +33,245 @@ registers:
       - {name: ripv, msb: 0, lsb: 0, values: {"1": "RIPV set", "0": "RIPV clear"}}
       - {name: eipv, msb: 1, lsb: 1, values: {"1": "EIPV set", "0": "EIPV clear"}}
       - {name: mcip, msb: 2, lsb: 2, values: {"1": "machine check in progress"}}
+
+  # ---- SWB CPLD (C4A14/C4A15), read via `i2cdump -y 8 0xb` on the BMC ----
+  CPLD_1B_CRITICAL:
+    mnemonic: CPLD_1B_CRITICAL
+    addr: "0x1B"
+    canonical_source: SWB CPLD Specifications C4A14 Server_RevG_1.2 2 1.pdf
+    page_ref: "p. 19 (Table 3-8)"
+    bit_fields:
+      - {name: shdn_ok_l,        msb: 7, lsb: 7, values: {"0": "shutdown okay not indicated"}}
+      - {name: l2_rst_req_out_l, msb: 6, lsb: 6, values: {"1": "level 2 reset requested"}}
+      - {name: l0l1_rst_req_out_l, msb: 5, lsb: 5, values: {"1": "level 0/1 reset requested"}}
+      - {name: run_power_pg,     msb: 4, lsb: 4, values: {"1": "RUN power good", "0": "RUN power NOT good"}}
+      - {name: cpu_boot_done,    msb: 3, lsb: 3, values: {"1": "CPU POST completed", "0": "CPU in POST / no boot state"}}
+      - {name: iobrd0_pwr_good,  msb: 2, lsb: 2, values: {"1": "IO mezz 0 power good"}}
+      - {name: iobrd1_pwr_good,  msb: 1, lsb: 1, values: {"1": "IO mezz 1 power good"}}
+
+  CPLD_1C_INDICATORS:
+    mnemonic: CPLD_1C_INDICATORS
+    addr: "0x1C"
+    canonical_source: SWB CPLD Specifications C4A14 Server_RevG_1.2 2 1.pdf
+    page_ref: "p. 19 (Table 3-8)"
+    bit_fields:
+      - {name: pcie_wake_l,     msb: 7, lsb: 7, values: {"0": "PCIe wake asserted"}}
+      - {name: pwr_btn_l,       msb: 6, lsb: 6, values: {"0": "power button pressed"}}
+      - {name: uid_btn_n,       msb: 5, lsb: 5, values: {"0": "UID button pressed"}}
+      - {name: fpga0_ready_hmc, msb: 4, lsb: 4, values: {"1": "FPGA0 ready for HMC"}}
+      - {name: fpga1_ready_hmc, msb: 3, lsb: 3, values: {"1": "FPGA1 ready for HMC"}}
+      - {name: pe_slot1_wake_n, msb: 2, lsb: 2, values: {"0": "slot1 wake asserted"}}
+
+  CPLD_1D_RUN_FAULTS:
+    mnemonic: CPLD_1D_RUN_FAULTS
+    addr: "0x1D"
+    canonical_source: SWB CPLD Specifications C4A14 Server_RevG_1.2 2 1.pdf
+    page_ref: "p. 20 (Table 3-8)"
+    bit_fields:
+      - {name: run_power_fault_l,  msb: 7, lsb: 7, values: {"0": "RUN domain power regulator fault"}}
+      - {name: chassis_pwr_brk_l,  msb: 6, lsb: 6}
+      - {name: chassis_ac_loss_l,  msb: 5, lsb: 5}
+      - {name: iobrd0_iox_int_l,   msb: 4, lsb: 4, values: {"0": "mezz 0 IOX interrupt"}}
+      - {name: iobrd1_iox_int_l,   msb: 3, lsb: 3, values: {"0": "mezz 1 IOX interrupt"}}
+      - {name: run_power_timeout,  msb: 2, lsb: 2, values: {"1": "RUN_POWER_PG timeout during boot"}}
+      - {name: critical_ovr_all_or, msb: 0, lsb: 0, values: {"1": "a critical signal is abnormal"}}
+
+  CPLD_1E_SHUTDOWN:
+    mnemonic: CPLD_1E_SHUTDOWN
+    addr: "0x1E"
+    canonical_source: SWB CPLD Specifications C4A14 Server_RevG_1.2 2 1.pdf
+    page_ref: "p. 20 (Table 3-8)"
+    bit_fields:
+      - {name: graceful_shdn_bmc_flag, msb: 7, lsb: 7, values: {"1": "entered graceful shutdown by BMC"}}
+      - {name: graceful_shdn_done,      msb: 6, lsb: 6, values: {"1": "graceful shutdown completed"}}
+      - {name: graceful_shdn_fail,      msb: 5, lsb: 5, values: {"1": "graceful shutdown timed out"}}
+      - {name: force_shdn_flag,         msb: 4, lsb: 4, values: {"1": "entered force shutdown"}}
+      - {name: force_shdn_done,         msb: 3, lsb: 3, values: {"1": "force shutdown completed"}}
+      - {name: force_shdn_fail,         msb: 2, lsb: 2, values: {"1": "force shutdown timed out"}}
+      - {name: thermal_trip_flag,       msb: 1, lsb: 1, values: {"1": "thermal trip"}}
+      - {name: graceful_shdn_cpu_flag,  msb: 0, lsb: 0, values: {"1": "entered graceful shutdown by CPU"}}
+
+  CPLD_1F_READY:
+    mnemonic: CPLD_1F_READY
+    addr: "0x1F"
+    canonical_source: SWB CPLD Specifications C4A14 Server_RevG_1.2 2 1.pdf
+    page_ref: "p. 21 (Table 3-8)"
+    bit_fields:
+      - {name: ovl_s5_on,               msb: 7, lsb: 7, values: {"1": "OVL power on in S5"}}
+      - {name: fpga_ready,              msb: 6, lsb: 6, values: {"1": "Bianca FPGA ready"}}
+      - {name: hmc_ready,               msb: 5, lsb: 5, values: {"1": "HMC ready"}}
+      - {name: bmc_erot_fpga_spi_mux_sel, msb: 4, lsb: 4}
+      - {name: hmc_erot_rst_l,          msb: 3, lsb: 3}
+      - {name: fan_pwm_wdt_en,          msb: 2, lsb: 2, values: {"1": "fan PWM watchdog enabled"}}
+      - {name: bmc_12v_ctrl,            msb: 1, lsb: 1, values: {"1": "BMC enables main 12V to HPM"}}
+
+  CPLD_25_CPU_RESET:
+    mnemonic: CPLD_25_CPU_RESET
+    addr: "0x25"
+    canonical_source: SWB CPLD Specifications C4A14 Server_RevG_1.2 2 1.pdf
+    page_ref: "p. 21 (Table 3-9)"
+    bit_fields:
+      - {name: sys_rst_out_l,      msb: 7, lsb: 7, values: {"0": "system reset asserted"}}
+      - {name: sys_rst_out_l_fail, msb: 6, lsb: 6, values: {"1": "system reset timed out during bring-up"}}
+
+  CPLD_63_HANDSHAKE:
+    mnemonic: CPLD_63_HANDSHAKE
+    addr: "0x63"
+    canonical_source: SWB CPLD Specifications C4A14 Server_RevG_1.2 2 1.pdf
+    page_ref: "p. 26 (Table 3-14)"
+    bit_fields:
+      - {name: hpm_stby_power_en, msb: 7, lsb: 7, values: {"1": "HPM standby power enable"}}
+      - {name: hpm_stby_rdy,      msb: 6, lsb: 6, values: {"1": "HPM standby power good"}}
+      - {name: hpm_stby_en,       msb: 5, lsb: 5, values: {"1": "HPM standby power enable from BMC"}}
+      - {name: fm_bmc_ready,      msb: 4, lsb: 4, values: {"1": "BMC ready"}}
+      - {name: hpm_stby_rst_n,    msb: 3, lsb: 3, values: {"1": "HPM reset released"}}
+      - {name: scm_port1_rst_n,   msb: 2, lsb: 2, values: {"1": "CPU reset control released"}}
+
+  CPLD_90_RTIME_FAULTS:
+    mnemonic: CPLD_90_RTIME_FAULTS
+    addr: "0x90"
+    canonical_source: SWB CPLD Specifications C4A14 Server_RevG_1.2 2 1.pdf
+    page_ref: "p. 30 (Table 3-25)"
+    bit_fields:
+      - {name: pdb_12v_rtime_flt,     msb: 7, lsb: 7, values: {"1": "runtime power fault P12V_CB"}}
+      - {name: p12v_fpga_rtime_flt,   msb: 6, lsb: 6, values: {"1": "runtime power fault P12V_FPGA"}}
+      - {name: p12v_pcie_rtime_flt,   msb: 5, lsb: 5, values: {"1": "runtime power fault P12V_PCIE"}}
+      - {name: p12v_e1s_1_rtime_flt,  msb: 4, lsb: 4, values: {"1": "runtime power fault E1.S#1"}}
+      - {name: p12v_e1s_2_rtime_flt,  msb: 3, lsb: 3, values: {"1": "runtime power fault E1.S#2"}}
+      - {name: p12v_e1s_3_rtime_flt,  msb: 2, lsb: 2, values: {"1": "runtime power fault E1.S#3"}}
+      - {name: p12v_e1s_4_rtime_flt,  msb: 1, lsb: 1, values: {"1": "runtime power fault E1.S#4"}}
+      - {name: p12v_e1s_5_rtime_flt,  msb: 0, lsb: 0, values: {"1": "runtime power fault E1.S#5"}}
+
+  CPLD_91_RTIME_FAULTS:
+    mnemonic: CPLD_91_RTIME_FAULTS
+    addr: "0x91"
+    canonical_source: SWB CPLD Specifications C4A14 Server_RevG_1.2 2 1.pdf
+    page_ref: "p. 31 (Table 3-25)"
+    bit_fields:
+      - {name: p5v_rtime_flt,            msb: 7, lsb: 7, values: {"1": "runtime power fault P5V"}}
+      - {name: p3v3_rtime_flt,           msb: 6, lsb: 6, values: {"1": "runtime power fault P3V3"}}
+      - {name: p1v05_rtime_flt,          msb: 5, lsb: 5, values: {"1": "runtime power fault P1V05_USB_HUB"}}
+      - {name: p3v3_fpga_rtime_flt,      msb: 4, lsb: 4, values: {"1": "runtime power fault P3V3_FPGA"}}
+      - {name: p3v3_m2_rtime_flt,        msb: 3, lsb: 3, values: {"1": "runtime power fault P3V3_M2"}}
+      - {name: p1v8_sw_rtime_flt,        msb: 2, lsb: 2, values: {"1": "runtime power fault P1V8_SW"}}
+      - {name: p1v25_sw_rtime_flt,       msb: 1, lsb: 1, values: {"1": "runtime power fault P1V25_SW"}}
+      - {name: p0v8_sw_rtime_flt,        msb: 0, lsb: 0, values: {"1": "runtime power fault P0V8_SW"}}
+
+  CPLD_92_FAULTS:
+    mnemonic: CPLD_92_FAULTS
+    addr: "0x92"
+    canonical_source: SWB CPLD Specifications C4A14 Server_RevG_1.2 2 1.pdf
+    page_ref: "p. 31 (Table 3-25)"
+    bit_fields:
+      - {name: p12v_stby_scm_flt,       msb: 7, lsb: 7, values: {"1": "P12V_STBY_SCM efuse fault"}}
+      - {name: p3v3_stby_e1s_1_rtime_flt, msb: 6, lsb: 6, values: {"1": "runtime fault P3V3_STBY_E1S#1"}}
+      - {name: p3v3_stby_e1s_2_rtime_flt, msb: 5, lsb: 5, values: {"1": "runtime fault P3V3_STBY_E1S#2"}}
+      - {name: p3v3_stby_e1s_3_rtime_flt, msb: 4, lsb: 4, values: {"1": "runtime fault P3V3_STBY_E1S#3"}}
+      - {name: p3v3_stby_e1s_4_rtime_flt, msb: 3, lsb: 3, values: {"1": "runtime fault P3V3_STBY_E1S#4"}}
+      - {name: p3v3_stby_e1s_5_rtime_flt, msb: 2, lsb: 2, values: {"1": "runtime fault P3V3_STBY_E1S#5"}}
+      - {name: p12v_stby_cb_rtime_flt,   msb: 1, lsb: 1, values: {"1": "runtime fault P12V_STBY_CB"}}
+
+  CPLD_93_VR_OR:
+    mnemonic: CPLD_93_VR_OR
+    addr: "0x93"
+    canonical_source: SWB CPLD Specifications C4A14 Server_RevG_1.2 2 1.pdf
+    page_ref: "p. 31 (Table 3-25)"
+    bit_fields:
+      - {name: vr_fail_all_or, msb: 7, lsb: 7, values: {"1": "a VR fault signal is set"}}
+      - {name: pdb_vr_flt,     msb: 6, lsb: 6, values: {"1": "PDB VR fault"}}
+      - {name: swb_vr_flt,     msb: 5, lsb: 5, values: {"1": "switch board VR fault"}}
+      - {name: sbp_vr_flt,     msb: 4, lsb: 4, values: {"1": "storage board VR fault"}}
+
+  CPLD_94_PWRUP_FAULTS:
+    mnemonic: CPLD_94_PWRUP_FAULTS
+    addr: "0x94"
+    canonical_source: SWB CPLD Specifications C4A14 Server_RevG_1.2 2 1.pdf
+    page_ref: "p. 32 (Table 3-25)"
+    bit_fields:
+      - {name: pdb_12v_pwrup_flt,    msb: 7, lsb: 7, values: {"1": "power-up fault P12V_CB"}}
+      - {name: p12v_fpga_pwrup_flt,  msb: 6, lsb: 6, values: {"1": "power-up fault P12V_FPGA"}}
+      - {name: p12v_pcie_pwrup_flt,  msb: 5, lsb: 5, values: {"1": "power-up fault P12V_PCIE"}}
+      - {name: p12v_e1s_pwrup_flt,   msb: 4, lsb: 4, values: {"1": "power-up fault P12V_E1S"}}
+
+  CPLD_95_PWRUP_FAULTS:
+    mnemonic: CPLD_95_PWRUP_FAULTS
+    addr: "0x95"
+    canonical_source: SWB CPLD Specifications C4A14 Server_RevG_1.2 2 1.pdf
+    page_ref: "p. 32 (Table 3-25)"
+    bit_fields:
+      - {name: p5v_pwrup_flt,       msb: 7, lsb: 7, values: {"1": "power-up fault P5V"}}
+      - {name: p3v3_pwrup_flt,      msb: 6, lsb: 6, values: {"1": "power-up fault P3V3"}}
+      - {name: p1v05_pwrup_flt,     msb: 5, lsb: 5, values: {"1": "power-up fault P1V05_USB_HUB"}}
+      - {name: p3v3_fpga_pwrup_flt, msb: 4, lsb: 4, values: {"1": "power-up fault P3V3_FPGA"}}
+      - {name: p3v3_m2_pwrup_flt,   msb: 3, lsb: 3, values: {"1": "power-up fault P3V3_M2"}}
+      - {name: p1v8_sw_pwrup_flt,   msb: 2, lsb: 2, values: {"1": "power-up fault P1V8_SW"}}
+      - {name: p1v25_sw_pwrup_flt,  msb: 1, lsb: 1, values: {"1": "power-up fault P1V25_SW"}}
+      - {name: p0v8_sw_pwrup_flt,   msb: 0, lsb: 0, values: {"1": "power-up fault P0V8_SW"}}
+
+  CPLD_96_PWRUP_FAULTS:
+    mnemonic: CPLD_96_PWRUP_FAULTS
+    addr: "0x96"
+    canonical_source: SWB CPLD Specifications C4A14 Server_RevG_1.2 2 1.pdf
+    page_ref: "p. 32 (Table 3-25)"
+    bit_fields:
+      - {name: p3v3_stby_e1s_pwrup_flt, msb: 6, lsb: 6, values: {"1": "power-up fault P3V3_STBY_E1S"}}
+      - {name: p12v_stby_cb_pwrup_flt,  msb: 1, lsb: 1, values: {"1": "power-up fault P12V_STBY_CB"}}
+
+  CPLD_97_WARNING:
+    mnemonic: CPLD_97_WARNING
+    addr: "0x97"
+    canonical_source: SWB CPLD Specifications C4A14 Server_RevG_1.2 2 1.pdf
+    page_ref: "p. 33 (Table 3-26)"
+    bit_fields:
+      - {name: fan_fail_in_l,           msb: 7, lsb: 7, values: {"0": "a fan failed"}}
+      - {name: pex_syser_3v3_n,         msb: 6, lsb: 6, values: {"0": "PCIe switch system error"}}
+      - {name: leak_detect_alert_l,     msb: 5, lsb: 5, values: {"0": "leak detected"}}
+      - {name: cpu0_erot_fatal_error_l, msb: 4, lsb: 4, values: {"0": "CPU0 EROT fatal error"}}
+      - {name: cpu1_erot_fatal_error_l, msb: 3, lsb: 3, values: {"0": "CPU1 EROT fatal error"}}
+      - {name: cpu2_erot_fatal_error_l, msb: 2, lsb: 2, values: {"0": "CPU2 EROT fatal error"}}
+      - {name: cpu3_erot_fatal_error_l, msb: 1, lsb: 1, values: {"0": "CPU3 EROT fatal error"}}
+      - {name: warning_ovr_all_or,      msb: 0, lsb: 0, values: {"1": "a warning signal is abnormal"}}
+
+  CPLD_A1_BOOT_STATE:
+    mnemonic: CPLD_A1_BOOT_STATE
+    addr: "0xA1"
+    canonical_source: SWB CPLD Specifications C4A14 Server_RevG_1.2 2 1.pdf
+    page_ref: "p. 34 (Table 3-27)"
+    bit_fields:
+      - {name: power_seq_fsm, msb: 5, lsb: 0, values: {
+          "0": "s0_idle",
+          "1": "s1_3p3vsw",
+          "2": "s2_p12vsw",
+          "3": "s3_hpm_ready",
+          "4": "s4_rot_p1_check",
+          "5": "s5_pwron_wait",
+          "6": "s6_p12v",
+          "7": "s7_5p0_main",
+          "8": "s8_3p3_main",
+          "9": "s9_1p05_usb_hub",
+          "10": "s10_3p3_main_m2_fpga",
+          "11": "s11_1p8_pcie_sw",
+          "12": "s12_1p25_pcie_sw",
+          "13": "s13_0p8_pcie_sw",
+          "14": "s14_cerberus_auth",
+          "15": "s15_sys_reset",
+          "16": "s16_run",
+          "17": "s17_graceful_shdn",
+          "18": "s18_force_shdn",
+          "19": "s19_sys_reset_off",
+          "20": "s20_clk_off",
+          "21": "s21_main_off",
+          "22": "s22_p12v_off",
+          "23": "s23_pwrdown_wait",
+          "24": "s_rtime_pfault",
+        }}
+
+  CPLD_A2_SGPIO_LINK:
+    mnemonic: CPLD_A2_SGPIO_LINK
+    addr: "0xA2"
+    canonical_source: SWB CPLD Specifications C4A14 Server_RevG_1.2 2 1.pdf
+    page_ref: "p. 34 (Table 3-27)"
+    bit_fields:
+      - {name: sgpio0_link, msb: 5, lsb: 4, values: {"0": "link off", "1": "establishing", "2": "establishment failed", "3": "link good"}}
+      - {name: sgpio1_link, msb: 3, lsb: 2, values: {"0": "link off", "1": "establishing", "2": "establishment failed", "3": "link good"}}
+      - {name: hmc_sgpio_link, msb: 1, lsb: 0, values: {"0": "default (HMC unsupported)", "3": "link good"}}

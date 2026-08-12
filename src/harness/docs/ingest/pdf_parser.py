@@ -7,13 +7,13 @@ page ref so the RAG layer can always cite exact pages.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 try:  # optional dependency (`pip install harness[docs]`)
     import fitz  # pymupdf
-except Exception:  # pragma: no cover
+except Exception:  # noqa: BLE001 - optional dependency, degrade gracefully
     fitz = None
 
 

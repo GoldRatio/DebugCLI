@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from .allowlist import AllowPolicy
@@ -50,6 +51,8 @@ class Runner:
         self.policy = policy
         self.force_read_only = force_read_only
         self.calls: list[CommandResult] = []
+        # Optional live listener: fired once per executed command (UI streaming).
+        self.on_probe: Callable[[CommandResult], None] | None = None
 
     def execute(self, argv: list[str], timeout: float = 30.0) -> CommandResult:
         if self.force_read_only:
@@ -60,6 +63,8 @@ class Runner:
         result = self._exec(argv, timeout)
         result.elapsed_ms = int((time.monotonic() - start) * 1000)
         self.calls.append(result)
+        if self.on_probe is not None:
+            self.on_probe(result)
         return result
 
     def _exec(self, argv: list[str], timeout: float) -> CommandResult:

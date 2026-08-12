@@ -243,14 +243,38 @@ def test_run_menu_diagnose_builds_argv(tmp_path, monkeypatch, capsys):
         return 0
 
     monkeypatch.setattr(menu_mod, "select", _scripted_select([1, 0, 9]))
-    monkeypatch.setattr(menu_mod, "ask_text",
-                        lambda prompt, **kw: "ECC error on DIMM_A2")
+    # The symptom prompt is optional: an empty answer falls back to the
+    # default evidence-driven symptom.
+    monkeypatch.setattr(menu_mod, "ask_text", lambda prompt, **kw: "")
     monkeypatch.setattr(cli_mod, "_run_wizard_sub", fake_sub)
 
     assert run_menu(_menu_args()) == 0
     assert built and built[0][:4] == ["diagnose", "--inventory", "inventory.yaml",
                                       "--symptom"]
-    assert "--host" in built[0] and built[0][built[0].index("--host") + 1] == "h1"
+    assert built[0][built[0].index("--host") + 1] == "h1"
+    # empty symptom -> the default evidence-driven symptom is supplied
+    assert built[0][built[0].index("--symptom") + 1] == cli_mod._MENU_DIAGNOSE_SYMPTOM
+    assert "diagnosing from live evidence" in capsys.readouterr().out
+
+
+def test_run_menu_diagnose_uses_typed_symptom(tmp_path, monkeypatch):
+    _write_inventory(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    from harness.operator import menu as menu_mod
+    built = []
+
+    def fake_sub(argv):
+        built.append(argv)
+        return 0
+
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([1, 0, 9]))
+    monkeypatch.setattr(menu_mod, "ask_text",
+                        lambda prompt, **kw: "amber light on power rail")
+    monkeypatch.setattr(cli_mod, "_run_wizard_sub", fake_sub)
+
+    assert run_menu(_menu_args()) == 0
+    idx = built[0].index("--symptom")
+    assert built[0][idx + 1] == "amber light on power rail"
 
 
 # ---- runs inspection menu ----

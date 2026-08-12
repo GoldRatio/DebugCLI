@@ -102,3 +102,33 @@ def test_summary_respects_max_items():
     s = summarize([_dump(sel, "sel")], max_items=10)
     assert s.anomaly_count == 10
     assert len(s.interesting) == 10
+
+
+def test_failed_probes_surface_as_gap_notes():
+    missing = RegisterDump(
+        subsystem="bmc", source="sudo -S i2cdump -y 8 0xb",
+        raw="RScmCli# start serial session -i 2 -p 2200\n"
+            "admin@m1120-c4a15:~$ sudo -S i2cdump -y 8 0xb\n"
+            "sudo: i2cdump: command not found\n",
+        cmd_argv=["sudo", "-S", "i2cdump", "-y", "8", "0xb"],
+        ok=False, meta={"exit": 127, "elapsed_ms": 1, "kind": "i2c"},
+    )
+    denied = RegisterDump(
+        subsystem="bmc", source="sudo -S ipmitool sel list",
+        raw="Permission denied\n", cmd_argv=["x"], ok=False,
+        meta={"exit": 1, "elapsed_ms": 1},
+    )
+    s = summarize([missing, denied])
+    assert any("command not found" in n and "exit 127" in n for n in s.notes)
+    assert any("denied" in n and "exit 1" in n for n in s.notes)
+
+
+def test_failed_probes_do_not_hide_behind_max_items():
+    # A probe gap is a note, not an interesting line: never starved by max_items.
+    missing = RegisterDump(
+        subsystem="bmc", source="sudo -S i2cdump -y 8 0xb",
+        raw="sudo: i2cdump: command not found\n", cmd_argv=["x"], ok=False,
+        meta={"exit": 127, "elapsed_ms": 1, "kind": "i2c"},
+    )
+    s = summarize([missing], max_items=1)
+    assert any("probe failed" in n for n in s.notes)

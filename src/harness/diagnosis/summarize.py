@@ -86,6 +86,11 @@ def summarize(dumps: list[RegisterDump], max_items: int = 50) -> EvidenceSummary
                 f"matching deassert; if they recur at every power-on they may be "
                 f"expected boot sequencing rather than an active failure.")
 
+    # Probes that did not run (missing tool, denied, non-zero) must be visible to
+    # the LLM: an absent register dump is evidence of a gap, not of a healthy value.
+    failed = [_probe_failure_note(d) for d in dumps if not d.ok]
+    notes.extend(failed[:5])
+
     non_ok = [f"{n}={s}" for n, s in sensor_statuses.items()
               if s not in ("ok", "na")]
     if sensor_statuses:
@@ -108,7 +113,7 @@ def summarize(dumps: list[RegisterDump], max_items: int = 50) -> EvidenceSummary
 
 def _dump_kind(dump: RegisterDump) -> str:
     kind = (dump.meta or {}).get("kind")
-    if kind in ("sensor", "sel", "fru", "dmesg"):
+    if kind in ("sensor", "sel", "fru", "dmesg", "i2c"):
         return kind
     source = dump.source
     if "sel list" in source:
@@ -117,12 +122,27 @@ def _dump_kind(dump: RegisterDump) -> str:
         return "fru"
     if "sensor list" in source or ("sensor" in source and "sdr" not in source):
         return "sensor"
+    if "i2cdump" in source or "i2cget" in source:
+        return "i2c"
     if "dmesg" in source or "rdmsr" in source or "msr" in source:
         return "dmesg"
     return "other"
 
 
 _SEL_FAULT_RE = re.compile(r"\b(fail(?:ure)?s?|faults?|error|critical)\b", re.IGNORECASE)
+
+_FAILURE_HINTS = ("command not found", "No such file", "not found", "denied",
+                  "Permission denied", "error", "failed")
+
+
+def _probe_failure_note(dump: RegisterDump) -> str:
+    """Short reason a probe dump failed, from its raw output (console banners)."""
+    exit_code = (dump.meta or {}).get("exit")
+    for hint in _FAILURE_HINTS:
+        m = re.search(hint, dump.raw, re.IGNORECASE)
+        if m:
+            return f"probe failed: {dump.source} ({m.group(0)}; exit {exit_code})"
+    return f"probe failed: {dump.source} (exit {exit_code})"
 
 _ANOMALY_HINTS = ("error", "fail", "uncorrectable", "corrected", "warning",
                   "critical", "overflow", "sensor", "non-zero", "threshold",

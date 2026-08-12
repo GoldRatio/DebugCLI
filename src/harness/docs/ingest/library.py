@@ -1,19 +1,22 @@
-"""Persisted RAG document library ("upload" point for architecture PDFs).
+"""Persisted RAG document library ("upload" point for architecture docs).
 
 Layout of a library directory::
 
     <lib>/
-      pdfs/            uploaded PDFs (copy-in; this is the upload surface)
+      pdfs/            uploaded source files, any supported format (copy-in;
+                       this is the upload surface; keep the name for back-compat)
       index.json       manifest: name -> sha256/size/chunks/error/ingested_at
       chunks.jsonl     cached chunks (text/title/page/index) for fast retrieval
 
-``add`` copies PDFs in, re-parses only files whose sha256 changed (or failed
-before), and records the manifest atomically. ``rm``/``ls``/``reindex`` manage
-the store, and ``build_retriever`` returns a ``RagPipeline`` over the cached
-chunks without touching the PDFs again.
+``add`` copies files in (PDF / Markdown / plain text / CSV), re-parses only
+files whose sha256 changed (or failed before), and records the manifest
+atomically. ``rm``/``ls``/``reindex`` manage the store, and ``build_retriever``
+returns a ``RagPipeline`` over the cached chunks without touching the sources
+again.
 
-The parser is injectable so the library is testable without pymupdf; the
-default is the layout-aware ``PdfParser``.
+Parsing is dispatched on file extension: PDFs use the injectable (layout-aware)
+``PdfParser`` -- injectable so the library is testable without pymupdf -- while
+markdown/text/CSV use the lightweight parsers in ``text_parser``.
 """
 
 from __future__ import annotations
@@ -30,12 +33,23 @@ from ..retrieval.hybrid_search import HybridRetriever
 from ..retrieval.rag import RagPipeline
 from .chunk import CharTokenizer, Chunk, Chunker
 from .pdf_parser import PageText, PdfParser
+from .text_parser import _CsvParser, _MarkdownParser, _PlainTextParser
 
 MANIFEST = "index.json"
 CHUNKS = "chunks.jsonl"
 PDFS = "pdfs"
 
 Parser = Callable[[Path], list[PageText]]
+
+_TEXT_PARSERS: dict[str, Callable[[], object]] = {
+    ".md": _MarkdownParser,
+    ".markdown": _MarkdownParser,
+    ".txt": _PlainTextParser,
+    ".text": _PlainTextParser,
+    ".csv": _CsvParser,
+}
+
+SUPPORTED_SUFFIXES = frozenset({".pdf"} | set(_TEXT_PARSERS))
 
 
 @dataclass(frozen=True)
@@ -54,6 +68,21 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: fh.read(1 << 16), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def parse_pages(path: Path, pdf_parser: Parser | None = None) -> list[PageText]:
+    """Parse a source file (PDF / markdown / text / CSV) into ``PageText`` list.
+
+    Dispatch on file extension; PDFs use the layout-aware ``PdfParser`` (or an
+    injected parser), text formats use the ``text_parser`` implementations.
+    """
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        if pdf_parser is not None:
+            return pdf_parser(path)
+        return PdfParser().parse(path)
+    parser_cls = _TEXT_PARSERS[suffix]
+    return parser_cls().parse(path)
 
 
 class DocLibrary:
@@ -93,7 +122,7 @@ class DocLibrary:
     # ---- operations ----
 
     def add(self, files: list[str | Path]) -> list[str]:
-        """Upload PDFs into the library and index them. Returns status lines."""
+        """Upload documents into the library and index them. Returns status lines."""
         self.root.mkdir(parents=True, exist_ok=True)
         self.pdfs_dir.mkdir(parents=True, exist_ok=True)
         manifest = self._manifest()
@@ -104,8 +133,11 @@ class DocLibrary:
             if not src.is_file():
                 status.append(f"skip {src}: not a file")
                 continue
-            if src.suffix.lower() != ".pdf":
-                status.append(f"skip {src.name}: not a .pdf")
+            suffix = src.suffix.lower()
+            if suffix not in SUPPORTED_SUFFIXES:
+                status.append(
+                    f"skip {src.name}: unsupported type (supported: "
+                    f"{', '.join(sorted(SUPPORTED_SUFFIXES))})")
                 continue
             digest = _sha256(src)
             entry = manifest.get(src.name)
@@ -113,7 +145,7 @@ class DocLibrary:
                 status.append(f"unchanged {src.name} (already indexed)")
                 continue
             shutil.copy2(src, self.pdfs_dir / src.name)
-            chunks, error = self._parse_pdf(src.name)
+            chunks, error = self._parse_doc(src.name)
             if error:
                 manifest[src.name] = {
                     "sha256": digest, "size": src.stat().st_size,
@@ -133,31 +165,34 @@ class DocLibrary:
         return status
 
     def reindex(self) -> list[str]:
-        """(Re-)index every PDF in ``pdfs/``: retries failures, picks up dropped
-        files (manual copy into the library also counts as an upload)."""
+        """(Re-)index every supported file in ``pdfs/``: retries failures,
+        picks up dropped files (manual copy into the library counts as upload)."""
         self.root.mkdir(parents=True, exist_ok=True)
         self.pdfs_dir.mkdir(parents=True, exist_ok=True)
         manifest = self._manifest()
         status: list[str] = []
         changed = False
-        for pdf in sorted(self.pdfs_dir.glob("*.pdf")):
-            digest = _sha256(pdf)
-            entry = manifest.get(pdf.name)
+        files = sorted(
+            f for f in self.pdfs_dir.iterdir()
+            if f.is_file() and f.suffix.lower() in SUPPORTED_SUFFIXES)
+        for src in files:
+            digest = _sha256(src)
+            entry = manifest.get(src.name)
             if entry and entry.get("sha256") == digest and not entry.get("error"):
                 continue
-            chunks, error = self._parse_pdf(pdf.name)
+            chunks, error = self._parse_doc(src.name)
             if error:
-                manifest[pdf.name] = {
-                    "sha256": digest, "size": pdf.stat().st_size,
+                manifest[src.name] = {
+                    "sha256": digest, "size": src.stat().st_size,
                     "chunks": 0, "ingested_at": _now(), "error": error,
                 }
-                status.append(f"FAILED {pdf.name}: {error}")
+                status.append(f"FAILED {src.name}: {error}")
             else:
-                manifest[pdf.name] = {
-                    "sha256": digest, "size": pdf.stat().st_size,
+                manifest[src.name] = {
+                    "sha256": digest, "size": src.stat().st_size,
                     "chunks": len(chunks), "ingested_at": _now(),
                 }
-                status.append(f"indexed {pdf.name}: {len(chunks)} chunk(s)")
+                status.append(f"indexed {src.name}: {len(chunks)} chunk(s)")
             changed = True
         if changed:
             self._save_chunks(self._all_chunks(manifest))
@@ -189,17 +224,18 @@ class DocLibrary:
 
     # ---- internals ----
 
-    def _parse_pdf(self, name: str) -> tuple[list[Chunk], str | None]:
-        pdf = self.pdfs_dir / name
+    def _parse_doc(self, name: str) -> tuple[list[Chunk], str | None]:
+        """Parse any supported source file (PDF / markdown / text / CSV) into chunks."""
+        path = self.pdfs_dir / name
         try:
-            if self.parser is not None:
-                pages = self.parser(pdf)
-            else:
-                pages = PdfParser().parse(pdf)
+            pages = self._pages(path)
         except Exception as exc:  # noqa: BLE001 - record per-file, never fatal
             return [], str(exc)
         chunks = Chunker(CharTokenizer()).chunk_pages(pages, title=name)
         return chunks, None
+
+    def _pages(self, path: Path) -> list[PageText]:
+        return parse_pages(path, pdf_parser=self.parser)
 
     def _all_chunks(self, manifest: dict[str, dict]) -> list[Chunk]:
         """Rebuild the chunk cache from indexed, error-free entries."""
@@ -207,7 +243,7 @@ class DocLibrary:
         for name, entry in manifest.items():
             if entry.get("error"):
                 continue
-            parsed, error = self._parse_pdf(name)
+            parsed, error = self._parse_doc(name)
             if error or not parsed:
                 continue
             chunks.extend(parsed)

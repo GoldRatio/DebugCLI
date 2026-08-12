@@ -40,6 +40,10 @@ OUTPUT = {
     "sudo -S ipmitool fru print": "Product Manufacturer: Quanta\nProduct Name: model_x\n",
     "sudo -S ipmitool sensor list": "CPU0 Temp | 45.000 | degrees C | ok\n",
     "sudo -S ipmitool sel list": " 5 | 08/07/2026 | 21:45:00 | Memory #0x01 | Uncorrectable ECC\n",
+    "sudo -S i2cdump -y 8 0xb": (
+        "1b: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n"
+        "a1: 10 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n"
+    ),
     "dmesg -r": "raw kernel ring buffer lines\n",
 }
 
@@ -157,6 +161,28 @@ def test_diagnose_end_to_end(tmp_path, capsys):
     captured = capsys.readouterr().out
     assert "repair action list" in captured
     assert "confidence:" in captured
+
+
+def test_diagnose_streams_pipeline_trace(tmp_path):
+    args = _diagnose_args(tmp_path, approve_all=True)
+    events: list[str] = []
+    run_diagnose(args, overrides={
+        "session": FakeSession(),
+        "llm": _fake_llm,
+        "progress": events.append,
+    })
+
+    joined = "\n".join(events)
+    assert "retrieve:" in joined
+    assert "plan:" in joined
+    assert "collect:" in joined
+    assert "decode:" in joined
+    assert "reason:" in joined
+
+    probes = [e for e in events if e.startswith("probe ")]
+    assert probes, f"expected per-probe stream lines, got nothing from: {events}"
+    assert any("-> ok" in p for p in probes)
+    assert any("/bin/dmidecode" in p for p in probes)
 
 
 def test_diagnose_without_approval_records_denied(tmp_path):
@@ -355,6 +381,7 @@ def test_diagnose_console_generic_plan_dedupes_bmc_probes(tmp_path):
     assert calls == [
         "sudo -S ipmitool fru print",       # model detection
         "sudo -S ipmitool sensor list",     # cpu
+        "sudo -S i2cdump -y 8 0xb",         # cpu: SWB CPLD boot-state block
         "sudo -S ipmitool sel list",        # kernel
         "dmesg -r",                         # kernel
     ]

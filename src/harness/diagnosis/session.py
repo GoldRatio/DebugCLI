@@ -25,8 +25,9 @@ from dataclasses import dataclass, field
 
 from ..inspect.base import RegisterDecode, RegisterDump
 from ..inspect.model import PROFILE_COLLECTORS, detect_model
+from ..plan.doc_guided import mine_probe_commands
 from ..plan.profile import plan_collection
-from .engine import EngineContext, _to_subsystems
+from .engine import EngineContext, _to_subsystems, decode_dumps
 from .llm import LLMError
 from .prompt import TURN_CONTRACT, TURN_SYSTEM_PREAMBLE, build_turn_evidence
 from .schema import Diagnosis, TurnResponse
@@ -61,6 +62,7 @@ class SessionEngine:
         self._decoded: list[RegisterDecode] = []
         self._summaries: EvidenceSummary = EvidenceSummary(interesting=[], anomaly_count=0, total=0)
         self._topic_snippets: list[str] = []
+        self._base_snippets: list[str] = []
         self._model = None
         self._plan = None
         self._prompt_seq = 0
@@ -112,10 +114,19 @@ class SessionEngine:
         if self._plan is not None:
             return
         from ..inspect.model import DetectedModel
-        self._plan = plan_collection(symptom)
+        self._base_snippets = (self.ctx.docs_retriever(symptom)
+                               if self.ctx.docs_retriever else [])
+        self._plan = plan_collection(symptom, self._base_snippets)
+        # Console runners: run the whole plan's probes in ONE serial session
+        # (~35s each) and let the collectors dedupe against the probe cache.
+        from .engine import prebatch_console_plan
+        planned = [(name, self.ctx.collector_factory(name, self.ctx.runner))
+                   for name in self._plan.collectors]
+        prebatch_console_plan(self.ctx, self._plan, planned)
         self._model = detect_model(self.ctx.runner) or DetectedModel(
             product_name="unknown", bios_vendor="unknown", bios_version=None, raw="")
         self._collect_all(self._plan.collectors)
+        self._collect_doc_probes(self._plan.doc_probes)
 
     def _collect_all(self, names: list[str]) -> list[str]:
         added: list[str] = []
@@ -131,6 +142,28 @@ class SessionEngine:
         if added:
             self._refresh()
         return added
+
+    def _collect_doc_probes(self, commands: list[str]) -> list[str]:
+        """Run doc-named probes (deduped against already-run commands).
+
+        Returns the sources of probes actually executed this call.
+        """
+        if not commands:
+            return []
+        from ..inspect.collectors.doc_guided import DocGuidedProbeCollector
+        collector = DocGuidedProbeCollector(self.ctx.runner, commands)
+        new_dumps = collector.collect()
+        merged = self._dumps.get("doc_guided", []) + new_dumps
+        seen: set[str] = set()
+        out = []
+        for dump in merged:
+            if dump.source in seen:
+                continue
+            seen.add(dump.source)
+            out.append(dump)
+        self._dumps["doc_guided"] = out
+        self._refresh()
+        return [d.source for d in new_dumps]
 
     def _apply_probe(self, resp: TurnResponse) -> str:
         lines: list[str] = []
@@ -148,20 +181,21 @@ class SessionEngine:
             snippets = self.ctx.docs_retriever(topic)
             self._topic_snippets.extend(snippets)
             lines.append(f"doc topic {topic!r}: {len(snippets)} snippet(s) retrieved")
+            probes = mine_probe_commands(snippets)
+            if probes:
+                added = self._collect_doc_probes(probes)
+                lines.append(f"doc-named probes: {', '.join(added) or 'already run'}")
         return "; ".join(lines)
 
     def _refresh(self) -> None:
         all_dumps = [d for dumps in self._dumps.values() for d in dumps]
-        decoded: list[RegisterDecode] = []
-        for dump in all_dumps:
-            if not dump.ok:
-                continue
-            decoded.extend(self.ctx.decoder.decode_many(dump.raw))
-        self._decoded = decoded
+        self._decoded = decode_dumps(self.ctx.decoder, all_dumps)
         self._summaries = summarize(all_dumps)
 
     def _snippets(self, symptom: str) -> list[str]:
-        base = self.ctx.docs_retriever(symptom) if self.ctx.docs_retriever else []
+        base = self._base_snippets
+        if not base and self.ctx.docs_retriever:
+            base = self.ctx.docs_retriever(symptom)
         seen = set(base)
         for s in self._topic_snippets:
             if s not in seen:

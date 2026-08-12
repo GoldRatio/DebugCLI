@@ -69,6 +69,23 @@ def test_keyword_route_plain_diagnose():
     assert cmd.rack is None
 
 
+def test_keyword_route_previous_run_followup_diagnoses():
+    # "It didn't give explicit repair actions" must NOT become a chat reply:
+    # the operator wants a fresh read-only diagnosis with concrete actions.
+    cmd = _keyword_route(
+        "There was a previous run on this server that was .74 percent "
+        "confidence. It didn't give explicit repair actions of what should "
+        "be replaced though")
+    assert cmd is not None
+    assert cmd.intent == "diagnose"
+    assert "previous run" in cmd.symptom
+
+
+def test_keyword_route_low_confidence_diagnoses():
+    cmd = _keyword_route("The last diagnosis was only 0.74 confidence")
+    assert cmd.intent == "diagnose"
+
+
 # ---- route_message ----
 
 def test_route_message_keyword_target_is_propagated():

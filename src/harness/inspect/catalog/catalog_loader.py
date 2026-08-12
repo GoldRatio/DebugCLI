@@ -7,9 +7,9 @@ downstream can mutate the authoritative decode tables.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache
 from importlib.resources import files
-from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -45,6 +45,14 @@ class RegisterCatalog:
 
     def lookup(self, mnemonic: str) -> RegisterDef | None:
         return self.registers.get(mnemonic.upper())
+
+    def lookup_addr(self, addr: str) -> RegisterDef | None:
+        """Find a register by its I2C/CPU address (e.g. "0x1b"), case-insensitive."""
+        want = addr.upper()
+        for defn in self.registers.values():
+            if defn.addr and defn.addr.upper() == want:
+                return defn
+        return None
 
 
 def load_catalog(path: str | Path | None = None) -> RegisterCatalog:

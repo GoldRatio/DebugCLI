@@ -72,10 +72,16 @@ def test_probe_accepts_legit_read_only_forms():
         "i2cdump -y -f 0 0x51 0x0 0x80",     # -r range form
         "i2cget -y -f 0 0x51 0x40",
         "i2cdetect -l",
+        "i2ctransfer -y 8 w1@0xb 0x00 r256", # i2c-tools v4+ block read
+        "sudo -S i2ctransfer -y 8 w1@0xb 0x00 r256",
+        "ls -l /usr/sbin/i2cdump /usr/sbin/i2ctransfer",  # BMC tool discovery
+        "ls /usr/bin",
         "sudo -S i2cdump -y -f 0 0x51",      # sudo -S wraps a read-only probe
         "sudo -S ipmitool sensor list",
         "sudo -S ipmitool sel list",
         "sudo -S ipmitool fru print",
+        "ipmitool sdr",
+        "ipmitool sdr elist",
         "ipmitool sensor elist",
     ):
         assert validate_serial_probe(good) == good
@@ -94,6 +100,12 @@ def test_probe_rejects_i2c_write_and_destructive_sudo():
         "sudo -S",                             # sudo must wrap a probe program
         "sudo i2cdump -y -f 0 0x51",           # only -S form (stdin password)
         "sudo -S nvme format /dev/nvme0n1",
+        "i2ctransfer -y 8 w256@0xb 0x00",      # block write of any size
+        "i2ctransfer -y 8 w4@0xb 0x00 0x01 0x02 0x03 r1",  # >2-byte write
+        "i2ctransfer -y 8 w1@0xb 0x00",        # write-only, no read at all
+        "i2ctransfer -y 8 w1 0x00 r256",       # write descriptor needs @addr
+        "ls /dev/sda",                         # ls on devices, not system dirs
+        "ls ../../etc/passwd",                 # no path traversal
     ):
         with pytest.raises(SerialProbeDenied):
             validate_serial_probe(bad)
@@ -161,9 +173,19 @@ def test_render_sudo_password_handshake():
         port=2200, sudo_password="s3cret",
     )
     assert 'send "sudo -S i2cdump -y -f 0 0x51\\r"' in script
-    # handshake only after sudo probes; plain probes get no password prompt
-    assert script.count('expect "password for"') == 1
-    assert 'send "s3cret\\r"' in script
+    # the echoed command line is consumed before prompt matching, so prompt
+    # patterns only ever match real post-output prompts
+    assert 'expect "sudo -S i2cdump -y -f 0 0x51\\r"' in script
+    # handshake after the first sudo probe only; the password is sent ONLY when
+    # the prompt appears (openBMC prints "Password: " not "[sudo] password for
+    # ..."; cached sudo prompts nothing and must not get a stray password typed
+    # at the bare shell prompt); plain probes get no password prompt
+    assert '"password for" {' in script
+    assert '"Password:" {' in script
+    # one handshake block (one send per prompt pattern), first sudo only;
+    # the other brace-block is the session-start failure branch
+    assert script.count('send "s3cret\\r"') == 2
+    assert script.count("expect {") == 2
     # failure branch comes before the node prompt branch and before the first
     # probe/password send (the session-start send naturally comes earlier)
     fail_idx = script.index('"Status Description:" { exit 3 }')
@@ -281,7 +303,6 @@ def test_run_probes_resolves_sudo_from_store():
     assert res.probe_count == 2
     assert "start serial session -i 12 -p 2200" in client.written
     assert 'send "sudo -S i2cdump -y -f 0 0x51\\r"' in client.written
-    assert 'expect "password for"' in client.written
     assert 'send "0penBmc\\r"' in client.written  # trailing newline stripped
 
 
@@ -301,7 +322,8 @@ def test_run_probes_no_sudo_when_path_unset():
     sc = SerialConsole(_console(trust_level="lab"), MemorySecretStore())
     sc._client = client
     sc.run_probes(["lspci"])
-    assert 'expect "password for"' not in client.written
+    assert '"password for"' not in client.written
+    assert 'expect "lspci\\r"' in client.written
 
 
 def test_run_probes_dead_session_raises_not_fake_ok():
@@ -387,6 +409,91 @@ def test_console_runner_records_console_failures_as_failed_results():
     assert res.exit_code == 1
 
 
+def test_console_runner_marks_missing_probe_tool_as_failed():
+    """expect exits 0 while the shell prints `command not found`: not a fake-ok."""
+    from harness.engine.sol import ConsoleRunner
+
+    class _MissingToolConsole:
+        def run_probes(self, commands):
+            return ConsoleResult(
+                output="RScmCli# start serial session -i 2 -p 2200\r\n"
+                       "admin@m1120-c4a15:~$ sudo -S i2cdump -y 8 0xb\r\n"
+                       "Password: \r\n"
+                       "sudo: i2cdump: command not found\r\n"
+                       "admin@m1120-c4a15:~$ ",
+                probe_count=1)
+
+    res = ConsoleRunner(_MissingToolConsole()).execute(["sudo -S i2cdump -y 8 0xb"])
+    assert res.exit_code == 127
+    assert not res.ok
+    assert "command not found" in res.stderr
+
+
+def test_console_runner_stray_not_found_noise_does_not_fake_127():
+    """A probe that RAN keeps its output even when unrelated session noise
+    (e.g. a stray line) contains `command not found` -- only a block whose
+    output is just the shell error is a hard 127."""
+    from harness.engine.sol import ConsoleRunner, _not_found_error
+
+    assert _not_found_error("-sh: 0penBmc: command not found\n",
+                            "sudo -S ipmitool sensor list") is None
+    assert _not_found_error("-sh: ipmitool: command not found\n",
+                            "sudo -S ipmitool sensor list") is not None
+    assert _not_found_error("sudo: i2cdump: command not found\n",
+                            "sudo -S i2cdump -y 8 0xb") is not None
+    assert _not_found_error(
+        "Password: \nCPU0 Temp | 45.000 | degrees C | ok\n"
+        "admin@m1120-c4a15:~$ 0penBmc\n-sh: 0penBmc: command not found\n",
+        "sudo -S ipmitool sensor list") is None
+
+    class _NoisyConsole:
+        def run_probes(self, commands):
+            return ConsoleResult(
+                output="admin@m1120-c4a15:~$ sudo -S ipmitool sensor list\n"
+                       "CPU0 Temp | 45.000 | degrees C | ok\n"
+                       "admin@m1120-c4a15:~$ 0penBmc\n"
+                       "-sh: 0penBmc: command not found\n"
+                       "admin@m1120-c4a15:~$ ",
+                probe_count=1)
+
+    res = ConsoleRunner(_NoisyConsole()).execute(["sudo -S ipmitool sensor list"])
+    assert res.exit_code == 0
+    assert res.ok
+    assert "CPU0 Temp" in res.stdout
+
+
+def test_console_runner_uses_absolute_path_when_bmc_path_lacks_sbin():
+    """OpenBMC shells may lack /usr/sbin on PATH even though i2c-tools live
+    there: bare i2cdump/i2ctransfer must go on the wire as /usr/sbin/<tool>."""
+    from harness.engine.sol import ConsoleRunner
+
+    class _RecordingConsole:
+        def __init__(self):
+            self.probes = []
+
+        def run_probes(self, commands):
+            self.probes.extend(commands)
+            return ConsoleResult(output="1b: 05\n", probe_count=1)
+
+    console = _RecordingConsole()
+    runner = ConsoleRunner(console)
+    res = runner.execute(["sudo -S i2cdump", "-y", "8", "0xb"])
+    assert res.ok
+    assert console.probes == ["sudo -S /usr/sbin/i2cdump -y 8 0xb"]
+    # recorded argv keeps the planned form; source strings stay stable
+    assert res.argv == ["sudo -S i2cdump", "-y", "8", "0xb"]
+    # bare i2ctransfer and i2cget are absolutized too
+    runner.execute(["i2ctransfer", "-y", "8", "w1@0xb", "0x00", "r256"])
+    runner.execute(["sudo", "-S", "i2cget", "-y", "8", "0xb", "0x1b"])
+    assert console.probes[1:] == [
+        "/usr/sbin/i2ctransfer -y 8 w1@0xb 0x00 r256",
+        "sudo -S /usr/sbin/i2cget -y 8 0xb 0x1b",
+    ]
+    # non-i2c commands are untouched
+    runner.execute(["/usr/bin/lspci", "-xxx"])
+    assert console.probes[-1] == "/usr/bin/lspci -xxx"
+
+
 def test_console_runner_runs_detect_model_and_collectors():
     from harness.engine.sol import ConsoleRunner
     console = _FakeConsole()
@@ -402,6 +509,16 @@ def test_console_runner_is_flagged_as_console():
     assert ConsoleRunner(_FakeConsole()).is_console is True
 
 
+_FAKE_I2C_ROWS = (
+    "1b: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n"
+    "a1: 05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n"
+)
+
+
+def _fake_stdout(cmd: str) -> str:
+    return _FAKE_I2C_ROWS if "i2cdump" in cmd else "ok"
+
+
 def test_bmc_console_collector_issues_bmc_shell_probes():
     from harness.engine.runner import CommandResult
     from harness.inspect.collectors.bmc_console import BmcConsoleCollector
@@ -413,13 +530,14 @@ def test_bmc_console_collector_issues_bmc_shell_probes():
             self.calls = []
 
         def execute(self, argv, timeout=30.0):
-            result = CommandResult(argv=list(argv), stdout="ok", stderr="",
-                                   exit_code=0, elapsed_ms=1)
+            cmd = " ".join(argv)
+            result = CommandResult(argv=list(argv), stdout=_fake_stdout(cmd),
+                                   stderr="", exit_code=0, elapsed_ms=1)
             self.calls.append(result)
             return result
 
     for subsystem, expected in {
-        "cpu": ["sudo -S ipmitool sensor list"],
+        "cpu": ["sudo -S ipmitool sensor list", "sudo -S i2cdump -y 8 0xb"],
         "kernel": ["sudo -S ipmitool sel list", "dmesg -r"],
         "ipmi": ["sudo -S ipmitool sensor list", "sudo -S ipmitool sel list",
                  "sudo -S ipmitool fru print"],
@@ -443,18 +561,20 @@ def test_bmc_console_collectors_dedupe_probes_across_subsystems():
             self.calls = []
 
         def execute(self, argv, timeout=30.0):
-            result = CommandResult(argv=list(argv), stdout="ok", stderr="",
-                                   exit_code=0, elapsed_ms=1)
+            cmd = " ".join(argv)
+            result = CommandResult(argv=list(argv), stdout=_fake_stdout(cmd),
+                                   stderr="", exit_code=0, elapsed_ms=1)
             self.calls.append(result)
             return result
 
     fake = _FakeRunner()
-    BmcConsoleCollector(fake, subsystem="cpu").collect()    # sensor list
+    BmcConsoleCollector(fake, subsystem="cpu").collect()    # sensor list + i2cdump
     BmcConsoleCollector(fake, subsystem="ipmi").collect()   # sel list + fru print
     BmcConsoleCollector(fake, subsystem="kernel").collect()  # dmesg -r
     executed = [" ".join(c.argv) for c in fake.calls]
     assert executed == [
         "sudo -S ipmitool sensor list",
+        "sudo -S i2cdump -y 8 0xb",
         "sudo -S ipmitool sel list",
         "sudo -S ipmitool fru print",
         "dmesg -r",
@@ -472,9 +592,10 @@ def test_bmc_console_collector_reruns_probe_that_previously_failed():
             self.calls = []
 
         def execute(self, argv, timeout=30.0):
-            failed = not any(c.ok for c in self.calls)
-            result = CommandResult(argv=list(argv), stdout="ok", stderr="",
-                                   exit_code=1 if failed else 0, elapsed_ms=1)
+            cmd = " ".join(argv)
+            failed = len(self.calls) == 0  # only the very first probe fails
+            result = CommandResult(argv=list(argv), stdout=_fake_stdout(cmd),
+                                   stderr="", exit_code=1 if failed else 0, elapsed_ms=1)
             self.calls.append(result)
             return result
 
@@ -483,9 +604,53 @@ def test_bmc_console_collector_reruns_probe_that_previously_failed():
     BmcConsoleCollector(fake, subsystem="ipmi").collect()    # retries sensor list
     executed = [" ".join(c.argv) for c in fake.calls]
     assert executed == ["sudo -S ipmitool sensor list",
+                        "sudo -S i2cdump -y 8 0xb",
                         "sudo -S ipmitool sensor list",
                         "sudo -S ipmitool sel list",
                         "sudo -S ipmitool fru print"]
+
+
+def test_bmc_console_collector_cpld_chain_falls_back_when_i2cdump_missing():
+    """When i2cdump is absent, the chain must fall through to i2ctransfer."""
+    from harness.engine.runner import CommandResult
+    from harness.inspect.collectors.bmc_console import BmcConsoleCollector
+
+    class _FakeRunner:
+        is_console = True
+
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, argv, timeout=30.0):
+            cmd = " ".join(argv)
+            if "i2cdump" in cmd:  # tool missing: shell prints not-found, exit 127
+                stdout, code = "sudo: i2cdump: command not found", 127
+            elif "i2ctransfer" in cmd:
+                stdout = "1b: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n"
+                code = 0
+            else:
+                stdout, code = "ok", 0
+            result = CommandResult(argv=list(argv), stdout=stdout, stderr="",
+                                   exit_code=code, elapsed_ms=1)
+            self.calls.append(result)
+            return result
+
+    fake = _FakeRunner()
+    dumps = BmcConsoleCollector(fake, subsystem="cpu").collect()
+    executed = [" ".join(c.argv) for c in fake.calls]
+    # sensor list, then the chain: sudo i2cdump (missing) -> plain i2cdump
+    # (missing) -> sudo i2ctransfer (data). Plain i2ctransfer never needed.
+    assert executed == [
+        "sudo -S ipmitool sensor list",
+        "sudo -S i2cdump -y 8 0xb",
+        "i2cdump -y 8 0xb",
+        "sudo -S i2ctransfer -y 8 w1@0xb 0x00 r256",
+    ]
+    ok = [d for d in dumps if d.ok]
+    assert [d.source for d in ok] == ["sudo -S ipmitool sensor list",
+                                      "sudo -S i2ctransfer -y 8 w1@0xb 0x00 r256"]
+    # The failed attempts are recorded (audit trail), not dropped.
+    assert any("command not found" in d.raw for d in dumps)
 
 
 def test_detect_model_uses_fru_on_console_runner():
@@ -574,3 +739,100 @@ def test_detect_model_keeps_dmidecode_on_host_runner():
 
     model = detect_model(_HostRunner())
     assert model is not None and model.product_name == "X"
+
+
+# ---- batched console probes (one session per collector, not per probe) ----
+
+def test_split_batch_output_isolates_each_probe_block():
+    from harness.engine.sol import _split_batch_output
+
+    transcript = (
+        "root@bmc:~$ sudo -S ipmitool sensor list\r\n"
+        "CPU0 Temp | 45.000 | degrees C | ok\r\n"
+        "root@bmc:~$ sudo -S ipmitool sel list\r\n"
+        " 5 | Memory | Uncorrectable ECC\r\n"
+        "root@bmc:~$"
+    )
+    blocks = _split_batch_output(transcript, [
+        "sudo -S ipmitool sensor list",
+        "sudo -S ipmitool sel list",
+    ])
+    assert "45.000" in blocks[0] and "sel list" not in blocks[0]
+    assert "Uncorrectable ECC" in blocks[1]
+
+
+def test_split_batch_output_handles_missing_echo():
+    from harness.engine.sol import _split_batch_output
+
+    blocks = _split_batch_output("only one echo line\r\n", [
+        "sudo -S i2cdump -y 8 0xb",
+        "sudo -S ipmitool sel list",
+    ])
+    assert blocks[0] == ""          # first echo not found
+    assert blocks[1] == ""          # second echo not found either
+
+
+def test_split_batch_output_ignores_expect_debug_lines():
+    """expect's `send:` debug lines contain the command text but never END with
+    it; only the real echoed line (prompt + command) may delimit blocks."""
+    from harness.engine.sol import _split_batch_output
+
+    transcript = (
+        "spawn q63-1 rm\n"
+        "send: sending \"sudo -S ipmitool sensor list\\r\" to { exp0 }\n"
+        "root@bmc:~$ sudo -S ipmitool sensor list\n"
+        "CPU0 Temp | 45.000 | degrees C | ok\n"
+        "send: sending \"sudo -S ipmitool sel list\\r\" to { exp0 }\n"
+        "root@bmc:~$ sudo -S ipmitool sel list\n"
+        " 5 | Memory | Uncorrectable ECC\n"
+        "root@bmc:~$"
+    )
+    blocks = _split_batch_output(transcript, [
+        "sudo -S ipmitool sensor list",
+        "sudo -S ipmitool sel list",
+    ])
+    assert "45.000" in blocks[0]
+    assert "root@bmc:~$ sudo -S ipmitool sel list" not in blocks[0]
+    assert "Uncorrectable ECC" in blocks[1]
+    assert "send:" not in blocks[1]
+
+
+def test_bmc_console_collector_batches_non_i2c_probes():
+    from harness.engine.runner import CommandResult
+    from harness.inspect.collectors.bmc_console import BmcConsoleCollector
+
+    class _BatchRunner:
+        is_console = True
+
+        def __init__(self):
+            self.calls = []
+            self.batches: list[list[str]] = []
+
+        def batch_execute(self, cmds, timeout=300.0):
+            self.batches.append(list(cmds))
+            results = []
+            for cmd in cmds:
+                stdout = _FAKE_I2C_ROWS if "i2cdump" in cmd else "ok"
+                argv = cmd.split()
+                result = CommandResult(argv=argv, stdout=stdout,
+                                       stderr="", exit_code=0, elapsed_ms=1)
+                self.calls.append(result)
+                results.append(result)
+            return results
+
+        def execute(self, argv, timeout=300.0):
+            cmd = " ".join(argv)
+            result = CommandResult(argv=list(argv), stdout=_fake_stdout(cmd),
+                                   stderr="", exit_code=0, elapsed_ms=1)
+            self.calls.append(result)
+            return result
+
+    fake = _BatchRunner()
+    dumps = BmcConsoleCollector(fake, subsystem="cpu").collect()
+    # one batched session for sensor list; the CPLD chain still runs
+    # sequentially and stops at the first real register dump.
+    assert fake.batches == [["sudo -S ipmitool sensor list"]]
+    executed = [" ".join(c.argv) for c in fake.calls]
+    assert executed == ["sudo -S ipmitool sensor list",
+                        "sudo -S i2cdump -y 8 0xb"]
+    assert [d.source for d in dumps] == executed

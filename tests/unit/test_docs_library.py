@@ -49,11 +49,11 @@ def test_add_skips_unchanged_and_reindexes_changed(tmp_path):
     assert lib.build_retriever() is not None
 
 
-def test_add_rejects_non_pdf_and_missing(tmp_path):
+def test_add_rejects_unsupported_and_missing(tmp_path):
     lib = DocLibrary(tmp_path / "lib", parser=_fake_pdf)
-    txt = _write_pdf(tmp_path, "notes.txt", "x")
-    status = lib.add([txt, tmp_path / "missing.pdf"])
-    assert any("not a .pdf" in s for s in status)
+    exe = _write_pdf(tmp_path, "notes.exe", "x")
+    status = lib.add([exe, tmp_path / "missing.pdf"])
+    assert any("unsupported type" in s for s in status)
     assert any("not a file" in s for s in status)
     assert lib.entries() == []
 
@@ -122,3 +122,82 @@ def test_retriever_serves_from_cache_without_reparsing(tmp_path):
     assert rag is not None
     assert calls == []  # served from chunks.jsonl, PDFs untouched
     assert "[k.pdf p.1]" in rag.lines("kernel oops", top_k=1)[0]
+
+
+# ---- multi-format ingestion (markdown / text / csv) ----
+
+def test_add_markdown_splits_on_headings(tmp_path):
+    lib = DocLibrary(tmp_path / "lib")
+    md = tmp_path / "runbook.md"
+    md.write_text(
+        "# First Section\n\nmemory ECC uncorrectable DIMM error\n\n"
+        "## Second\n\npcie link down after reboot\n",
+        encoding="utf-8",
+    )
+
+    status = lib.add([md])
+    assert any("indexed runbook.md" in s for s in status)
+    assert (tmp_path / "lib" / "pdfs" / "runbook.md").exists()
+
+    rag = lib.build_retriever()
+    lines = rag.lines("DIMM ECC error", top_k=2)
+    assert lines
+    assert any("[runbook.md p.1]" in l for l in lines)
+    entries = lib.entries()
+    assert entries[0].name == "runbook.md" and entries[0].chunks >= 1
+
+
+def test_add_markdown_strips_front_matter(tmp_path):
+    lib = DocLibrary(tmp_path / "lib")
+    md = tmp_path / "runbook.md"
+    md.write_text("---\ntitle: Runbook\n---\n# Memory\n\ndimm error\n", encoding="utf-8")
+
+    lib.add([md])
+    assert lib.build_retriever() is not None
+
+
+def test_add_csv_searchable_by_cell_values(tmp_path):
+    lib = DocLibrary(tmp_path / "lib")
+    csv = tmp_path / "parts.csv"
+    csv.write_text("slot,part,status\n3,PSU-01,FAULT\n7,HDD-02,OK\n", encoding="utf-8")
+
+    status = lib.add([csv])
+    assert any("indexed parts.csv" in s for s in status)
+    rag = lib.build_retriever()
+    lines = rag.lines("PSU-01 FAULT", top_k=2)
+    assert lines and "[parts.csv p.1]" in lines[0]
+
+
+def test_add_plain_text(tmp_path):
+    lib = DocLibrary(tmp_path / "lib")
+    txt = tmp_path / "notes.txt"
+    txt.write_text("CPLD records power faults in I2C registers 0x90-0x96\n", encoding="utf-8")
+
+    lib.add([txt])
+    assert lib.entries()[0].chunks >= 1
+    lines = lib.build_retriever().lines("CPLD power fault I2C register", top_k=1)
+    assert lines and "[notes.txt p.1]" in lines[0]
+
+
+def test_add_rejects_unsupported_and_reindex_picks_up_text(tmp_path):
+    lib = DocLibrary(tmp_path / "lib")
+    exe = _write_pdf(tmp_path, "tool.exe", "nope")
+    status = lib.add([exe])
+    assert any("unsupported type" in s for s in status)
+    assert lib.entries() == []
+
+    dropped = tmp_path / "lib" / "pdfs" / "dropped.md"
+    dropped.parent.mkdir(parents=True, exist_ok=True)
+    dropped.write_text("# Notes\n\nmemory configuration guide\n", encoding="utf-8")
+    status = lib.reindex()
+    assert any("indexed dropped.md" in s for s in status)
+    assert lib.build_retriever() is not None
+
+
+def test_remove_text_file(tmp_path):
+    lib = DocLibrary(tmp_path / "lib")
+    lib.add([_write_pdf(tmp_path, "a.md", "# A\n\ncontent here")])
+    lib.remove("a.md")
+    assert lib.entries() == []
+    assert not (tmp_path / "lib" / "pdfs" / "a.md").exists()
+    assert lib.build_retriever() is None

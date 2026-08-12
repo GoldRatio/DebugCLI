@@ -31,7 +31,12 @@ JSON object -- no prose:
 - "verify": re-check whether a previous state changed. Fields: metric (optional,
   default "ecc"), baseline (optional, omitted = latest run).
 - "status": the operator asks what is running or what was done so far.
-- "reply": anything else -- answer conversationally. Field: text (required).
+- "reply": purely conversational messages only. Field: text (required).
+
+The operator expects ACTION: mentions of a symptom, of a previous diagnosis's
+quality (low confidence, missing/absent repair actions), or of what part should be
+replaced or repaired are "diagnose" requests -- re-run the read-only diagnosis with
+the full message as the symptom. Never answer with advice instead of acting.
 
 Never fabricate hardware findings, never propose commands or writes. Respond with the
 JSON object only."""
@@ -134,7 +139,9 @@ def _keyword_route(text: str) -> SessionCommand:
     if any(k in low for k in ("doc", "manual", "pdf", "lookup", "reference")):
         return SessionCommand(intent="docs", query=text)
     if any(k in low for k in ("diagnos", "why", "error", "crash", "panic", "fail",
-                              "fault", "warn", "check", "inspect", "look at")):
+                              "fault", "warn", "check", "inspect", "look at",
+                              "confidence", "percent", "previous run", "repair",
+                              "replace", "redo", "rerun")):
         cleaned, target = extract_target(text)
         return SessionCommand(intent="diagnose", symptom=cleaned or text, **target)
     return SessionCommand(intent="reply", text=text)

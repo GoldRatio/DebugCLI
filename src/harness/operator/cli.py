@@ -57,6 +57,7 @@ import json
 import re
 import shlex
 import sys
+from collections.abc import Callable
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -75,9 +76,15 @@ from ..diagnosis.session import SessionEngine
 from ..diagnosis.verifier import Verifier
 from ..engine.allowlist import default_policy
 from ..engine.bmc import BmcRunner
-from ..engine.runner import Runner
+from ..engine.runner import CommandResult, Runner
 from ..engine.session import SSHSession
-from ..engine.sol import ConsoleRunner, SerialConsole, SerialConsoleError
+from ..engine.sol import (
+    ConsoleRunner,
+    SerialConsole,
+    SerialConsoleError,
+    _absolutize_bmc_i2c_tools,
+    validate_serial_probe,
+)
 from ..inspect.base import RegisterDump
 from ..inspect.collectors.bmc_console import BmcConsoleCollector
 from ..inspect.collectors.ipmi import IpmiCollector
@@ -90,6 +97,15 @@ from ..targets import TargetError, TargetSpec, resolve_target
 from ..targets.aliases import AliasError, TargetAlias, load_targets, save_targets
 
 # ---- helpers ----
+
+# Menu-driven diagnosis runs without asking for a symptom prompt: target first,
+# then diagnose straight from the live evidence (see SYSTEM_PREAMBLE in
+# diagnosis/prompt.py for how the LLM handles a generic symptom).
+_MENU_DIAGNOSE_SYMPTOM = (
+    "No specific symptom was reported by the operator. Diagnose this server "
+    "from the live evidence in this prompt (boot state, sensors, SEL, kernel "
+    "log). Report the current state and the most likely fault class or verdict."
+)
 
 def _make_store(args) -> SecretStore:
     secret_dir = getattr(args, "secret_dir", None)
@@ -179,28 +195,31 @@ def _console_sudo_secret(store: SecretStore, domain: ConsoleDomain, secrets: lis
 
 
 def _build_retriever(docs_dir: str | None):
-    """Build the RAG retriever over a directory of PDFs (returns None when absent)."""
+    """Build a RAG retriever over a directory of supported documents (PDF /
+    markdown / text / CSV). Returns None when absent."""
     if not docs_dir:
         return None
     try:
         from ..docs.ingest.chunk import CharTokenizer, Chunker
-        from ..docs.ingest.pdf_parser import PdfParser
+        from ..docs.ingest.library import SUPPORTED_SUFFIXES, parse_pages
         from ..docs.retrieval.hybrid_search import HybridRetriever
         from ..docs.retrieval.rag import RagPipeline
     except ImportError:
-        print("  [docs] pymupdf not installed; install harness[docs] for --docs-dir",
+        print("  [docs] extras not installed; install harness[docs] for --docs-dir",
               file=sys.stderr)
         return None
     chunks = []
-    for pdf in sorted(Path(docs_dir).glob("*.pdf")):
+    for pdf in sorted(Path(docs_dir).iterdir()):
+        if not pdf.is_file() or pdf.suffix.lower() not in SUPPORTED_SUFFIXES:
+            continue
         try:
-            parsed = PdfParser().parse(pdf)
-        except Exception as exc:  # noqa: BLE001 - unreadable PDFs are skipped, never fatal
+            parsed = parse_pages(pdf)
+        except Exception as exc:  # noqa: BLE001 - unreadable docs skipped, never fatal
             print(f"  [docs] skip {pdf.name}: {exc}", file=sys.stderr)
             continue
         chunks.extend(Chunker(CharTokenizer()).chunk_pages(parsed, title=pdf.name))
     if not chunks:
-        print(f"  [docs] no readable PDFs in {docs_dir!r}; proceeding without RAG",
+        print(f"  [docs] no readable documents in {docs_dir!r}; proceeding without RAG",
               file=sys.stderr)
         return None
     rag = RagPipeline(HybridRetriever(chunks))
@@ -389,6 +408,24 @@ def run_docs(args) -> int:
     return 0
 
 
+def _progress_printer() -> Callable[[str], None]:
+    """Live pipeline trace writer: goes to stderr so the diagnosis verdict
+    remains the only stdout output."""
+
+    def _emit(text: str) -> None:
+        print(f"  {text}", file=sys.stderr, flush=True)
+
+    return _emit
+
+
+def _probe_line(res: CommandResult) -> str:
+    """One-line summary of an executed probe: command, outcome, elapsed."""
+    cmd = " ".join(res.argv)
+    outcome = "ok" if res.ok else f"exit {res.exit_code}"
+    elapsed = f"{res.elapsed_ms / 1000:.1f}s" if res.elapsed_ms else ""
+    return f"{cmd} -> {outcome} {elapsed}"
+
+
 def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
     """Full read-only diagnosis; returns the scored, audited Diagnosis.
 
@@ -460,6 +497,15 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
             session.open()
         runner = session
 
+    # Live pipeline trace: step events (plan/collect/decode/reason) plus one
+    # line per executed probe (command, outcome, elapsed). Defaults to stderr.
+    if "progress" in overrides:
+        progress: Callable[[str], None] = overrides["progress"]
+    else:
+        progress = _progress_printer()
+    if hasattr(runner, "on_probe"):
+        runner.on_probe = lambda res: progress(f"probe {_probe_line(res)}")
+
     bmc_runner = overrides.get("bmc_runner")
     if bmc_runner is None and bmc_password is not None:
         bmc_runner = BmcRunner(host.bmc.address, host.bmc.username, bmc_password)
@@ -515,7 +561,7 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
         supervisor=_step,
         dump_callback=lambda dumps: _save_dumps(out, dumps),
         prompt_callback=lambda content: _save_prompt(out, content, session_mode),
-        progress=overrides.get("progress"),
+        progress=progress,
         model_hook=(
             lambda model: log.append(trace.session_id, "model_detected", {
                 "model": model.model_key if model is not None else None,
@@ -596,15 +642,18 @@ def run_console(args) -> int:
 
     console = SerialConsole(domain, store)
     try:
-        result = console.run_probes(args.probe)
+        wire = [_absolutize_bmc_i2c_tools(c) for c in args.probe]
+        result = console.run_probes(wire)
         redactor = Redactor(secrets)
         rendered = redactor.redact(result.output) if secrets else result.output
         for line in rendered.splitlines():
             print(line)
         if log is not None:
-            for cmd in args.probe:
+            for cmd, wire_cmd in zip(args.probe, wire):
+                if wire_cmd != cmd:
+                    validate_serial_probe(wire_cmd)  # wire invariant: gate-checked
                 log.append(trace.session_id, "cmd", {
-                    "argv": shlex.split(cmd), "exit": 0,
+                    "argv": shlex.split(wire_cmd), "exit": 0,
                     "probe_count": result.probe_count,
                 })
             trace.record_command(["console", *args.probe], 0, result.elapsed_ms,
@@ -1164,12 +1213,15 @@ def run_menu(args) -> int:
                 spec = _pick_target(inv, store, args, console=console_default)
                 if spec is None:
                     continue
-                symptom = ask_text("Symptom (describe the problem)").strip()
-                if not symptom:
-                    print("  cancelled: no symptom")
-                    continue
-                argv = ["diagnose", "--inventory", str(inv_path),
-                        "--symptom", symptom]
+                symptom = ask_text("Symptom (Enter for no symptom / "
+                                   "live-evidence diagnosis)").strip()
+                if symptom:
+                    argv = ["diagnose", "--inventory", str(inv_path),
+                            "--symptom", symptom]
+                else:
+                    print("  (no symptom: diagnosing from live evidence)")
+                    argv = ["diagnose", "--inventory", str(inv_path),
+                            "--symptom", _MENU_DIAGNOSE_SYMPTOM]
                 argv += _target_argv(spec)
                 argv += _wizard_flags(args, "diagnose")
                 _run_wizard_sub(argv)
@@ -1284,16 +1336,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--inventory", required=True)
     p.set_defaults(func=run_lint)
 
-    p = sub.add_parser("docs", help="manage the RAG document library (upload PDFs / list / remove)")
+    p = sub.add_parser("docs", help="manage the RAG document library (upload PDFs / markdown / text / CSV)")
     p.add_argument("--lib", default="harness_docs",
                    help="library directory (default: harness_docs)")
     docs_sub = p.add_subparsers(dest="docs_action", required=True)
-    a = docs_sub.add_parser("add", help="upload PDF(s) into the library and index them")
-    a.add_argument("files", nargs="+", help="PDF file(s) to upload")
-    r = docs_sub.add_parser("rm", help="remove a PDF from the library")
-    r.add_argument("name", help="PDF filename as shown by 'docs ls'")
+    a = docs_sub.add_parser("add", help="upload document(s) into the library and index them")
+    a.add_argument("files", nargs="+", help="file(s) to upload (pdf, md, txt, csv)")
+    r = docs_sub.add_parser("rm", help="remove a document from the library")
+    r.add_argument("name", help="filename as shown by 'docs ls'")
     docs_sub.add_parser("ls", help="list indexed documents")
-    docs_sub.add_parser("reindex", help="re-index all PDFs (retries failures, "
+    docs_sub.add_parser("reindex", help="re-index all documents (retries failures, "
                                         "picks up files dropped into the library)")
     p.set_defaults(func=run_docs)
 

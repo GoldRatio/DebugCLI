@@ -173,3 +173,100 @@ def test_session_context_seeded_before_first_turn():
     assert any(t["kind"] == "context" and "PSU was replaced" in t["content"]
                for t in engine.transcript)
     assert any("PSU was replaced" in m["content"] for m in llm.calls[0])
+
+
+class FakeConsoleRunner(Runner):
+    """Console-target runner with canned BMC-shell outputs."""
+
+    OUTPUT: ClassVar[dict[str, str]] = {
+        "sudo -S ipmitool sensor list": (
+            "Power_Status     | 0x0        | discrete   | 0x0180| na | na\n"
+        ),
+        "sudo -S ipmitool sel list": (
+            "  1 | 08/10/26 | 21:30:38 UTC | System Event #0x07 | Timestamp Clock Sync | Asserted\n"
+        ),
+        "sudo -S ipmitool fru print": "Product Name          : C4A15\n",
+        "sudo -S i2cdump -y 8 0xb": (
+            "     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f\n"
+            "1b: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n"
+            "a1: 05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n"
+        ),
+        "dmesg -r": "<6>Booting Linux ... Machine model: C4A15 BMC\n",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(AllowPolicy([
+            AllowRule("sudo -S ipmitool sensor list"),
+            AllowRule("sudo -S ipmitool sel list"),
+            AllowRule("sudo -S ipmitool fru print"),
+            AllowRule("sudo -S i2cdump -y 8 0xb"),
+            AllowRule("dmesg -r"),
+        ]))
+        self.is_console = True
+
+    def _exec(self, argv, timeout=30.0):
+        return CommandResult(argv=list(argv), stdout=self.OUTPUT.get(" ".join(argv), ""),
+                             stderr="", exit_code=0, elapsed_ms=1)
+
+
+def _console_factory(name, _runner):
+    from harness.inspect.collectors.bmc_console import BmcConsoleCollector
+    if name in ("cpu_msr", "kernel", "ipmi"):
+        return BmcConsoleCollector(_runner, subsystem={
+            "cpu_msr": "cpu", "kernel": "kernel", "ipmi": "ipmi",
+        }[name])
+    return None
+
+
+def _console_ctx(runner) -> EngineContext:
+    return EngineContext(
+        runner=runner,
+        decoder=Decoder(),
+        collector_factory=_console_factory,
+        llm=_stub_diagnosis,
+        supervisor=lambda label: None,
+    )
+
+
+GB_HANGUP_I2C = (
+    "[GB_HangUp_troubleshooting_v1.2.pdf p.1] For EVERY Amber Light issue, "
+    'please dump "i2cdump -y 8 0xb" in the BMC to get the boot state.'
+)
+
+
+def test_session_initial_doc_probe_runs_and_decodes():
+    runner = FakeConsoleRunner()
+    ctx = _console_ctx(runner)
+    ctx.docs_retriever = lambda q: [GB_HANGUP_I2C]
+    llm = ScriptedLLM({"kind": "diagnosis", "diagnosis": _stub_diagnosis().model_dump()})
+    engine = SessionEngine(ctx, llm=llm)
+    diag = engine.run("amber light, server stuck no boot")
+    assert any(c.ok and "i2cdump -y 8 0xb" in " ".join(c.argv) for c in runner.calls)
+    mnemonics = {e["mnemonic"] for e in diag.evidence}
+    assert "CPLD_1B_CRITICAL" in mnemonics
+    assert "CPLD_A1_BOOT_STATE" in mnemonics
+
+
+def test_session_doc_topic_mines_new_probes():
+    runner = FakeConsoleRunner()
+    runner.policy.add(AllowRule("sudo -S i2cdump -y 9 0xb"))
+    runner.OUTPUT = dict(FakeConsoleRunner.OUTPUT)
+    runner.OUTPUT["sudo -S i2cdump -y 9 0xb"] = (
+        "     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f\n"
+        "1b: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n"
+        "a1: 05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n"
+    )
+    ctx = _console_ctx(runner)
+    ctx.docs_retriever = lambda q: [
+        ("[GB_HangUp_troubleshooting_v1.2.pdf p.1] "
+         'dump "i2cdump -y 9 0xb" to get the boot state.'),
+    ]
+    llm = ScriptedLLM(
+        {"kind": "probe", "subsystems": [], "doc_topics": ["amber light"]},
+        {"kind": "diagnosis", "diagnosis": _stub_diagnosis().model_dump()},
+    )
+    engine = SessionEngine(ctx, llm=llm, max_turns=3)
+    diag = engine.run("amber light, server stuck no boot")
+    assert any(c.ok and "i2cdump -y 9 0xb" in " ".join(c.argv) for c in runner.calls)
+    mnemonics = {e["mnemonic"] for e in diag.evidence}
+    assert "CPLD_1B_CRITICAL" in mnemonics

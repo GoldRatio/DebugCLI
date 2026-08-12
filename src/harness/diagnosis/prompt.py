@@ -37,7 +37,17 @@ Evidence kind rules:
   are nominal and only historical log entries reference past faults (the server is
   fixed); "fault" ONLY when current-state evidence shows a live problem;
   "degraded" for an active non-fatal issue; "unknown" only when evidence is
-  insufficient. The "diagnosis" text must match the chosen state."""
+  insufficient. The "diagnosis" text must match the chosen state.
+
+No-symptom runs: when the Symptom section is generic or absent, do not ask for
+more information or refuse -- this is a scheduled evidence-only diagnosis (the
+operator skipped the symptom question on purpose). Diagnose strictly from the
+live evidence in this prompt: read the decoded boot-state registers (e.g. the
+SWB CPLD boot-state block: CPU/reset flags at 0x1b, power-sequence FSM at 0xa1),
+weigh current sensors over the SEL history, and state the most likely fault class
+and repair path -- or a clean verdict when nothing is anomalous. If a non-dumped
+register is flagged UNKNOWN, propose the read-only probe that would capture it
+rather than guessing its value."""
 
 def build_prompt(*,
                  model: DetectedModel | None,

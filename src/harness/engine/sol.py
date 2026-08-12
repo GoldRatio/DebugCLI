@@ -55,8 +55,9 @@ _DANGEROUS = re.compile(
 
 # Value charset: a value is a single token -- no spaces, no shell metacharacters,
 # no globbing, no expansion, no quotes. `|` is allowed inside a quoted token
-# (a regex alternation for grep), never as a shell pipe.
-_SAFE_VALUE = re.compile(r"^[A-Za-z0-9_./:+=,-|]+$")
+# (a regex alternation for grep), never as a shell pipe; `@` is allowed so
+# ``i2ctransfer`` write/read descriptors like ``w1@0xb`` are expressible.
+_SAFE_VALUE = re.compile(r"^[A-Za-z0-9_./:+=,-|@]+$")
 
 # Values never acceptable anywhere (spec: `/dev/mem` is rejected outright).
 _FORBIDDEN_VALUES = frozenset({"/dev/mem", "/dev/kmem"})
@@ -69,6 +70,11 @@ _DEAD_SESSION = re.compile(
     r"spawn id exp\d+ not open|expect: timed out|child process exited abnormally"
     r"|Status Description: .*failed"
 )
+
+# Probe-did-not-run markers: the shell prints ``prog: not found`` (or sudo's
+# ``sudo: prog: command not found``) while expect still exits 0. Without
+# detection a missing tool would record a fake-ok probe with no register data.
+_CMD_NOT_FOUND = re.compile(r":\s*(?:command\s+)?not found|No such file or directory")
 
 
 @dataclass(frozen=True)
@@ -83,6 +89,8 @@ class _ProbeRule:
       be in the subcommand's set (e.g. ``ipmitool sel`` only allows ``list``, so
       ``ipmitool sel clear`` is not expressible)
     - ``value_check``: optional extra predicate on a value (e.g. ``cat`` paths)
+    - ``command_check``: optional whole-command predicate over the positional
+      tokens (e.g. ``i2ctransfer`` descriptor shape, read-before-write)
     """
 
     flags: frozenset[str] = frozenset()
@@ -91,6 +99,7 @@ class _ProbeRule:
     subcommands: frozenset[str] = frozenset()
     subcommand_values: dict[str, frozenset[str]] | None = None
     value_check: Callable[[str], bool] | None = None
+    command_check: Callable[[list[str]], bool] | None = None
 
 
 def _cat_value(value: str) -> bool:
@@ -102,6 +111,46 @@ def _cat_value(value: str) -> bool:
 
 def _dev_value(value: str) -> bool:
     return value.startswith("/dev/")
+
+
+def _system_path_value(value: str) -> bool:
+    # `ls` may only read system tool/layout paths; never /dev, arbitrary files,
+    # or `..` traversal. Used for BMC tool-availability discovery.
+    return (value.startswith(("/bin/", "/sbin/", "/usr/", "/opt/", "/var/",
+                              "/lib/", "/etc/", "/run/", "/sys/", "/proc/"))
+            and ".." not in value.split("/"))
+
+
+# i2ctransfer message tokens: ``r<n>`` read descriptor, ``w<n>@0x..`` write
+# descriptor, or a byte payload (``0x..`` / bare 2-hex-digit). Writing the
+# register pointer (w1/w2) is part of the documented read protocol, so those
+# are allowed -- but only as pointer writes, and never without a read.
+_I2C_TRANSFER_TOKEN_RE = re.compile(
+    r"^(?P<kind>[rw])(?P<count>\d+)(?:@(?P<addr>0x[0-9a-fA-F]{1,2}))?$")
+_I2C_TRANSFER_BYTE_RE = re.compile(r"^(?:0x)?[0-9a-fA-F]{1,2}$")
+
+
+def _i2ctransfer_command_check(tokens: list[str]) -> bool:
+    """Whole-command gate for ``i2ctransfer``: read descriptors (``r<n>``) and
+    register-pointer writes (``w1@addr``/``w2@addr``) with byte payloads only,
+    and every command must contain at least one read. A ``w256@addr ...`` block
+    write is not expressible.
+    """
+    reads = 0
+    for tok in tokens:
+        m = _I2C_TRANSFER_TOKEN_RE.match(tok)
+        if m is None:
+            if _I2C_TRANSFER_BYTE_RE.match(tok):
+                continue
+            return False
+        kind, count, addr = m.group("kind"), int(m.group("count")), m.group("addr")
+        if kind == "r":
+            reads += 1
+            continue
+        if kind == "w" and 1 <= count <= 2 and addr is not None:
+            continue
+        return False
+    return reads >= 1
 
 
 # Read-only probe contracts, mirroring the allowlist philosophy: exact tokens,
@@ -153,13 +202,28 @@ _PROBE_SPEC: dict[str, _ProbeRule] = {
         flags=frozenset({"-y", "-a", "-l", "-q", "-r"}),
         values=True,
     ),
+    # ls on system paths only: read-only tool/layout discovery on the BMC.
+    "ls": _ProbeRule(
+        flags=frozenset({"-l", "-a", "-1", "-h", "-i"}),
+        values=True,
+        value_check=_system_path_value,
+    ),
+    # i2ctransfer: block read/write descriptors (e.g. ``w1@0xb 0x00 r256``).
+    # The command_check keeps descriptor writes to register-pointer width
+    # (w1/w2, per the vendor read sequences) and demands at least one read.
+    "i2ctransfer": _ProbeRule(
+        flags=frozenset({"-y", "-f", "-v"}),
+        values=True,
+        command_check=_i2ctransfer_command_check,
+    ),
     # ipmitool run on the BMC console (already on the BMC; no -H/-U/-E pins).
     "ipmitool": _ProbeRule(
-        subcommands=frozenset({"sensor", "sel", "fru"}),
+        subcommands=frozenset({"sensor", "sel", "fru", "sdr"}),
         subcommand_values={
             "sensor": frozenset({"list", "elist"}),
             "sel": frozenset({"list", "info"}),   # NOT "clear"/"delete"
             "fru": frozenset({"print"}),
+            "sdr": frozenset({"list", "elist"}),
         },
     ),
 }
@@ -225,6 +289,12 @@ def _validate_segment(parts: list[str]) -> None:
             raise SerialProbeDenied(f"unexpected argument for {prog}: {token!r}")
         _validate_value(token, rule)
         i += 1
+
+    if rule.command_check is not None:
+        positionals = [t for t in parts[1:] if not t.startswith("-")]
+        if not rule.command_check(positionals):
+            raise SerialProbeDenied(
+                f"command shape not read-only for {prog}: {positionals!r}")
 
 
 def validate_serial_probe(cmd: str) -> str:
@@ -327,15 +397,39 @@ def render_expect_script(*, tool: str, rack: str, cable: str,
     lines.append(f'        "{prompts.node}" {{}}')
     lines.append("    }")
 
+    first_sudo = True
     for cmd in commands:
         lines.append(f'    send "{_tcl_escape(cmd)}\\r"')
-        if sudo_password is not None and cmd.startswith("sudo -S "):
-            # Password handshake: shell prompts for it on stdin, we feed it.
-            lines.append('    expect "password for"')
-            lines.append(f'    send "{_tcl_escape(sudo_password)}\\r"')
+        # Consume THIS command's echoed line first: the echo carries the node
+        # prompt text as its prefix, so a plain prompt-expect would match the
+        # echoed line and race the next send while the command is still
+        # running. Prompt matching must only ever see real post-output prompts.
+        lines.append(f'    expect "{_tcl_escape(cmd)}\\r"')
+        if sudo_password is not None and cmd.startswith("sudo -S ") and first_sudo:
+            # Password handshake for the first sudo only: openBMC prints
+            # "Password: ", stock sudo prints "[sudo] password for ...".
+            # Do NOT type the password into a prompt-less shell (it would echo
+            # into the transcript and the shell would run it as a command) --
+            # when the prompt never appears (already authenticated), nothing is
+            # sent and the prompt-anchor expect below still confirms the run.
+            # sudo's timestamp cache covers the remaining sudo probes in this
+            # session; a mid-session re-prompt degrades to an unauthenticated
+            # probe rather than a misdirected password.
+            lines.append("    expect {")
+            lines.append('        "password for" { '
+                         f'send "{_tcl_escape(sudo_password)}\\r"' + " }")
+            lines.append('        "Password:" { '
+                         f'send "{_tcl_escape(sudo_password)}\\r"' + " }")
+            lines.append("    }")
         lines.append(f'    expect "{prompts.node}"')
+        if cmd.startswith("sudo -S "):
+            first_sudo = False
 
+    # Wait the serial disconnect back to the rack manager prompt so the LAST
+    # probe's trailing output (echo + results still in flight on the serial
+    # line) is captured before the expect process exits and kills the session.
     lines.append('    send "exit\\r"')
+    lines.append(f'    expect "{prompts.rack_manager}"')
     lines.append("'")
     return "\n".join(lines)
 
@@ -447,6 +541,104 @@ class _MissingHostReject(paramiko.client.MissingHostKeyPolicy):
         raise paramiko.SSHException(f"host key for {hostname} not in pinned known_hosts")
 
 
+_I2C_TOOLS_BARE = frozenset({"i2cdump", "i2ctransfer", "i2cget", "i2cdetect"})
+
+
+def _absolutize_bmc_i2c_tools(cmd: str) -> str:
+    """Use absolute paths for BMC i2c-tools programs.
+
+    OpenBMC serial shells observed with PATH missing ``/usr/sbin``: the tools
+    are installed (``/usr/sbin/i2cdump -> i2cdump.i2c-tools``) yet every bare
+    invocation fails with ``command not found``. Rewriting bare i2c-tools
+    commands to ``/usr/sbin/<tool>`` makes them run regardless of PATH.
+    """
+    parts = cmd.split()
+    if not parts:
+        return cmd
+    prog_i = 2 if parts[0] == "sudo" and len(parts) > 2 and parts[1] == "-S" else 0
+    if "/" in parts[prog_i]:
+        return cmd
+    prog = parts[prog_i].split("/")[-1]
+    if prog not in _I2C_TOOLS_BARE:
+        return cmd
+    parts[prog_i] = f"/usr/sbin/{prog}"
+    return " ".join(parts)
+
+
+_NAME_BEFORE_ERROR = re.compile(r":\s*([^\s:\"]+)\"?\s*$")
+_EXEC_MISSING = re.compile(r'can\'t exec "([^"]+)": No such file or directory')
+
+
+def _probe_program(cmd: str) -> str:
+    parts = cmd.split()
+    if parts[:2] == ["sudo", "-S"]:
+        parts = parts[2:]
+    if not parts:
+        return ""
+    return parts[0].rsplit("/", 1)[-1]
+
+
+def _not_found_error(output: str, cmd: str) -> str | None:
+    """Return the shell error line for a probe result ONLY when the error names
+    the probe's own program (``sudo: i2cdump: command not found``). Stray
+    session noise (e.g. a password send landing at a bare prompt becomes
+    ``-sh: 0penBmc: command not found``) never references the probe program and
+    must not fake a 127 over real probe output."""
+    prog = _probe_program(cmd)
+    for ln in output.splitlines():
+        m = _CMD_NOT_FOUND.search(ln)
+        if m is None:
+            continue
+        failed = None
+        am = _NAME_BEFORE_ERROR.search(ln[:m.start()])
+        if am is not None:
+            failed = am.group(1)
+        else:
+            em = _EXEC_MISSING.search(ln)
+            if em is not None:
+                failed = em.group(1)
+        if failed is not None and (
+                failed == prog
+                or (failed == "sudo" and cmd.startswith("sudo -S "))):
+            return ln
+    return None
+
+
+def _split_batch_output(transcript: str, wire_cmds: list[str]) -> list[str]:
+    """Slice one console transcript into per-command blocks, line-aware.
+
+    The shell echoes each sent command as a line ending in the command text
+    (``<node prompt><cmd>``), while expect's ``send:`` debug lines never end
+    with the command. Each block spans the lines after a command's echo up to
+    the next command's echo (or the transcript end).
+    """
+    lines = transcript.splitlines()
+    blocks: list[str] = []
+    anchor = 0
+    for i, cmd in enumerate(wire_cmds):
+        start = None
+        j = anchor
+        while j < len(lines):
+            if lines[j].rstrip().endswith(cmd):
+                start = j
+                j += 1
+                break
+            j += 1
+        if start is None:
+            blocks.append("")
+            anchor = len(lines)
+            continue
+        end = len(lines)
+        if i + 1 < len(wire_cmds):
+            for k in range(j, len(lines)):
+                if lines[k].rstrip().endswith(wire_cmds[i + 1]):
+                    end = k
+                    break
+        blocks.append("\n".join(lines[start + 1:end]))
+        anchor = j
+    return blocks
+
+
 class ConsoleRunner:
     """``Runner``-shaped adapter: executes read-only commands over the serial
     console (rack manager + cable), so the whole diagnostic pipeline (model
@@ -459,9 +651,16 @@ class ConsoleRunner:
     pipeline continues instead of crashing.
     """
 
-    def __init__(self, console: SerialConsole) -> None:
+    def __init__(self, console: SerialConsole,
+                 on_probe: Callable[[CommandResult], None] | None = None) -> None:
         self._console = console
         self.calls: list[CommandResult] = []
+        # Optional live listener: fired per recorded result (UI streaming).
+        self.on_probe = on_probe
+        # Results keyed by the WIRE command (absolute paths): a plan-level
+        # pre-batch runs every probe once in ONE console session; later
+        # per-collector executions dedupe against this cache.
+        self.probe_cache: dict[str, CommandResult] = {}
 
     is_console = True
 
@@ -474,17 +673,98 @@ class ConsoleRunner:
             return self._record(CommandResult(
                 argv=list(argv), stdout="", stderr=f"denied: {exc}",
                 exit_code=2, elapsed_ms=0))
+        wire_cmd = _absolutize_bmc_i2c_tools(cmd)
+        if wire_cmd != cmd:
+            # The wire always carries a gate-checked command; the recorded argv
+            # keeps the planned form (source strings, traces, audit stay stable).
+            validate_serial_probe(wire_cmd)
+        cached = self.probe_cache.get(wire_cmd)
+        if cached is not None:
+            return cached    # already executed in the plan-level batch session
         start = time.monotonic()
         try:
-            result = self._console.run_probes([cmd])
+            result = self._console.run_probes([wire_cmd])
             out = CommandResult(argv=list(argv), stdout=result.output, stderr="",
                                 exit_code=0, elapsed_ms=0)
         except SerialConsoleError as exc:
             out = CommandResult(argv=list(argv), stdout="", stderr=str(exc),
                                 exit_code=1, elapsed_ms=0)
+        if out.exit_code == 0:
+            m = _not_found_error(out.stdout, " ".join(argv))
+            if m is not None:
+                # The probe program does not exist on the console: expect exits
+                # 0 while the shell prints ``prog: not found``. Fake-ok dumps
+                # with no register data must never reach the decoder/LLM.
+                out.exit_code = 127
+                out.stderr = f"probe did not run on console: {m}"
         out.elapsed_ms = int((time.monotonic() - start) * 1000)
         return self._record(out)
 
     def _record(self, result: CommandResult) -> CommandResult:
         self.calls.append(result)
+        if self.on_probe is not None:
+            self.on_probe(result)
         return result
+
+    def batch_execute(self, cmds: list[str], timeout: float = 300.0) -> list[CommandResult]:
+        """Run several probes in ONE console session (one rack-manager hop +
+        one serial-session start), returning per-command results in order.
+
+        ``cmds`` are probe strings (e.g. ``sudo -S ipmitool sensor list``);
+        each is gate-checked individually; the recorded argv keeps the planned
+        form. Sequential stop-on-success chains should still use ``execute``
+        per probe -- batching runs every command regardless.
+        """
+        wire_list: list[str] = []
+        denied: dict[str, CommandResult] = {}
+        for cmd in cmds:
+            argv = shlex.split(cmd)
+            security_check(argv)
+            try:
+                validate_serial_probe(cmd)
+            except SerialProbeDenied as exc:
+                denied[cmd] = self._record(CommandResult(
+                    argv=argv, stdout="", stderr=f"denied: {exc}",
+                    exit_code=2, elapsed_ms=0))
+                continue
+            wire_cmd = _absolutize_bmc_i2c_tools(cmd)
+            validate_serial_probe(wire_cmd)
+            wire_list.append(wire_cmd)
+        if not wire_list:
+            return [denied[c] for c in cmds]
+        start = time.monotonic()
+        try:
+            out = self._console.run_probes(wire_list)
+            transcript = out.output
+        except SerialConsoleError as exc:
+            failed: list[CommandResult] = []
+            for cmd in cmds:
+                if cmd in denied:
+                    failed.append(denied[cmd])
+                else:
+                    failed.append(self._record(CommandResult(
+                        argv=shlex.split(cmd), stdout="", stderr=str(exc),
+                        exit_code=1, elapsed_ms=0)))
+            return failed
+        elapsed = int((time.monotonic() - start) * 1000)
+        blocks = _split_batch_output(transcript, wire_list)
+        results: list[CommandResult] = []
+        wire_idx = 0
+        for cmd in cmds:
+            argv = shlex.split(cmd)
+            if cmd in denied:
+                results.append(denied[cmd])
+                continue
+            block = blocks[wire_idx] if wire_idx < len(blocks) else ""
+            result = CommandResult(argv=argv, stdout=block, stderr="",
+                                   exit_code=0, elapsed_ms=elapsed)
+            m = _not_found_error(result.stdout, cmd)
+            if m is not None:
+                # The probe program does not exist on the console: expect exits
+                # 0 while the shell prints ``prog: not found``.
+                result.exit_code = 127
+                result.stderr = f"probe did not run on console: {m}"
+            self.probe_cache[_absolutize_bmc_i2c_tools(cmd)] = result
+            results.append(self._record(result))
+            wire_idx += 1
+        return results
