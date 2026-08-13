@@ -45,6 +45,7 @@ from ..config.vault import SecretStore
 from ..diagnosis.schema import Diagnosis
 from ..operator.supervisor import Escalation
 from ..targets import TargetError, TargetSpec, resolve_target
+from .credential_gate import apply_ssh_context
 from .menu import LineReader as _LineReader
 from .router import SessionCommand, route_message
 
@@ -91,6 +92,9 @@ class Session:
     answer_ready: threading.Event = field(default_factory=threading.Event)
     awaiting: bool = False
     answered: bool = False
+    cred_pending: str | None = None
+    cred_answer: bytes | None = None
+    cred_event: threading.Event = field(default_factory=threading.Event)
     quit: bool = False
     last_tick: float = field(default_factory=time.monotonic)
 
@@ -229,6 +233,7 @@ def _set_target(session: Session, spec: TargetSpec) -> bool:
     except TargetError as exc:
         _print_line(session, f"  x target: {exc}")
         return False
+    apply_ssh_context(session.store, target, ssh_user=session.ssh_user)
     session.host = target.host
     session.target = spec
     session.target_label = target.label
@@ -400,6 +405,40 @@ def _drain_events(session: Session) -> tuple[object | None, str | None]:
         else:
             _render_event(session, kind, payload)
     return result, error
+
+
+def _credential_bridge(session: Session) -> Callable[[str], bytes | None]:
+    """Bridge from the worker thread into the REPL main loop: the worker sets
+    ``cred_pending`` and waits; the loop prompts on the main thread and fires
+    ``cred_event`` to release the worker (see ``_handle_credential``)."""
+    def bridge(vault_path: str) -> bytes | None:
+        session.cred_pending = vault_path
+        session.cred_event.clear()
+        session.cred_event.wait()
+        session.cred_pending = None
+        return session.cred_answer
+    return bridge
+
+
+def _handle_credential(session: Session) -> None:
+    """Prompt the operator on the MAIN thread for a credential the worker needs
+    (see ``OnDemandSecretStore`` / ``CredentialPrompter`` in credential_gate).
+    The answer bytes travel through the event bridge -- never the LLM."""
+    vault_path = session.cred_pending
+    if vault_path is None:
+        return
+    prompter = getattr(session.store, "prompter", None)
+    if prompter is None:
+        session.cred_answer = None
+        session.cred_event.set()
+        return
+    _print_line(session, f"  credential needed: {vault_path}")
+    try:
+        session.cred_answer = prompter.prompt_now(vault_path)
+    except Exception:  # noqa: BLE001 - declined credential stays None, never crash the REPL
+        session.cred_answer = None
+    finally:
+        session.cred_event.set()
 
 
 def _find_newest_run(out_dir: Path, session_dir: Path) -> Path | None:
@@ -908,6 +947,8 @@ def run_session(args, overrides: dict | None = None) -> int:
         except TargetError as exc:
             print(f"error: cannot resolve initial target: {exc}", file=sys.stderr)
             return 2
+    if target is not None:
+        apply_ssh_context(store, target, ssh_user=getattr(args, "ssh_user", "diagbot"))
 
     session = Session(
         inv_path=args.inventory,
@@ -944,6 +985,9 @@ def run_session(args, overrides: dict | None = None) -> int:
 
     reader = overrides.get("reader") or _LineReader()
     session.reader = reader
+    prompter = getattr(store, "prompter", None)
+    if prompter is not None:
+        prompter.set_bridge(_credential_bridge(session))
 
     print(f"harness session | inventory: {args.inventory}")
     print(f"hosts: {', '.join(f'{h.name}({h.trust_level})' for h in hosts)}")
@@ -969,6 +1013,12 @@ def run_session(args, overrides: dict | None = None) -> int:
             if result is not None or error is not None:
                 _finish_task(session, result, error)
                 _save_session(session)
+            if session.cred_pending is not None:
+                if session.task is not None and session.task.alive:
+                    _handle_credential(session)
+                else:
+                    session.cred_pending = None
+                    session.cred_event.set()
             task = session.task
             if (task is not None and not task.alive and task.events.empty()
                     and result is None and error is None):

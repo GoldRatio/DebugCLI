@@ -96,6 +96,7 @@ from ..operator.supervisor import Escalation, RunSupervisor
 from ..plan.profile import plan_collection
 from ..targets import TargetError, TargetSpec, resolve_target
 from ..targets.aliases import AliasError, TargetAlias, load_targets, save_targets
+from .credential_gate import apply_ssh_context
 
 # ---- helpers ----
 
@@ -108,7 +109,10 @@ _MENU_DIAGNOSE_SYMPTOM = (
     "log). Report the current state and the most likely fault class or verdict."
 )
 
-def _make_store(args) -> SecretStore:
+def _make_store(args, *, prompt: bool | None = None) -> SecretStore:
+    """Resolve the lab secret store; when running interactively, wrap it so a
+    missing vault path prompts the OPERATOR on demand (never the agent/LLM)
+    instead of failing the run (see ``operator.credential_gate``)."""
     secret_dir = getattr(args, "secret_dir", None)
     if not secret_dir:
         # auto-discover the well-known lab store, mirroring inventory discovery
@@ -116,9 +120,19 @@ def _make_store(args) -> SecretStore:
             if Path(candidate).is_dir():
                 secret_dir = candidate
                 break
-    if secret_dir:
-        return DirSecretStore(secret_dir)
-    return MemorySecretStore()
+    interactive = (prompt if prompt is not None
+                   else (sys.stdin.isatty()
+                         and os.environ.get("HARNESS_NO_PROMPT") != "1"))
+    if not secret_dir:
+        if not interactive:
+            return MemorySecretStore()
+        # zero-config start: on-demand credentials must PERSIST between runs
+        secret_dir = "secrets"
+    base: SecretStore = DirSecretStore(secret_dir)
+    if not interactive:
+        return base
+    from .credential_gate import CredentialPrompter, OnDemandSecretStore
+    return OnDemandSecretStore(base, CredentialPrompter(base))
 
 
 def _resolve_target_from_args(args, inv: Inventory, store: SecretStore):
@@ -374,12 +388,12 @@ def _seat_pending_case(out: Path, diagnosis: Diagnosis, target_label: str,
         f"- {d.get('mnemonic', '?')} = {d.get('raw_hex', '?')}"
         for d in diagnosis.evidence if isinstance(d, dict)]
     cited = list(dict.fromkeys(
-        r.get("source", "") for r in diagnosis.references
-        if r.get("source")))
+        r.source for r in diagnosis.references
+        if r.source))
     for action in diagnosis.actions:
         for r in action.references:
-            if r.get("source"):
-                cited.append(r.get("source", ""))
+            if r.source:
+                cited.append(r.source)
     cited = [s for s in dict.fromkeys(cited) if _is_doc_source(s)]
     pending = CaseOutcome(
         run_id=session_id,
@@ -560,6 +574,7 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
     inv = load_inventory(args.inventory)
     store = overrides.get("store") or _make_store(args)
     target = _resolve_target_from_args(args, inv, store)
+    apply_ssh_context(store, target, ssh_user=getattr(args, "ssh_user", "diagbot"))
     host: Host = target.host
 
     out = Path(args.out_dir) / SessionTrace().session_id
@@ -764,6 +779,7 @@ def run_console(args) -> int:
     inv = load_inventory(args.inventory)
     store = _make_store(args)
     target = _resolve_target_from_args(args, inv, store)
+    apply_ssh_context(store, target, ssh_user=getattr(args, "ssh_user", "diagbot"))
     host: Host = target.host
     if host.console is None:
         print(f"target {target.label!r} has no console path "
@@ -827,6 +843,7 @@ def run_verify(args, overrides: dict | None = None) -> int:
     inv = load_inventory(args.inventory)
     store = overrides.get("store") or _make_store(args)
     target = _resolve_target_from_args(args, inv, store)
+    apply_ssh_context(store, target, ssh_user=getattr(args, "ssh_user", "diagbot"))
     host: Host = target.host
     baseline = [RegisterDump(**d) for d in json.loads(
         Path(args.baseline).read_text(encoding="utf-8"))]
@@ -1672,7 +1689,9 @@ def run_menu(args) -> int:
     store = _make_store(args)
     if not store.keys() and not getattr(inv, "llm", None):
         print("  hint: nothing registered yet -- pick `setup` to register the "
-              "LLM API key and SSH identity", file=sys.stderr)
+              "LLM API key and SSH identity up front, or just start: the "
+              "agent will ask you for each credential the moment it needs it "
+              "(never through the model)", file=sys.stderr)
     console_default = bool(getattr(args, "console", False))
     print(f"harness menu | inventory: {inv_path} | {len(inv.hosts)} host(s)"
           + (" | console" if console_default else ""))

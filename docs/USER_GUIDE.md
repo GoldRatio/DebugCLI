@@ -78,6 +78,30 @@ What it does, in order:
 Re-running `harness setup` never overwrites an existing SSH key and skips
 vaults that are already registered.
 
+## 2c. Zero-setup start (credentials on demand)
+
+You don't have to register anything before the first run. Launch the interactive
+menu / session with an empty (or missing) `--secret-dir` store; the harness asks
+you for each credential **the moment it is actually needed**, pauses, stores it
+(0o600, git-ignored) and continues:
+
+- **LLM API key** — prompted at the first LLM call (`getpass`, never echoed),
+  written to the inventory's `api_key_vault_path`.
+- **SSH identity** — prompted at session open. Choose *generate* (fresh ed25519
+  via `ssh-keygen`) or *file* (an existing private key). After the key is made,
+  it offers to **install the public key onto the target**: one-time password
+  auth through paramiko, the host-key fingerprint is shown for you to verify,
+  and the pinned `known_hosts` entry is recorded only with your confirmation.
+  The install password is used once and never stored.
+- **BMC / sudo passwords** — prompted at console/IPMI time (`getpass` with a
+  confirmation pass).
+
+Prompts run in the terminal, **never through the agent**: the LLM only ever sees
+vault paths and identifiers, so credentials never appear in prompts,
+transcripts, or the redacted audit log — during the run or afterwards. Set
+`HARNESS_NO_PROMPT=1` (or run with non-tty stdin, e.g. automation/CI) to disable
+prompting and keep the plain `KeyError` / `TargetError` messages instead.
+
 ## 3. Add architecture PDFs to the RAG library
 
 ```powershell
@@ -177,7 +201,7 @@ Under `harness_runs/<run-id>/`:
 | Symptom | Likely cause |
 |---|---|
 | `SerialConsoleError: allowed only at lab/qa` | `trust_level` is `prod`; set `lab`/`qa` |
-| `sudo password missing from vault` | no secret at `sudo_vault_path` |
+| `sudo password missing from vault` | no secret at `sudo_vault_path` (or `HARNESS_NO_PROMPT=1` / non-tty input) |
 | `SerialProbeDenied: ... i2cset ...` | write tool — only reads allowed (`i2cdump`/`i2cget`) |
 | `did not see node prompt "~#"` | wrong/blank cable, or session timeout |
 | `spawn q71-1 rm` fails | rack-manager user lacks `jumpin`, or wrong rack id |

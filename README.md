@@ -25,8 +25,11 @@ prioritized list of **human-approved** repair actions.
   expect-script engine: automatic prompt waits, `sudo -S` password handshake
   (password fetched from the secret store, never embedded), host-key pinning.
 - **Credential safety** — credentials are registered via a non-agent
-  `harness secrets` CLI and never pass through the LLM prompt, transcripts, or
-  audit logs. Vault paths only; `inventory_lint` rejects inline secrets.
+  `harness secrets` CLI (or on demand: `harness menu` / `harness session` prompt
+  the OPERATOR for each credential the moment it is needed — generate + install
+  an SSH key onto the target, capture the LLM key and BMC/sudo passwords via
+  `getpass`) and never pass through the LLM prompt, transcripts, or audit logs.
+  Vault paths only; `inventory_lint` rejects inline secrets.
 - **RAG over vendor PDFs** — hybrid BM25 + dense retrieval over chunked
   hardware docs, plus a parts-lookup graph for FRU/PN validation.
 - **Audit trail** — append-only, hash-chained `audit.jsonl` per run with
@@ -58,6 +61,10 @@ harness lint --inventory inventory.yaml
 # 2. Register credentials once (non-agent CLI, never echoed)
 harness secrets add-ssh 10.0.0.50 --key-file .\secrets\id_ed25519 --secret-dir .\secrets
 harness secrets set-password bmc-ro --secret-dir .\secrets
+
+#    ...or skip registration entirely: the menu/session prompts you for each
+#    credential the first time it is needed (never through the agent):
+harness
 
 # 3. Diagnose — interactive menu (no flags to remember)
 harness

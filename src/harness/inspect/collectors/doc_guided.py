@@ -42,10 +42,11 @@ class DocGuidedProbeCollector(Collector):
         self.commands = commands
 
     def collect(self, **kwargs) -> list[RegisterDump]:
-        # Skip commands already attempted this run -- including failures: a
-        # profile may have tried (and failed with "command not found") the same
-        # dump, and re-running it via the doc path cannot succeed.
-        attempted = {" ".join(c.argv) for c in getattr(self.runner, "calls", [])}
+        # Reuse results the runner already recorded (the plan-level pre-batch
+        # runs doc-named probes in the SAME one-session batch): a probe that
+        # already ran must become evidence, not be skipped. Only commands not
+        # yet attempted execute now.
+        prior = {" ".join(c.argv): c for c in getattr(self.runner, "calls", [])}
         is_console = bool(getattr(self.runner, "is_console", False))
         dumps = []
         for cmd in self.commands:
@@ -54,16 +55,17 @@ class DocGuidedProbeCollector(Collector):
             if (is_console and prog in _PRIVILEGED
                     and not cmd.startswith("sudo -S ")):
                 final = "sudo -S " + cmd
-            if final in attempted:
-                continue
-            try:
-                result = self.runner.execute([final])
-            except ReadOnlyViolation as exc:
-                # Host runner: probe not in the allowlist. Record it as a failed
-                # dump (like ConsoleRunner does for denied probes) so the pipeline
-                # continues instead of crashing.
-                result = CommandResult(argv=[final], stdout="", stderr=str(exc),
-                                       exit_code=2, elapsed_ms=0)
+            if final in prior:
+                result = prior[final]
+            else:
+                try:
+                    result = self.runner.execute([final])
+                except ReadOnlyViolation as exc:
+                    # Host runner: probe not in the allowlist. Record it as a failed
+                    # dump (like ConsoleRunner does for denied probes) so the pipeline
+                    # continues instead of crashing.
+                    result = CommandResult(argv=[final], stdout="", stderr=str(exc),
+                                           exit_code=2, elapsed_ms=0)
             dumps.append(RegisterDump(
                 subsystem=self.subsystem,
                 source=final,

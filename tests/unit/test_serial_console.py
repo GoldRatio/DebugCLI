@@ -581,6 +581,40 @@ def test_bmc_console_collectors_dedupe_probes_across_subsystems():
     ]
 
 
+def test_bmc_console_collector_materializes_prebatched_probes():
+    """The plan-level pre-batch runs the whole plan in ONE console session;
+    collect() must turn those recorded results into RegisterDumps instead of
+    dropping them (otherwise evidence is empty on console runs)."""
+    from harness.engine.runner import CommandResult
+    from harness.inspect.collectors.bmc_console import BmcConsoleCollector
+
+    class _PrewarmedRunner:
+        is_console = True
+
+        def __init__(self, results):
+            self.calls = list(results)
+            self.executed = []
+
+        def execute(self, argv, timeout=30.0):
+            self.executed.append(argv)
+            raise AssertionError(f"collector re-ran a pre-batched probe: {argv!r}")
+
+        def batch_execute(self, cmds, timeout=300.0):
+            raise AssertionError("collector opened a new batch after the pre-batch")
+
+    sensor = CommandResult(argv=["sudo", "-S", "ipmitool", "sensor", "list"],
+                           stdout="ok", stderr="", exit_code=0, elapsed_ms=1)
+    i2cdump = CommandResult(argv=["sudo", "-S", "i2cdump", "-y", "8", "0xb"],
+                            stdout=_FAKE_I2C_ROWS, stderr="", exit_code=0,
+                            elapsed_ms=1)
+    runner = _PrewarmedRunner([sensor, i2cdump])
+    dumps = BmcConsoleCollector(runner, subsystem="cpu").collect()
+    assert runner.executed == []
+    assert [d.source for d in dumps] == ["sudo -S ipmitool sensor list",
+                                         "sudo -S i2cdump -y 8 0xb"]
+    assert all(d.ok for d in dumps)
+
+
 def test_bmc_console_collector_reruns_probe_that_previously_failed():
     from harness.engine.runner import CommandResult
     from harness.inspect.collectors.bmc_console import BmcConsoleCollector

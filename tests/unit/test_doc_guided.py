@@ -73,3 +73,32 @@ def test_plan_collection_ignores_unsafe_doc_commands():
     plan = plan_collection("amber light",
                            ["[doc p.2] Run `ipmitool sel clear` to reset the log."])
     assert plan.doc_probes == []
+
+
+def test_doc_probe_collector_materializes_prebatched_probes():
+    """Doc-named probes pre-batched into the one console session must become
+    RegisterDumps from the recorded result, not be skipped (else doc-named
+    evidence is empty on console runs)."""
+    from harness.engine.runner import CommandResult
+    from harness.inspect.collectors.doc_guided import DocGuidedProbeCollector
+
+    class _PrewarmedRunner:
+        is_console = True
+
+        def __init__(self, results):
+            self.calls = list(results)
+            self.executed = []
+
+        def execute(self, argv, timeout=30.0):
+            self.executed.append(argv)
+            raise AssertionError(f"collector re-ran a pre-batched probe: {argv!r}")
+
+    i2cdump = CommandResult(
+        argv=["sudo", "-S", "i2cdump", "-y", "8", "0xb"],
+        stdout="1b: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n",
+        stderr="", exit_code=0, elapsed_ms=1)
+    runner = _PrewarmedRunner([i2cdump])
+    dumps = DocGuidedProbeCollector(runner, ["i2cdump -y 8 0xb"]).collect()
+    assert runner.executed == []
+    assert [d.source for d in dumps] == ["sudo -S i2cdump -y 8 0xb"]
+    assert dumps[0].ok

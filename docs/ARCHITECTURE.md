@@ -49,7 +49,11 @@ symptom ─▶ plan.symptom -> subsystem ─▶ minimal collector set
 
 ## Credential flow
 
-1. Operator registers material with `harness secrets` (non-agent CLI).
+1. Operator registers material with `harness secrets` (non-agent CLI) **or** on
+   demand: `operator/credential_gate.py` wraps the store, and the first time a
+   vault path is actually needed (LLM call / SSH open / console probe) the
+   operator is prompted in the terminal — generate + install an SSH key onto the
+   target, or `getpass` the LLM/BMC/sudo credentials. Non-tty runs skip prompting.
 2. Inventory YAML stores **vault paths only** — `inventory_lint` rejects inline
    secrets at load.
 3. Prompts and transcripts carry identifiers + vault paths; the LLM never sees

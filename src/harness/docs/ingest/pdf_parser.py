@@ -12,9 +12,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 try:  # optional dependency (`pip install harness[docs]`)
-    import fitz  # pymupdf
+    import pymupdf
 except Exception:  # noqa: BLE001 - optional dependency, degrade gracefully
-    fitz = None
+    pymupdf = None
 
 
 @dataclass(frozen=True)
@@ -30,9 +30,9 @@ class PdfParser:
         self.ocr = ocr
 
     def parse(self, path: str | Path) -> list[PageText]:
-        if fitz is None:
+        if pymupdf is None:
             raise RuntimeError("pymupdf not installed; install harness[docs]")
-        doc = fitz.open(str(path))
+        doc = pymupdf.open(str(path))
         pages = []
         for i, page in enumerate(doc, start=1):
             text = page.get_text().strip()

@@ -100,14 +100,13 @@ class BmcConsoleCollector(Collector):
         return non_i2c + ([first_i2c] if first_i2c is not None else [])
 
     def collect(self, **kwargs) -> list[RegisterDump]:
-        # Skip probes this run already executed successfully (the generic plan
-        # overlaps: sensor list in cpu+ipmi, sel list in kernel+ipmi, and
-        # detect_model already ran fru print). One console round-trip ~30s.
-        done = {" ".join(c.argv) for c in getattr(self.runner, "calls", []) if c.ok}
-        pending = [(cmd, kind) for cmd, kind in _BMC_PROBES[self.subsystem]
-                   if cmd not in done]
-        if not pending:
-            return []
+        # Probes the runner has already executed successfully this run (the
+        # plan-level pre-batch runs the whole plan in ONE console session; the
+        # generic plan also overlaps sensor/sel/fru across subsystems) are
+        # REUSED as evidence, never re-run and never dropped. Only probes not
+        # yet attempted -- or previously failed -- execute now.
+        prior = {" ".join(c.argv): c for c in getattr(self.runner, "calls", [])}
+        ok_prior = {cmd: result for cmd, result in prior.items() if result.ok}
 
         def _dump(cmd: str, kind: str, result) -> RegisterDump:
             return RegisterDump(
@@ -120,24 +119,37 @@ class BmcConsoleCollector(Collector):
                       "kind": kind},
             )
 
-        # CPLD dump chain: stop at the first candidate that produced real
-        # register rows; failed candidates stay in the record as evidence.
-        batch = [p for p in pending if p[1] != "i2c"]
-        chain = [p for p in pending if p[1] == "i2c"]
-        if batch and hasattr(self.runner, "batch_execute"):
-            results = self.runner.batch_execute([c for c, _ in batch])
-            dumps = [_dump(c, k, r) for (c, k), r in zip(batch, results)]
+        # Non-i2c probes: materialize any already-run success as a dump, then
+        # execute the rest (batched when the runner supports it).
+        dumps: list[RegisterDump] = []
+        pending: list[tuple[str, str]] = []
+        for cmd, kind in _BMC_PROBES[self.subsystem]:
+            if kind == "i2c":
+                continue
+            cached = ok_prior.get(cmd)
+            if cached is not None:
+                dumps.append(_dump(cmd, kind, cached))
+            else:
+                pending.append((cmd, kind))
+        if pending and hasattr(self.runner, "batch_execute"):
+            results = self.runner.batch_execute([c for c, _ in pending])
+            dumps.extend(_dump(c, k, r) for (c, k), r in zip(pending, results))
         else:
-            dumps = []
-            for cmd, kind in batch:
-                result = self.runner.execute([cmd])
-                dumps.append(_dump(cmd, kind, result))
-        for cmd, kind in chain:
-            if kind == "i2c" and any(
-                    d.meta.get("kind") == "i2c" and d.ok
-                    and _has_register_output(d.source, d.raw) for d in dumps):
+            for cmd, kind in pending:
+                dumps.append(_dump(cmd, kind, self.runner.execute([cmd])))
+
+        # CPLD dump chain: stop at the first candidate that produced real
+        # register rows; a pre-batched first candidate is reused rather than
+        # re-run, and failed candidates stay in the record as evidence.
+        for cmd, kind in _BMC_PROBES[self.subsystem]:
+            if kind != "i2c":
+                continue
+            if any(d.meta.get("kind") == "i2c" and d.ok
+                   and _has_register_output(d.source, d.raw) for d in dumps):
                 break
-            result = self.runner.execute([cmd])
+            result = ok_prior.get(cmd)
+            if result is None:
+                result = self.runner.execute([cmd])
             dumps.append(_dump(cmd, kind, result))
             if kind == "i2c" and result.ok and _has_register_output(cmd, result.stdout):
                 break
