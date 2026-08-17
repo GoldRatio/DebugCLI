@@ -15,7 +15,7 @@ from ..base import RegisterDump
 from . import Collector
 
 # BMC BusyBox shell needs `sudo -S` for privileged tools; plain `dmesg` does not.
-_PRIVILEGED = ("i2cdump", "i2cget", "i2cdetect", "ipmitool")
+_PRIVILEGED = ("i2cdump", "i2cget", "i2cdetect", "i2ctransfer", "ipmitool")
 
 
 def _kind_for(cmd: str) -> str:
@@ -27,7 +27,8 @@ def _kind_for(cmd: str) -> str:
         return "fru"
     if "dmesg" in cmd:
         return "dmesg"
-    if "i2cdump" in cmd or "i2cget" in cmd or "i2cdetect" in cmd:
+    if "i2cdump" in cmd or "i2cget" in cmd or "i2cdetect" in cmd \
+            or "i2ctransfer" in cmd:
         return "i2c"
     return "other"
 

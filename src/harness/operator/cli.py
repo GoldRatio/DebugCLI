@@ -343,6 +343,85 @@ def _parts_check(parts_graph: dict, dump_sets) -> object:
     return PartsValidator().validate_fru(parts_graph, fru_text)
 
 
+def _parse_parts_line(line: str, rail: str) -> dict | None:
+    """``slot, FRU, PN, SN`` (comma-separated) -> instance-part entry."""
+    cells = [c.strip() for c in (line or "").split(",")]
+    if not cells or not cells[0]:
+        return None
+    entry = {"slot": cells[0], "rail": rail}
+    if len(cells) > 1 and cells[1]:
+        entry["fru"] = cells[1]
+    if len(cells) > 2 and cells[2]:
+        entry["pn"] = cells[2]
+    if len(cells) > 3 and cells[3]:
+        entry["sn"] = cells[3]
+    return entry
+
+
+def _make_parts_ask(store, target_label: str, progress: Callable[[str], None],
+                    repl_input) -> Callable[[str], list[dict]]:
+    """Isolation-pass parts-ask callback: prompt the operator, persist answers.
+
+    ``repl_input`` is the REPL's human-input bridge when running inside a
+    session (its ``_make_answer_fn``); the bridge renders nothing itself, so the
+    question is shown through ``progress``. Otherwise a TTY ``input`` is used.
+    Automated runs (no bridge, no TTY) never block: they return [] and leave the
+    gap on record. The documented rail->loads topology (from ``topology.py``)
+    pre-fills the question's candidate slots so the operator confirms/extends
+    instead of enumerating from memory.
+    """
+
+    def _candidate_loads(rail: str) -> list[str]:
+        from ..docs.parts.topology import loads_for_rail
+        names: list[str] = []
+        for edge in loads_for_rail(rail, None):
+            for load in edge.get("loads") or []:
+                name = load.get("name")
+                conn = load.get("connection")
+                if name and name not in names:
+                    names.append(name + (f" ({conn})" if conn else ""))
+        return names
+
+    def ask(rail: str) -> list[dict]:
+        if repl_input is not None:
+            ask_ui = repl_input
+        elif sys.stdin.isatty():
+            ask_ui = input
+        else:
+            progress(f"ask-parts: no parts on record for {target_label!r}; "
+                     f"skipped (no interactive TTY)")
+            return []
+        candidates = _candidate_loads(rail)
+        progress(f"ask-parts: no parts on record for {target_label!r}; "
+                 f"prompting for the {rail!r} rail loads")
+        entries: list[dict] = []
+        while True:
+            question = (
+                f"[parts] {rail} fault decoded -- which components are on this rail?"
+                + (f"\n  documented loads: {', '.join(candidates)}" if candidates else "")
+                + "\n  enter one component as: slot, FRU, PN, SN   "
+                "('done' to finish, 'skip' to skip)")
+            if repl_input is not None:
+                progress(question)
+            answer = ask_ui(question)
+            text = (answer or "").strip()
+            if not text or text.lower() in ("done", "skip", "none"):
+                break
+            entry = _parse_parts_line(text, rail)
+            if entry is None:
+                progress("  (unrecognized; expected 'slot, FRU, PN, SN')")
+                continue
+            entries.append(entry)
+            progress(f"  recorded {entry['slot']}")
+        if entries:
+            store.merge(target_label, entries)
+            progress(f"  saved {len(entries)} part(s) for {target_label!r} "
+                     f"({store.path_for(target_label)})")
+        return entries
+
+    return ask
+
+
 def _save_dumps(out: Path, dump_sets) -> None:
     dumps_dir = out / "dumps"
     dumps_dir.mkdir(exist_ok=True)
@@ -672,6 +751,22 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
         supervisor.check(label)
 
     parts_graph = _load_parts_graph(getattr(args, "parts_csv", None))
+    # Operator-answered instance parts (prompted under --ask-parts) persist per
+    # target and are reused by future runs; the explicit CSV wins on a slot.
+    from ..docs.parts.instance_store import InstancePartsStore, merge_store_into_parts
+    parts_store = InstancePartsStore(getattr(args, "parts_dir", "config/parts"))
+    stored_parts = parts_store.load(target.label)
+    parts_graph = merge_store_into_parts(parts_graph, stored_parts)
+    parts_ask = (_make_parts_ask(parts_store, target.label, progress,
+                                 overrides.get("human_input"))
+                 if getattr(args, "ask_parts", False) else None)
+
+    # Documented power-topology edges (rail -> loads) for the fault-isolation
+    # round: the decoded rail fault is mapped back to the loads it feeds so the
+    # prompt enumerates the whole suspect set. Keyed to the detected model when
+    # known, else every platform is returned with its own label.
+    from ..docs.parts.topology import loads_for_rail
+    topology_hook = lambda sig, model_key: loads_for_rail(sig, model_key)
 
     def collector_factory(name, _runner):
         if _runner.is_console:
@@ -691,12 +786,20 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
     calibration_root = Path(args.out_dir) / "calibration"
     ident = _llm_ident_for(args, inv)
 
+    # Snippets the engine actually put in the prompt (first-pass + isolation
+    # round). The scorer reads these so LLM citations to isolation snippets are
+    # counted as supported instead of re-retrieving the symptom only.
+    used_snippets: dict[str, list[str]] = {"lines": []}
+
     ctx = EngineContext(
         runner=runner,
         decoder=Decoder(),
         collector_factory=collector_factory,
         llm=llm,
         docs_retriever=retriever,
+        snippets_callback=lambda lines: used_snippets.update(lines=lines),
+        parts_ask=parts_ask,
+        topology=topology_hook,
         parts_refs=(
             lambda: [f"{k}: {v}" for k, v in parts_graph.items()]
         ) if parts_graph else None,
@@ -707,7 +810,8 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
             lambda d, dump_sets: score_diagnosis(
                 d,
                 retrieved_snippets=(
-                    retriever(args.symptom, None) if retriever else None
+                    used_snippets["lines"]
+                    or (retriever(args.symptom, None) if retriever else None)
                 ),
                 evidence_fit=(
                     None if d.evidence else evidence_fit_from_dumps(d, dump_sets)
@@ -1271,6 +1375,7 @@ _WIZARD_FLAGS: dict[str, str] = {
     "--docs-lib": "docs_lib",
     "--docs-dir": "docs_dir",
     "--parts-csv": "parts_csv",
+    "--parts-dir": "parts_dir",
     "--out-dir": "out_dir",
     "--session-dir": "session_dir",
     "--targets-file": "targets_file",
@@ -1278,9 +1383,9 @@ _WIZARD_FLAGS: dict[str, str] = {
 
 _ALLOWED_FLAGS: dict[str, tuple[str, ...]] = {
     "diagnose": ("--secret-dir", "--docs-lib", "--docs-dir", "--parts-csv",
-                 "--out-dir", "--targets-file"),
+                 "--parts-dir", "--out-dir", "--targets-file"),
     "session": ("--secret-dir", "--docs-lib", "--docs-dir", "--parts-csv",
-                "--out-dir", "--session-dir", "--targets-file"),
+                "--parts-dir", "--out-dir", "--session-dir", "--targets-file"),
     "console": ("--secret-dir", "--out-dir", "--targets-file"),
     "verify": ("--secret-dir", "--targets-file"),
     "setup": ("--secret-dir",),
@@ -1423,6 +1528,8 @@ def _wizard_flags(args, subcommand: str) -> list[str]:
             argv += ["--llm", llm]
         if getattr(args, "console", False):
             argv.append("--console")
+        if getattr(args, "ask_parts", False):
+            argv.append("--ask-parts")
     return argv
 
 
@@ -1827,6 +1934,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="directory of architecture PDFs (legacy; prefer --docs-lib)")
     p.add_argument("--parts-csv", default=None,
                    help="parts list CSV (columns: slot,fru,pn,sn)")
+    p.add_argument("--ask-parts", action="store_true",
+                   help="interactive: prompt for and store missing per-slot instance parts")
+    p.add_argument("--parts-dir", default="config/parts",
+                   help="where answered instance parts are persisted, one file per target")
     p.add_argument("--console", action="store_true",
                    help="prefer the serial console for targets (lab/qa only)")
     p.add_argument("--out-dir", default="harness_runs")
@@ -1896,6 +2007,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--approval", action="store_true", help="prompt y/N for each action")
     p.add_argument("--approve-all", action="store_true", help="record every action approved")
     p.add_argument("--wall-s", type=float, default=900.0, help="supervisor wall-clock budget")
+    p.add_argument("--ask-parts", action="store_true",
+                   help="interactive: when a rail fault is decoded, prompt for the "
+                        "operator's per-slot instance parts and store them for future runs")
+    p.add_argument("--parts-dir", default="config/parts",
+                   help="where answered instance parts are persisted, one file per target")
     p.set_defaults(func=run_diagnose)
 
     p = sub.add_parser("console", help="run read-only probes over the serial console (lab/qa only)")
@@ -1936,6 +2052,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="directory of architecture PDFs used for RAG "
                        "(legacy ad-hoc; prefer --docs-lib)")
     p.add_argument("--parts-csv", help="parts list CSV (columns: slot,fru,pn,sn)")
+    p.add_argument("--ask-parts", action="store_true",
+                   help="interactive: when a rail fault is decoded, prompt for the "
+                        "operator's per-slot instance parts and store them for future runs")
+    p.add_argument("--parts-dir", default="config/parts",
+                   help="where answered instance parts are persisted, one file per target")
     p.add_argument("--console", action="store_true",
                    help="run probes over the serial console (lab/qa only)")
     p.add_argument("--out-dir", default="harness_runs",

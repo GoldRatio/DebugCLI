@@ -26,6 +26,11 @@ _PROBE_PATTERNS = [
     re.compile(r"\bi2cget(?:\s+-[yfa]+)?\s+\d+\s+0x[0-9a-fA-F]+(?:\s+0x[0-9a-fA-F]+)?"),
     # i2cdetect [-y|-a|-l|-q|-r] <bus>
     re.compile(r"\bi2cdetect(?:\s+-[yfalqr]+)?\s+\d+"),
+    # i2ctransfer block read: `i2ctransfer -y <bus> [w<n>@0x..] 0x.. ... r<n>`
+    # (the FPGA register dumps e.g. `i2ctransfer -y 2 w2@0x11 0x00 0x00 r256`).
+    re.compile(
+        r"\bi2ctransfer(?:\s+-[yfv]+)?\s+\d+"
+        r"(?:\s+(?:[rw]\d+(?:@0x[0-9a-fA-F]{1,2})?|0x[0-9a-fA-F]{1,2}))+"),
     # ipmitool read-only forms: sdr [list|elist]; sensor list/elist; sel list/info;
     # fru print. Destructive forms ("sel clear", "sensor set") are not expressible.
     re.compile(r"\bipmitool\s+(?:sdr(?:\s+(?:list|elist))?|sensor\s+(?:list|elist)"

@@ -204,6 +204,20 @@ def test_diagnose_with_parts_csv(tmp_path):
     assert diag.parts_discrepancies == []
 
 
+def test_diagnose_ask_parts_never_hangs_without_tty(tmp_path, monkeypatch, capsys):
+    """--ask-parts on a non-interactive run must not block: no rail fault is
+    decoded for this MCE run, and even if one were, a missing TTY skips the
+    prompt and completes."""
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    args = _diagnose_args(tmp_path)
+    args.ask_parts = True
+    args.parts_dir = str(tmp_path / "config" / "parts")
+    diag = run_diagnose(args, overrides={"session": FakeSession(), "llm": _fake_llm})
+    assert diag.diagnosis  # pipeline completed
+    # nothing was prompted or persisted
+    assert not list((tmp_path / "config" / "parts").glob("*.json"))
+
+
 def test_verify_against_baseline(tmp_path, capsys):
     baseline = tmp_path / "dumps.json"
     baseline.write_text(json.dumps([{

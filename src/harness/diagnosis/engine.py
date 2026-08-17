@@ -27,6 +27,11 @@ from .parts_validate import PartsCheckResult
 from .prompt import build_prompt
 from .schema import Diagnosis
 
+# dump_sets key for the fault-isolation probe round. Kept separate so its raw
+# i2c/register output is surfaced to the LLM as raw evidence and NEVER decoded
+# through the (single-device) register catalog, which would misattribute bytes.
+ISOLATION_DUMPS_KEY = "doc_guided_isolation"
+
 
 @dataclass
 class EngineContext:
@@ -46,6 +51,9 @@ class EngineContext:
     model_hint: str | None = None  # canonical key from target alias / inventory (fallback only)
     model_ask: Callable[[], str | None] | None = None  # optional, non-blocking operator fallback
     case_library: Callable[[str, str | None], list[str]] | None = None  # symptom, model_key -> prior-case lines
+    snippets_callback: Callable[[list[str]], None] | None = None  # audit/scorer: the exact snippet union used in the prompt
+    parts_ask: Callable[[str], list[dict]] | None = None  # rail key -> operator-supplied parts (slot->fru/pn/sn) or []
+    topology: Callable[[dict, str | None], list[dict]] | None = None  # fault sig, model_key -> documented rail->loads edges
     # Prompt 05 contract (optional field only): outcome-fed subsystem priors.
     # None keeps the static heuristic table (plan_collection/classify).
     priors: object | None = None  # plan.subsystem.PriorModel | None (lazy import)
@@ -185,6 +193,19 @@ class DiagnosticEngine:
         all_dumps = [d for dumps in dump_sets.values() for d in dumps]
         summaries = summarize(all_dumps)
 
+        # 3b. Fault-isolation pass: a decoded power-rail fault is a FAILURE POINT,
+        # not a root cause. When one is present, retrieve the documented isolation
+        # procedure, run the read-only probes it names (second, targeted round),
+        # and -- when opted in -- prompt for the operator's instance parts data.
+        iso_snippets, iso_dumps, iso_parts, iso_topology = self._run_isolation_pass(
+            decoded, summaries, model_key)
+        if iso_dumps:
+            dump_sets[ISOLATION_DUMPS_KEY] = iso_dumps
+        all_snippets = _dedupe([*snippets, *iso_snippets])
+        if iso_snippets or iso_dumps or iso_parts or iso_topology:
+            _emit(f"isolate: {len(iso_snippets)} snippet(s), "
+                  f"{len(iso_dumps)} probe(s) run for fault isolation")
+
         # 4. Parts refs (snippets already retrieved at step 0).
         parts = self.ctx.parts_refs() if self.ctx.parts_refs else []
 
@@ -195,7 +216,10 @@ class DiagnosticEngine:
             model=model,
             decoded=decoded,
             summaries=summaries,
-            doc_snippets=snippets,
+            doc_snippets=all_snippets,
+            isolation_probes=iso_dumps,
+            isolation_parts=iso_parts,
+            topology=iso_topology,
             parts_refs=parts,
             symptom=symptom,
             prior_cases=prior_cases,
@@ -214,6 +238,8 @@ class DiagnosticEngine:
             self.ctx.dump_callback(dump_sets)
         if self.ctx.parts_validate is not None:
             diagnosis.parts_discrepancies = self.ctx.parts_validate(dump_sets).discrepancies
+        if self.ctx.snippets_callback is not None:
+            self.ctx.snippets_callback(all_snippets)
         if self.ctx.scorer is not None:
             diagnosis = self.ctx.scorer(diagnosis, dump_sets)
         _emit(f"score: confidence {diagnosis.confidence:.2f}")
@@ -224,10 +250,76 @@ class DiagnosticEngine:
                                     self.ctx.model_ask)
 
     def _decode_all(self, dump_sets: dict[str, list[RegisterDump]]):
+        # The fault-isolation round holds raw evidence for a device the register
+        # catalog does not cover; decoding it through the catalog would
+        # misattribute bytes, so it is never routed to the decoder.
+        decode_sets = {k: v for k, v in dump_sets.items()
+                       if k != ISOLATION_DUMPS_KEY}
         return decode_dumps(
             self.ctx.decoder,
-            [d for dumps in dump_sets.values() for d in dumps],
+            [d for dumps in decode_sets.values() for d in dumps],
         )
+
+    def _run_isolation_pass(self, decoded, summaries, model_key):
+        """Second, fault-isolation round for decoded power-rail faults.
+
+        Returns ``(isolation_snippets, isolation_dumps, isolation_parts,
+        isolation_topology)``. Deterministic no-op when no rail fault is decoded
+        or no doc library is wired. All probes are deny-by-default read-only (the
+        same gate as the first pass); on a console runner the new probes batch
+        into one serial session. Isolation output is raw evidence, never
+        catalog-decoded (see ``ISOLATION_DUMPS_KEY``). When ``parts_ask`` is
+        configured it fires with the rail key so the operator can supply instance
+        parts data; the answers are returned (and persisted by the caller's
+        callback). ``topology`` maps the fault to the documented rail->loads
+        edges (which loads the failing rail feeds) so the prompt can enumerate
+        the suspect set instead of guessing a single FRU.
+        """
+        from ..inspect.collectors.doc_guided import _PRIVILEGED, DocGuidedProbeCollector
+        from ..plan.doc_guided import mine_probe_commands
+        from ..plan.isolation import build_isolation_queries, detect_fault_signature
+
+        sig = detect_fault_signature(decoded, summaries)
+        if sig is None or self.ctx.docs_retriever is None:
+            return [], [], [], []
+        if self.ctx.supervisor is not None:
+            self.ctx.supervisor("isolate")
+
+        iso_parts: list[dict] = []
+        if self.ctx.parts_ask is not None:
+            iso_parts = self.ctx.parts_ask(sig["rail_tokens"]) or []
+
+        iso_topology: list[dict] = []
+        if self.ctx.topology is not None:
+            iso_topology = self.ctx.topology(sig, model_key) or []
+
+        iso_snippets: list[str] = []
+        for query in build_isolation_queries(sig):
+            for s in self.ctx.docs_retriever(query, model_key) or []:
+                if s not in iso_snippets:
+                    iso_snippets.append(s)
+        iso_snippets = iso_snippets[:8]
+        if not iso_snippets:
+            return [], [], iso_parts, iso_topology
+
+        probes: list[str] = []
+        for probe in mine_probe_commands(iso_snippets):
+            prog = probe.split()[0].split("/")[-1]
+            final = probe
+            if (getattr(self.ctx.runner, "is_console", False)
+                    and prog in _PRIVILEGED
+                    and not probe.startswith("sudo -S ")):
+                final = "sudo -S " + probe
+            if final not in probes:
+                probes.append(final)
+        done = {" ".join(c.argv) for c in getattr(self.ctx.runner, "calls", [])}
+        new_probes = [p for p in probes if p not in done]
+        if new_probes and getattr(self.ctx.runner, "is_console", False) \
+                and hasattr(self.ctx.runner, "batch_execute"):
+            self.ctx.runner.batch_execute(new_probes)
+        dumps = DocGuidedProbeCollector(self.ctx.runner, new_probes).collect() \
+            if new_probes else []
+        return iso_snippets, dumps, iso_parts, iso_topology
 
 
 def decode_dumps(decoder: Decoder, dumps: list[RegisterDump]) -> list[RegisterDecode]:
@@ -255,4 +347,16 @@ def _to_subsystems(ranking) -> list:
             out.append(Subsystem(r.subsystem))
         except ValueError:
             out.append(Subsystem.GENERIC)
+    return out
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    """Order-preserving dedupe (first-pass + isolation snippets can overlap)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
     return out

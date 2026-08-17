@@ -49,6 +49,16 @@ and repair path -- or a clean verdict when nothing is anomalous. If a non-dumped
 register is flagged UNKNOWN, propose the read-only probe that would capture it
 rather than guessing its value.
 
+Power-rail fault registers (any *_pwrup_flt / *_rtime_flt / *_vr_flt, a RUN
+power fault, or RUN power not good) are FAILURE POINTS, not root causes: a rail
+that fails to come up is downstream of every load it feeds, and a shorted load,
+a connector/busbar, or the supplying board can all produce the same register.
+When such a fault is decoded, treat the suspect set as the whole power path:
+enumerate the loads on that rail and the documented isolation step for each
+before recommending a single FRU replacement. If the Isolation Probe Evidence
+section below shows raw read-only output, map its offsets with the retrieved
+isolation snippet -- do not assert a register meaning the catalog did not decode.
+
 Prior Verified Cases are observed history from THIS fleet. Use them to weigh
 likelihoods, never as documentation: they MUST NOT be cited as a Reference
 source. If a prior case contradicts the vendor snippets, the snippets and
@@ -97,6 +107,71 @@ def _prior_cases_section(prior_cases: list[str]) -> list[str]:
     return lines
 
 
+def _isolation_probes_section(isolation_probes: list | None) -> list[str]:
+    """Raw fault-isolation probe output, kept separate from catalog decodes."""
+    lines = ["## Isolation Probe Evidence"]
+    probes = isolation_probes or []
+    if not probes:
+        lines.append("(none)")
+        return lines
+    lines.append(
+        "Read-only probes run to isolate the fault. Output is RAW (not "
+        "catalog-decoded): map each offset/byte using the retrieved isolation "
+        "snippet above.")
+    for dump in probes:
+        lines.append(f"- {dump.source}")
+        raw = (dump.raw or "").strip().splitlines()
+        for line in raw[:40]:
+            lines.append(f"    {line.strip()}")
+        if len(raw) > 40:
+            lines.append(f"    ... ({len(raw) - 40} more lines in the audit dump)")
+    return lines
+
+
+def _operator_parts_section(parts: list | None) -> list[str]:
+    """Operator-answered instance parts for the affected rail (fleet truth)."""
+    lines = ["## Operator-Supplied Parts"]
+    entries = [e for e in (parts or []) if e and e.get("slot")]
+    if not entries:
+        return lines + ["(none)"]
+    lines.append("Instance data answered by the operator for the affected rail "
+                 "(persisted for future runs):")
+    for entry in entries:
+        slot = entry.get("slot")
+        fru = entry.get("fru") or ""
+        pn = entry.get("pn") or ""
+        sn = entry.get("sn") or ""
+        lines.append(f"- {slot}: {fru}"
+                     + (f" ({pn})" if pn else "")
+                     + (f", SN {sn}" if sn else ""))
+    return lines
+
+
+def _power_topology_section(topology: list | None) -> list[str]:
+    """Documented rail->loads edges for the decoded fault (suspect set)."""
+    lines = ["## Power-Topology (documented rail loads)"]
+    edges = [e for e in (topology or []) if e and e.get("rail")]
+    if not edges:
+        return lines + ["(none)"]
+    lines.append("Rail-to-loads edges extracted from the architecture docs for "
+                 "the decoded fault; each suspect below is on the failing rail "
+                 "and is a candidate root cause:")
+    for edge in edges:
+        lines.append(f"- {edge.get('rail')} ({edge.get('voltage') or '?'}"
+                     + f", platform {edge.get('platform') or '?'}"
+                     + (f", {', '.join(edge.get('refs') or [])}" if edge.get("refs")
+                        else "")
+                     + ")")
+        for load in edge.get("loads") or []:
+            name = load.get("name")
+            conn = load.get("connection")
+            refs = load.get("refs") or []
+            lines.append(f"    - {name}"
+                         + (f" -- {conn}" if conn else "")
+                         + (f" [{', '.join(refs)}]" if refs else ""))
+    return lines
+
+
 def build_prompt(*,
                  model: DetectedModel | None,
                  decoded: list[RegisterDecode],
@@ -104,6 +179,9 @@ def build_prompt(*,
                  doc_snippets: list[str],
                  parts_refs: list[str],
                  symptom: str,
+                 isolation_probes: list | None = None,
+                 isolation_parts: list | None = None,
+                 topology: list | None = None,
                  prior_cases: list[str] | None = None) -> str:
     model_key = _model_key(model)
     lines = [
@@ -131,6 +209,11 @@ def build_prompt(*,
     lines.extend(["", "## Anomalous Evidence Summary"])
     lines.extend(summaries.interesting or ["(none)"])
     lines.extend(_snippets_section(doc_snippets, model_key))
+    lines.extend(["", *_isolation_probes_section(isolation_probes)])
+    if topology:
+        lines.extend(["", *_power_topology_section(topology)])
+    if isolation_parts:
+        lines.extend(["", *_operator_parts_section(isolation_parts)])
     lines.extend(["", "## Parts List References"])
     lines.extend(parts_refs or ["(none)"])
     lines.extend(["", *_prior_cases_section(prior_cases or [])])
