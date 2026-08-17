@@ -1,9 +1,10 @@
 """Plan + diagnosis orchestration smoke test with a fake runner + fake LLM."""
 
+import shlex
 from typing import ClassVar
 
 from harness.diagnosis.engine import DiagnosticEngine, EngineContext
-from harness.diagnosis.schema import Action, Diagnosis, Reference, Risk
+from harness.diagnosis.schema import Action, Diagnosis, Reference, Risk, ServerState
 from harness.engine.allowlist import AllowPolicy, AllowRule
 from harness.engine.runner import Runner
 from harness.inspect.decoder import Decoder
@@ -149,6 +150,251 @@ class FakeConsoleRunner(Runner):
         key = " ".join(argv)
         out = self.OUTPUT.get(key, "")
         return CommandResult(argv=argv, stdout=out, stderr="", exit_code=0, elapsed_ms=1)
+
+
+class _FlakyFruConsole(FakeConsoleRunner):
+    """Console runner whose FIRST fru print fails (transient session) but then
+    succeeds when the plan-level batch re-runs it. Mirrors ConsoleRunner's
+    ``probe_cache``/``batch_execute`` so re-detection serves the cached batch
+    result instead of opening a third session."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.probe_cache: dict[str, object] = {}
+        self._fru_runs = 0
+
+    def execute(self, argv, timeout=300.0):
+        from harness.engine.runner import CommandResult
+        cmd = " ".join(argv)
+        cached = self.probe_cache.get(cmd)
+        if cached is not None:
+            return cached
+        self._fru_runs += 1
+        if cmd == "sudo -S ipmitool fru print" and self._fru_runs == 1:
+            return self._record(CommandResult(
+                argv=argv, stdout="", stderr="session dropped",
+                exit_code=1, elapsed_ms=1))
+        out = self.OUTPUT.get(cmd, "")
+        return self._record(CommandResult(
+            argv=argv, stdout=out, stderr="", exit_code=0, elapsed_ms=1))
+
+    def batch_execute(self, cmds, timeout=300.0):
+        from harness.engine.runner import CommandResult
+        results = []
+        for cmd in cmds:
+            argv = shlex.split(cmd)
+            out = self.OUTPUT.get(cmd, "")
+            res = CommandResult(argv=argv, stdout=out, stderr="",
+                                exit_code=0, elapsed_ms=1)
+            self.probe_cache[cmd] = res
+            results.append(self._record(res))
+        return results
+
+    def _record(self, result):
+        self.calls.append(result)
+        return result
+
+
+def test_console_prebatch_recovers_model_from_flaky_fru():
+    """A transient first FRU failure must not stick: the plan-level pre-batch
+    re-runs the model probe, and re-detection serves the cached result (zero
+    extra sessions, and the model facts reach the hook + retriever)."""
+    from harness.inspect.collectors.bmc_console import BmcConsoleCollector
+
+    runner = _FlakyFruConsole()
+    seen_keys = []
+    hooks = []
+
+    def retriever(query, model_key):
+        seen_keys.append(model_key)
+        return []
+
+    def factory(name, _runner):
+        if name in ("cpu_msr", "kernel", "ipmi"):
+            return BmcConsoleCollector(_runner, subsystem={
+                "cpu_msr": "cpu", "kernel": "kernel", "ipmi": "ipmi",
+            }[name])
+        return None
+
+    engine = DiagnosticEngine(EngineContext(
+        runner=runner,
+        decoder=Decoder(),
+        collector_factory=factory,
+        llm=_fake_llm,
+        docs_retriever=retriever,
+        model_hook=lambda m, drifted: hooks.append(
+            (m.model_key, drifted) if m else (None, drifted)),
+    ))
+    d = engine.run("amber light, server stuck no boot")
+    fru_runs = [c for c in runner.calls
+                if "ipmitool fru print" in " ".join(c.argv)]
+    assert len(fru_runs) == 2      # 1 failed single + 1 batch; no third session
+    assert fru_runs[0].ok is False and fru_runs[1].ok is True
+    assert seen_keys == [None, "samoa"]          # re-retrieval is model-keyed
+    assert hooks == [("samoa", False)]           # hook fires once, final model
+    assert d.diagnosis
+
+
+def test_follow_up_runs_agent_named_probe_and_rediagnoses():
+    """An unknown verdict whose action text names an un-run read-only probe
+    triggers ONE auto follow-up: the probe runs, its evidence is appended, and
+    the agent re-diagnoses against the decoded result."""
+    from harness.engine.allowlist import AllowRule
+    from harness.inspect.collectors.bmc_console import BmcConsoleCollector
+
+    runner = FakeConsoleRunner()
+    runner.policy.add(AllowRule("sudo -S i2cdump -y 9 0xb"))
+    runner.OUTPUT = dict(FakeConsoleRunner.OUTPUT)
+    runner.OUTPUT["sudo -S i2cdump -y 9 0xb"] = (
+        "     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f\n"
+        "1b: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n"
+        "a1: 05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n"
+    )
+
+    def factory(name, _runner):
+        if name in ("cpu_msr", "kernel", "ipmi"):
+            return BmcConsoleCollector(_runner, subsystem={
+                "cpu_msr": "cpu", "kernel": "kernel", "ipmi": "ipmi",
+            }[name])
+        return None
+
+    llm_prompts = []
+    audit_prompts = []
+    dump_sets_seen = {}
+
+    def llm(prompt):
+        llm_prompts.append(prompt)
+        if len(llm_prompts) == 1:
+            return Diagnosis(
+                state=ServerState.UNKNOWN,
+                diagnosis="CPU boot state unclear; need the CPLD register dump",
+                confidence=0.2,
+                actions=[Action(
+                    step=1,
+                    action="Dump the CPLD boot-state block",
+                    rationale='run "i2cdump -y 9 0xb" to read the CPU boot '
+                              "state; GB_HangUp_troubleshooting_v1.2.pdf p.1",
+                    risk=Risk.LOW,
+                    required_tool="BMC console",
+                    impact="none",
+                    references=[],
+                )],
+            )
+        return Diagnosis(
+            state=ServerState.FAULT,
+            diagnosis="CPU stuck in no boot state (amber light)",
+            confidence=0.6,
+            actions=[],
+        )
+
+    engine = DiagnosticEngine(EngineContext(
+        runner=runner,
+        decoder=Decoder(),
+        collector_factory=factory,
+        llm=llm,
+        dump_callback=lambda dumps: dump_sets_seen.update(dumps),
+        prompt_callback=audit_prompts.append,
+    ))
+    d = engine.run("amber light, server stuck in no boot")
+
+    assert len(llm_prompts) == 2          # exactly one follow-up re-diagnosis
+    assert len(audit_prompts) == 2        # every prompt audited verbatim
+    assert "## Follow-up Round" in audit_prompts[1]
+    assert any("sudo -S i2cdump -y 9 0xb" in " ".join(c.argv)
+               for c in runner.calls)
+    doc = dump_sets_seen.get("doc_guided")
+    assert doc and any("sudo -S i2cdump -y 9 0xb" in x.source for x in doc)
+    mnemonics = {e["mnemonic"] for e in d.evidence}
+    assert "CPLD_A1_BOOT_STATE" in mnemonics   # follow-up evidence decoded
+    assert d.state == ServerState.FAULT
+    assert d.diagnosis == "CPU stuck in no boot state (amber light)"
+
+
+def test_follow_up_skipped_when_agent_has_a_verdict():
+    """A non-unknown verdict never triggers the follow-up, even when the action
+    text names probes -- the engine trusts a reached verdict."""
+    from harness.inspect.collectors.bmc_console import BmcConsoleCollector
+
+    runner = FakeConsoleRunner()
+    llm_calls = []
+    seen_steps = []
+
+    def factory(name, _runner):
+        if name in ("cpu_msr", "kernel", "ipmi"):
+            return BmcConsoleCollector(_runner, subsystem={
+                "cpu_msr": "cpu", "kernel": "kernel", "ipmi": "ipmi",
+            }[name])
+        return None
+
+    def llm(prompt):
+        llm_calls.append(prompt)
+        return Diagnosis(
+            state=ServerState.FAULT,
+            diagnosis="CPU no boot (amber light)",
+            confidence=0.6,
+            actions=[Action(
+                step=1,
+                action="Dump the CPLD boot-state block",
+                rationale='run "i2cdump -y 9 0xb" to read the boot state',
+                risk=Risk.LOW,
+                required_tool="BMC console",
+                impact="none",
+                references=[],
+            )],
+        )
+
+    engine = DiagnosticEngine(EngineContext(
+        runner=runner,
+        decoder=Decoder(),
+        collector_factory=factory,
+        llm=llm,
+        supervisor=seen_steps.append,
+    ))
+    engine.run("amber light, server stuck in no boot")
+    assert len(llm_calls) == 1
+    assert not any(s.startswith("followup") for s in seen_steps)
+
+
+def test_follow_up_no_probe_run_when_nothing_named():
+    """An unknown verdict whose action text names no probe command skips the
+    follow-up entirely (no speculative probing)."""
+    from harness.inspect.collectors.bmc_console import BmcConsoleCollector
+
+    runner = FakeConsoleRunner()
+    llm_calls = []
+
+    def factory(name, _runner):
+        if name in ("cpu_msr", "kernel", "ipmi"):
+            return BmcConsoleCollector(_runner, subsystem={
+                "cpu_msr": "cpu", "kernel": "kernel", "ipmi": "ipmi",
+            }[name])
+        return None
+
+    def llm(prompt):
+        llm_calls.append(prompt)
+        return Diagnosis(
+            state=ServerState.UNKNOWN,
+            diagnosis="insufficient evidence for a verdict",
+            confidence=0.1,
+            actions=[Action(
+                step=1,
+                action="Consult the architecture documentation",
+                rationale="no register meaning found for the anomaly",
+                risk=Risk.LOW,
+                required_tool="none",
+                impact="none",
+                references=[],
+            )],
+        )
+
+    engine = DiagnosticEngine(EngineContext(
+        runner=runner,
+        decoder=Decoder(),
+        collector_factory=factory,
+        llm=llm,
+    ))
+    engine.run("amber light, server stuck in no boot")
+    assert len(llm_calls) == 1
 
 
 def test_console_cpu_profile_decodes_cpld_boot_state_evidence():

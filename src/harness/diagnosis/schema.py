@@ -71,6 +71,27 @@ class ConfidenceBreakdown(BaseModel):
     model_agreement: float = 0.0
     penalty: float = 0.0
     calibration_llm: str | None = None  # LLM ident whose calibration resolved model_agreement
+    # Root-cause certainty (failure-point runs only): how well the evidence
+    # discriminates the named root cause from the failing rail's suspect set.
+    # None = not applicable (no power-rail failure point was decoded).
+    root_cause_certainty: float | None = None
+
+
+class FailurePoint(BaseModel):
+    """A decoded power-rail fault: a FAILURE POINT, not a root cause.
+
+    Engine-owned context attached to the Diagnosis after the isolation pass so
+    the scorer (and the audit record) know which rail failed, the documented
+    suspect set on that rail, and whether discriminating isolation evidence was
+    collected. The LLM never fills this: the engine overwrites whatever the
+    model emitted.
+    """
+
+    rail_tokens: str = ""
+    reasons: list[str] = Field(default_factory=list)  # decoded fault fields
+    suspects: list[str] = Field(default_factory=list)  # documented loads + supplying board
+    isolation_ran: bool = False        # isolation probes executed with output
+    isolation_refs: list[str] = Field(default_factory=list)  # "[doc p.N]" markers cited
 
 
 CaseOutcomeValues = Literal["fixed", "partial", "not_fixed", "inconclusive", "unknown"]
@@ -88,6 +109,9 @@ class Diagnosis(BaseModel):
     evidence: list[Any] = Field(default_factory=list)  # raw decoded registers / summaries
     unknown_registers: list[str] = Field(default_factory=list)
     parts_discrepancies: list[str] = Field(default_factory=list)
+    # Engine-attached failure-point context (None on runs with no decoded
+    # power-rail fault); drives the root-cause-certainty confidence component.
+    failure_point: FailurePoint | None = None
 
 
 class TurnResponse(BaseModel):

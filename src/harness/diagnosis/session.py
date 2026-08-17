@@ -135,6 +135,21 @@ class SessionEngine:
         planned = [(name, self.ctx.collector_factory(name, self.ctx.runner))
                    for name in self._plan.collectors]
         prebatch_console_plan(self.ctx, self._plan, planned)
+        # A console pre-batch can resurrect model detection that a transient
+        # first FRU session failed (the batch result is served from the probe
+        # cache -- zero extra sessions). Recover so turn evidence stays
+        # model-keyed.
+        if self._model.product_name == "unknown" \
+                and getattr(self.ctx.runner, "is_console", False):
+            from ..inspect.model import detect_model
+            recovered = detect_model(self.ctx.runner)
+            if recovered is not None:
+                self._model = recovered
+                self._note(f"model={recovered.model_key} "
+                           "(recovered from console pre-batch)")
+                self._base_snippets = (
+                    self.ctx.docs_retriever(symptom, recovered.model_key)
+                    if self.ctx.docs_retriever else [])
         self._collect_all(self._plan.collectors)
         self._collect_doc_probes(self._plan.doc_probes)
 

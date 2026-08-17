@@ -448,7 +448,11 @@ def _save_prompt(out: Path, content: str, session_mode: bool) -> None:
         with (out / "prompt_turns.jsonl").open("a", encoding="utf-8") as f:
             f.write(content + "\n")
     else:
-        (out / "prompt.txt").write_text(content, encoding="utf-8")
+        # Single-shot runs can emit more than one prompt (auto follow-up round):
+        # append, separator-delimited, so the audit keeps every prompt verbatim.
+        with (out / "prompt.txt").open("a", encoding="utf-8") as f:
+            f.write(content)
+            f.write("\n\n==================== END PROMPT ====================\n\n")
 
 
 def _seat_pending_case(out: Path, diagnosis: Diagnosis, target_label: str,
@@ -531,9 +535,20 @@ def _print_diagnosis(diagnosis: Diagnosis, out: Path, session_id: str) -> None:
     print(f"confidence: {diagnosis.confidence}")
     if diagnosis.confidence_breakdown is not None:
         b = diagnosis.confidence_breakdown
-        print(f"  retrieval_citation_support={b.retrieval_citation_support} "
-              f"evidence_fit={b.evidence_fit} model_agreement={b.model_agreement} "
-              f"penalty={b.penalty}")
+        parts = [f"retrieval_citation_support={b.retrieval_citation_support}",
+                 f"evidence_fit={b.evidence_fit}",
+                 f"model_agreement={b.model_agreement}"]
+        if b.root_cause_certainty is not None:
+            parts.append(f"root_cause_certainty={b.root_cause_certainty}")
+        parts.append(f"penalty={b.penalty}")
+        print("  " + " ".join(parts))
+    if diagnosis.failure_point is not None:
+        fp = diagnosis.failure_point
+        suspects = ", ".join(fp.suspects) if fp.suspects else "(no documented suspect set)"
+        probe_note = ("isolation probes ran" if fp.isolation_ran
+                      else "no isolation evidence collected")
+        print(f"failure point (NOT a root cause yet): rail '{fp.rail_tokens}' "
+              f"suspects: {suspects}; {probe_note}")
     if diagnosis.unknown_registers:
         print(f"unknown registers (manual lookup): {', '.join(diagnosis.unknown_registers)}")
     if diagnosis.parts_discrepancies:

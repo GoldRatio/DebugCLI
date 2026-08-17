@@ -25,7 +25,7 @@ from ..inspect.model import DetectedModel, detect_model, from_alias, from_operat
 from ..plan.profile import plan_collection
 from .parts_validate import PartsCheckResult
 from .prompt import build_prompt
-from .schema import Diagnosis
+from .schema import Diagnosis, ServerState
 
 # dump_sets key for the fault-isolation probe round. Kept separate so its raw
 # i2c/register output is surfaced to the LLM as raw evidence and NEVER decoded
@@ -138,9 +138,9 @@ class DiagnosticEngine:
         # Model facts FIRST: detection (dmidecode/FRU) -> alias hint -> optional
         # operator fallback. Everything downstream (retrieval filter, prompt,
         # case library) is model-consistent because it always knows the source.
+        # The hook fires exactly once, after the pre-batch recovery attempt
+        # below, so it reports the final model facts.
         model, model_drifted = self._detect_model()
-        if self.ctx.model_hook is not None:
-            self.ctx.model_hook(model, model_drifted)
         model_key = model.model_key if model is not None else None
         if model is None:
             _emit("model=unknown (detection failed; no alias hint)")
@@ -170,6 +170,26 @@ class DiagnosticEngine:
         ]
         prebatch_console_plan(self.ctx, plan, collectors)
 
+        # A console pre-batch can resurrect model detection that a transient
+        # first FRU session failed: the batch result is served from the probe
+        # cache, so re-detecting costs zero extra sessions. Recover the model
+        # facts BEFORE the prompt is built (retrieval, case library, and the
+        # isolation pass are all model-keyed). The plan keeps the doc probes
+        # already mined; only the prompt snippets are refreshed model-keyed.
+        if model is None and getattr(self.ctx.runner, "is_console", False):
+            recovered = detect_model(self.ctx.runner)
+            if recovered is not None:
+                model = recovered
+                model_drifted = False
+                model_key = recovered.model_key
+                _emit(f"model={recovered.model_key} "
+                      "(recovered from console pre-batch)")
+                snippets = (self.ctx.docs_retriever(symptom, model_key)
+                            if self.ctx.docs_retriever else [])
+                _emit(f"retrieve: {len(snippets)} doc snippet(s) (model-keyed)")
+        if self.ctx.model_hook is not None:
+            self.ctx.model_hook(model, model_drifted)
+
         # 1. Collect the minimal targetted set for the primary subsystem.
         dump_sets: dict[str, list[RegisterDump]] = {}
         for collector_name, collector in collectors:
@@ -196,9 +216,10 @@ class DiagnosticEngine:
         # 3b. Fault-isolation pass: a decoded power-rail fault is a FAILURE POINT,
         # not a root cause. When one is present, retrieve the documented isolation
         # procedure, run the read-only probes it names (second, targeted round),
-        # and -- when opted in -- prompt for the operator's instance parts data.
-        iso_snippets, iso_dumps, iso_parts, iso_topology = self._run_isolation_pass(
-            decoded, summaries, model_key)
+        # map the rail to its documented loads, and -- when opted in -- prompt for
+        # the operator's instance parts data.
+        iso_snippets, iso_dumps, iso_parts, iso_topology, failure_point = (
+            self._run_isolation_pass(decoded, summaries, model_key))
         if iso_dumps:
             dump_sets[ISOLATION_DUMPS_KEY] = iso_dumps
         all_snippets = _dedupe([*snippets, *iso_snippets])
@@ -229,8 +250,33 @@ class DiagnosticEngine:
         _step("reason")
         _emit("reason: agent reasoning over evidence")
         diagnosis = self.ctx.llm(prompt)
+        # The failure-point context is ENGINE-OWNED fact (decoded registers +
+        # documented topology), never LLM output: overwrite whatever the model
+        # emitted so the scorer and audit see the real suspect set.
+        diagnosis.failure_point = failure_point
+
+        # 5b. Auto follow-up: when the agent still has no verdict, run the
+        # read-only probes ITS OWN action text names (each must pass the
+        # deny-by-default probe gate) and re-diagnose once against the appended
+        # evidence. Exactly one round, never recursive -- a stubborn agent
+        # cannot loop forever.
+        follow_up = self._maybe_follow_up(
+            symptom=symptom, model=model, model_key=model_key,
+            snippets=all_snippets, prior_cases=prior_cases, parts=parts,
+            iso_dumps=iso_dumps, iso_parts=iso_parts, iso_topology=iso_topology,
+            dump_sets=dump_sets, diagnosis=diagnosis,
+            _step=_step, _emit=_emit)
+        if follow_up is not None:
+            diagnosis, decoded = follow_up
+            diagnosis.failure_point = failure_point
 
         # 6. Attach structural evidence + score.
+        return self._finalize(diagnosis, plan, dump_sets, decoded,
+                              all_snippets, _emit)
+
+    def _finalize(self, diagnosis, plan, dump_sets, decoded, all_snippets,
+                  _emit) -> Diagnosis:
+        """Attach structural evidence and score a diagnosis for the run."""
         diagnosis.subsystems_considered = _to_subsystems(plan.subsystem_order)
         diagnosis.evidence = [d.__dict__ for d in decoded]
         diagnosis.unknown_registers = [d.mnemonic for d in decoded if d.unknown]
@@ -244,6 +290,93 @@ class DiagnosticEngine:
             diagnosis = self.ctx.scorer(diagnosis, dump_sets)
         _emit(f"score: confidence {diagnosis.confidence:.2f}")
         return diagnosis
+
+    def _maybe_follow_up(self, *, symptom, model, model_key, snippets,
+                         prior_cases, parts, iso_dumps, iso_parts,
+                         iso_topology, dump_sets, diagnosis, _step, _emit):
+        """One auto follow-up round when the agent could not reach a verdict.
+
+        Trigger: the diagnosis is still ``unknown`` AND the agent's own action
+        text names read-only probes that have not yet run this pass. Those are
+        run (one more batch/session on a console runner), decoded, summarized,
+        and the prompt is rebuilt with the appended evidence for a single
+        re-diagnosis. Returns ``(diagnosis2, decoded2)`` or None. Exactly one
+        round, never recursive.
+        """
+        if diagnosis.state != ServerState.UNKNOWN:
+            return None
+        from ..inspect.collectors.doc_guided import _PRIVILEGED, DocGuidedProbeCollector
+        from ..plan.doc_guided import mine_probe_commands
+
+        text = " ".join(f"{a.action} {a.rationale}" for a in diagnosis.actions)
+        done = {" ".join(c.argv) for c in getattr(self.ctx.runner, "calls", [])}
+        finals: list[str] = []
+        for probe in mine_probe_commands([text]):
+            prog = probe.split()[0].split("/")[-1]
+            final = probe
+            if (getattr(self.ctx.runner, "is_console", False)
+                    and prog in _PRIVILEGED
+                    and not probe.startswith("sudo -S ")):
+                final = "sudo -S " + probe
+            if final not in finals and final not in done:
+                finals.append(final)
+        finals = finals[:5]
+        if not finals:
+            return None
+        if getattr(self.ctx.runner, "is_console", False) \
+                and hasattr(self.ctx.runner, "batch_execute"):
+            self.ctx.runner.batch_execute(finals)
+        new_dumps = DocGuidedProbeCollector(self.ctx.runner, finals).collect()
+        if not new_dumps:
+            return None
+
+        # Merge into the doc_guided evidence set (source-deduped) so the final
+        # dump_callback/audit carry the follow-up round too.
+        merged = dump_sets.get("doc_guided", []) + new_dumps
+        seen: set[str] = set()
+        out: list[RegisterDump] = []
+        for dump in merged:
+            if dump.source in seen:
+                continue
+            seen.add(dump.source)
+            out.append(dump)
+        dump_sets["doc_guided"] = out
+
+        _step("followup_collect")
+        _emit(f"follow-up: {len(new_dumps)} agent-named probe(s) run")
+
+        decoded2 = self._decode_all(dump_sets)
+        _step("followup_decode")
+        _emit(f"follow-up: {len(decoded2)} register(s) decoded")
+
+        from .summarize import summarize
+        summaries2 = summarize(
+            [d for dumps in dump_sets.values() for d in dumps])
+
+        prompt2 = build_prompt(
+            model=model,
+            decoded=decoded2,
+            summaries=summaries2,
+            doc_snippets=snippets,
+            isolation_probes=iso_dumps,
+            isolation_parts=iso_parts,
+            topology=iso_topology,
+            parts_refs=parts,
+            symptom=symptom,
+            prior_cases=prior_cases,
+        )
+        prompt2 += (
+            "\n\n## Follow-up Round\nYour previous recommendations did not "
+            "resolve a verdict, so the read-only probes named in them were run "
+            "and their evidence is appended above (see the Decoded Registers / "
+            "Anomalous Evidence Summary sections). Re-diagnose strictly from "
+            "the evidence; if it still cannot decide, return state=unknown and "
+            "say so -- do not invent register meanings.")
+        if self.ctx.prompt_callback is not None:
+            self.ctx.prompt_callback(prompt2)
+        _step("followup_reason")
+        _emit("follow-up: agent reasoning over appended evidence")
+        return self.ctx.llm(prompt2), decoded2
 
     def _detect_model(self) -> tuple[DetectedModel | None, bool]:
         return detect_with_fallback(self.ctx.runner, self.ctx.model_hint,
@@ -264,24 +397,28 @@ class DiagnosticEngine:
         """Second, fault-isolation round for decoded power-rail faults.
 
         Returns ``(isolation_snippets, isolation_dumps, isolation_parts,
-        isolation_topology)``. Deterministic no-op when no rail fault is decoded
-        or no doc library is wired. All probes are deny-by-default read-only (the
-        same gate as the first pass); on a console runner the new probes batch
-        into one serial session. Isolation output is raw evidence, never
-        catalog-decoded (see ``ISOLATION_DUMPS_KEY``). When ``parts_ask`` is
-        configured it fires with the rail key so the operator can supply instance
-        parts data; the answers are returned (and persisted by the caller's
-        callback). ``topology`` maps the fault to the documented rail->loads
-        edges (which loads the failing rail feeds) so the prompt can enumerate
-        the suspect set instead of guessing a single FRU.
+        isolation_topology, failure_point)``. ``failure_point`` is set whenever
+        a rail fault is decoded (a fact from the registers, independent of the
+        doc library) and carries the documented suspect set for the scorer.
+        The rest is a deterministic no-op when no doc library is wired. All
+        probes are deny-by-default read-only (the same gate as the first pass);
+        on a console runner the new probes batch into one serial session.
+        Isolation output is raw evidence, never catalog-decoded (see
+        ``ISOLATION_DUMPS_KEY``). When ``parts_ask`` is configured it fires with
+        the rail key so the operator can supply instance parts data; the answers
+        are returned (and persisted by the caller's callback). ``topology`` maps
+        the fault to the documented rail->loads edges (which loads the failing
+        rail feeds) so the prompt can enumerate the suspect set instead of
+        guessing a single FRU.
         """
         from ..inspect.collectors.doc_guided import _PRIVILEGED, DocGuidedProbeCollector
         from ..plan.doc_guided import mine_probe_commands
         from ..plan.isolation import build_isolation_queries, detect_fault_signature
+        from .schema import FailurePoint
 
         sig = detect_fault_signature(decoded, summaries)
-        if sig is None or self.ctx.docs_retriever is None:
-            return [], [], [], []
+        if sig is None:
+            return [], [], [], [], None
         if self.ctx.supervisor is not None:
             self.ctx.supervisor("isolate")
 
@@ -289,9 +426,28 @@ class DiagnosticEngine:
         if self.ctx.parts_ask is not None:
             iso_parts = self.ctx.parts_ask(sig["rail_tokens"]) or []
 
+        # Rail -> documented loads: a fact about the failure point, available
+        # even without a doc library. The supplying board named by the rail
+        # fault (e.g. "pdb" in pdb_12v_pwrup_flt) is a suspect too.
         iso_topology: list[dict] = []
         if self.ctx.topology is not None:
             iso_topology = self.ctx.topology(sig, model_key) or []
+        suspects: list[str] = []
+        for edge in iso_topology:
+            for load in edge.get("loads") or []:
+                name = (load.get("name") or "").strip()
+                if name and name not in suspects:
+                    suspects.append(name)
+        rail_tokens = (sig.get("rail_tokens") or "").split()
+        if "pdb" in rail_tokens and "PDB" not in suspects:
+            suspects.append("PDB")
+        failure_point = FailurePoint(
+            rail_tokens=sig.get("rail_tokens") or "",
+            reasons=list(sig.get("reasons") or []),
+            suspects=suspects, isolation_ran=False, isolation_refs=[])
+
+        if self.ctx.docs_retriever is None:
+            return [], [], [], iso_topology, failure_point
 
         iso_snippets: list[str] = []
         for query in build_isolation_queries(sig):
@@ -300,7 +456,7 @@ class DiagnosticEngine:
                     iso_snippets.append(s)
         iso_snippets = iso_snippets[:8]
         if not iso_snippets:
-            return [], [], iso_parts, iso_topology
+            return [], [], iso_parts, iso_topology, failure_point
 
         probes: list[str] = []
         for probe in mine_probe_commands(iso_snippets):
@@ -319,7 +475,11 @@ class DiagnosticEngine:
             self.ctx.runner.batch_execute(new_probes)
         dumps = DocGuidedProbeCollector(self.ctx.runner, new_probes).collect() \
             if new_probes else []
-        return iso_snippets, dumps, iso_parts, iso_topology
+        failure_point.isolation_ran = bool(dumps)
+        failure_point.isolation_refs = [
+            s[:s.index("]") + 1] for s in iso_snippets
+            if s.startswith("[") and "]" in s]
+        return iso_snippets, dumps, iso_parts, iso_topology, failure_point
 
 
 def decode_dumps(decoder: Decoder, dumps: list[RegisterDump]) -> list[RegisterDecode]:
