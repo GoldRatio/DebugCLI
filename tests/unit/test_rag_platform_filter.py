@@ -46,6 +46,50 @@ def test_no_platform_filter_returns_everything():
     assert len(got) == 3
 
 
+def _node_chunks() -> list[Chunk]:
+    """Fleet-shaped chunks: a node spec (samoa), a tray guide (samoa + nvl72),
+    and a platform-neutral guide."""
+    return [
+        Chunk(text="PDB 50V to 12V power distribution connectors",
+              title="Samoa_spec.pdf", page=1, index=0, platforms=["samoa"]),
+        Chunk(text="compute tray PDB isolation and FPGA register dump procedure",
+              title="NVL72_tray.pdf", page=2, index=1,
+              platforms=["nvl72", "samoa"]),
+        Chunk(text="generic SEL event interpretation guidance",
+              title="SEL_guide.pdf", page=3, index=2, platforms=[]),
+    ]
+
+
+def test_family_matching_retrieves_same_platform_aliases():
+    """A detected 'c4a15' node (samoa family) retrieves samoa-tagged and
+    multi-platform (samoa+nvl72) chunks; a foreign platform stays excluded."""
+    retriever = HybridRetriever(_node_chunks())
+    got = retriever.query("PDB power fault", top_k=10, platform="c4a15")
+    titles = {c.title for c in got}
+    assert "Samoa_spec.pdf" in titles
+    assert "NVL72_tray.pdf" in titles
+    assert "SEL_guide.pdf" in titles
+
+
+def test_family_matching_excludes_foreign_platform_docs():
+    """An nvl72 rack key retrieves the tray guide + neutral chunks, but NOT the
+    pure node spec tagged only samoa."""
+    retriever = HybridRetriever(_node_chunks())
+    got = retriever.query("PDB power fault", top_k=10, platform="nvl72")
+    titles = {c.title for c in got}
+    assert "NVL72_tray.pdf" in titles
+    assert "SEL_guide.pdf" in titles
+    assert "Samoa_spec.pdf" not in titles
+
+
+def test_family_matching_unknown_key_falls_back_to_exact():
+    """An unrecognized platform key (no family) keeps exact-match behavior and
+    still allows platform-neutral chunks."""
+    retriever = HybridRetriever(_node_chunks())
+    got = retriever.query("PDB power fault", top_k=10, platform="poweredge_r650")
+    assert {c.title for c in got} == {"SEL_guide.pdf"}
+
+
 def test_rag_pipeline_passes_platform():
     rag = RagPipeline(HybridRetriever(_chunks()))
     lines = rag.lines("R650 memory", top_k=10, platform="poweredge_r650")

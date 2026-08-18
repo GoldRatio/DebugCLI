@@ -77,8 +77,10 @@ from ..diagnosis.session import SessionEngine
 from ..diagnosis.verifier import Verifier
 from ..engine.allowlist import default_policy
 from ..engine.bmc import BmcRunner
+from ..engine.interactive import InteractiveShell
 from ..engine.runner import CommandResult, Runner
 from ..engine.session import SSHSession
+from ..engine.single_test import SingleTestDriver, SingleTestError
 from ..engine.sol import (
     ConsoleRunner,
     SerialConsole,
@@ -94,6 +96,7 @@ from ..inspect.registry import make_collector
 from ..operator.gate import ApprovalDecision, ApprovalGate
 from ..operator.supervisor import Escalation, RunSupervisor
 from ..plan.profile import plan_collection
+from ..platforms import family_for
 from ..targets import TargetError, TargetSpec, resolve_target
 from ..targets.aliases import AliasError, TargetAlias, load_targets, save_targets
 from .credential_gate import apply_ssh_context
@@ -154,25 +157,26 @@ def _resolve_target_from_args(args, inv: Inventory, store: SecretStore):
     )
 
 
+def _resolve_profile(args, inv: Inventory) -> object:
+    """Resolve the effective LLM profile under the shared precedence.
+
+    ``--llm-model <ident>`` > ``--llm <provider>`` > persisted current model
+    (``config/models.yaml``) > inventory ``llm`` block > default. Both
+    ``_resolve_llm`` and ``_llm_ident_for`` go through here so the live adapter
+    and its calibration ident can never drift apart.
+    """
+    from ..config.model_catalog import ModelCatalog
+
+    catalog = ModelCatalog.load(inv=inv)
+    return catalog.resolve(provider=getattr(args, "llm", None),
+                           model_id=getattr(args, "llm_model", None))
+
+
 def _resolve_llm(args, inv: Inventory, store: SecretStore) -> object:
-    """LLM backend resolution: explicit ``--llm`` flag > inventory ``llm`` block
-    > default (openai). The api key, when vault-path configured, is resolved
-    through the secret store; otherwise env fallbacks apply (e.g. GEMINI_API_KEY)."""
-    provider = args.llm or (inv.llm.provider if inv.llm else None) or "openai"
-    if provider == "stub":
-        return StubLLM()
-    url = model = api_key = None
-    timeout = 120.0
-    if inv.llm is not None:
-        url, model, timeout = inv.llm.url, inv.llm.model, inv.llm.timeout
-        if inv.llm.api_key_vault_path:
-            try:
-                api_key = store.get(inv.llm.api_key_vault_path).decode().strip()
-            except KeyError:
-                pass  # absent from store; LLM falls back to env
-    if provider == "gemini":
-        return GeminiLLM(url=url, api_key=api_key, model=model, timeout=timeout)
-    return OpenAICompatLLM(url=url, api_key=api_key, model=model, timeout=timeout)
+    """LLM backend resolution (see ``_resolve_profile``). The api key, when
+    vault-path configured, is resolved through the secret store; otherwise env
+    fallbacks apply (e.g. GEMINI_API_KEY)."""
+    return _resolve_profile(args, inv).build(store)
 
 
 def _llm_ident_for(args, inv: Inventory) -> str:
@@ -183,15 +187,7 @@ def _llm_ident_for(args, inv: Inventory) -> str:
     per-model calibration store is keyed on -- it must not change for the same
     configured model, or calibration silently goes inactive (0.5).
     """
-    provider = args.llm or (inv.llm.provider if inv.llm else None) or "openai"
-    if provider == "stub":
-        return "stub"
-    model = inv.llm.model if inv.llm is not None and inv.llm.model else None
-    if not model:
-        env_model = os.environ.get("HARNESS_LLM_MODEL")
-        model = env_model or ("gemini-2.5-flash" if provider == "gemini"
-                              else "harness-diag")
-    return f"{provider}/{model}"
+    return _resolve_profile(args, inv).ident
 
 
 def _console_overrides(domain: ConsoleDomain, args) -> ConsoleDomain:
@@ -304,6 +300,30 @@ def _load_context(args) -> list[str]:
         except OSError as exc:
             print(f"  [context] skip {path}: {exc}", file=sys.stderr)
     return [a for a in answers if a]
+
+
+def _strip_surrounding_quotes(value: str) -> str:
+    """Trim one level of surrounding quotes a user may have pasted into a
+    prompt (e.g. ``"C:\\path\\log.log"`` or ``'C:\\path\\log.log'``)."""
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def _load_test_logs(args) -> list:
+    """Load operator-supplied test logs via the log-source seam (files today, a
+    website fetcher later). Unreadable/unparseable logs are reported and
+    skipped -- a bad log must never block a diagnosis."""
+    from ..testlog import FileLogSource, LogSourceError
+
+    reports = []
+    for path in getattr(args, "test_log", None) or []:
+        try:
+            reports.append(FileLogSource(_strip_surrounding_quotes(path)).load())
+        except (OSError, LogSourceError) as exc:
+            print(f"  [test-log] skip {path}: {exc}", file=sys.stderr)
+    return reports
 
 
 def _session_no_answer(_question: str) -> str:
@@ -456,14 +476,17 @@ def _save_prompt(out: Path, content: str, session_mode: bool) -> None:
 
 
 def _seat_pending_case(out: Path, diagnosis: Diagnosis, target_label: str,
-                       ident: str, symptom: str, session_id: str) -> None:
+                       ident: str, symptom: str, session_id: str,
+                       test_log_failures: list[str] | None = None) -> None:
     """Seed ``pending_case.json`` (outcome="unknown") in a run dir.
 
     ``harness report`` fills this base instead of inventing a record from
     artifacts, so actions_taken/outcome are added to (never overwrite) what the
     run itself observed. Deterministic pieces the learning loop needs are
     pre-computed here: evidence_hash over the collected dumps, the decoded
-    register lines (~ evidence block), and the cited doc titles.
+    register lines (~ evidence block), and the cited doc titles. ``--test-log``
+    runs additionally record the failure signatures so a future run with the
+    same harness failure surfaces this case pre-probe.
     """
     from ..diagnosis.schema import CaseOutcome
 
@@ -494,6 +517,10 @@ def _seat_pending_case(out: Path, diagnosis: Diagnosis, target_label: str,
         evidence_summary=evidence_lines,
         cited_titles=cited,
         confidence=diagnosis.confidence,
+        self_reported_confidence=(
+            diagnosis.confidence_breakdown.self_reported_confidence
+            if diagnosis.confidence_breakdown is not None else None),
+        test_log_failures=list(test_log_failures or []),
     )
     (out / "pending_case.json").write_text(
         pending.model_dump_json(indent=2), encoding="utf-8")
@@ -585,6 +612,9 @@ def run_docs(args) -> int:
     elif action == "reindex":
         for line in lib.reindex():
             print(line)
+    elif action == "retag":
+        for line in lib.retag(args.names, platform=getattr(args, "platform", None)):
+            print(line)
     elif action == "rm":
         try:
             print(lib.remove(args.name))
@@ -671,9 +701,26 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
     apply_ssh_context(store, target, ssh_user=getattr(args, "ssh_user", "diagbot"))
     host: Host = target.host
 
-    out = Path(args.out_dir) / SessionTrace().session_id
-    out.mkdir(parents=True, exist_ok=True)
     trace = SessionTrace()
+    out = Path(args.out_dir) / trace.session_id
+    out.mkdir(parents=True, exist_ok=True)
+
+    # Operator-supplied test logs: loaded BEFORE the retriever/audit so the
+    # derived symptom, run_start event, doc retrieval, and case seeding all see
+    # the same failure identity.
+    test_log_reports = _load_test_logs(args)
+    symptom = args.symptom or ""
+    if not symptom:
+        first = test_log_reports[0] if test_log_reports else None
+        if first is not None and first.failures:
+            symptom = (f"Factory test log failure: "
+                       f"{first.failures[0].signature}")
+        elif first is not None and first.raw_excerpt:
+            symptom = "Factory test log failure (see test-log evidence)"
+    if not symptom:
+        print("  error: a --symptom or --test-log is required to diagnose",
+              file=sys.stderr)
+        raise SystemExit(2)
 
     bmc_password: str | None = None
     secrets: list[str] = []
@@ -713,7 +760,7 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
 
     log = AuditLog(out / "audit.jsonl", Redactor(secrets))
     log.append(trace.session_id, "run_start", {
-        "host": target.label, "symptom": args.symptom, "trust_level": target.trust_level,
+        "host": target.label, "symptom": symptom, "trust_level": target.trust_level,
         "model": host.model, "collector_profile": host.collector_profile,
         "mode": "session" if session_mode else "single", "max_turns": max_turns,
         "target": target.kind,
@@ -722,6 +769,17 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
         **({"ip": target.ip} if target.ip is not None else {}),
         **({"docs_lib": docs_lib_used} if docs_lib_used else {}),
     })
+    if test_log_reports:
+        log.append(trace.session_id, "test_log_loaded", {
+            "count": len(test_log_reports),
+            "logs": [
+                {"source": r.source, "model": r.model, "serial": r.serial,
+                 "station": r.station, "stage": r.test_stage,
+                 "failures": [f.signature for f in r.failures],
+                 "parsed": bool(r.failures) or bool(r.raw_excerpt)}
+                for r in test_log_reports
+            ],
+        })
 
     use_console = bool(getattr(args, "console", False)) or target.kind == "console"
     if use_console:
@@ -751,6 +809,61 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
         progress = _progress_printer()
     if hasattr(runner, "on_probe"):
         runner.on_probe = lambda res: progress(f"probe {_probe_line(res)}")
+
+    # Preserve the raw test logs in the run dir so every diagnosis is
+    # reproducible from its own harness_runs/<id>/ directory.
+    if test_log_reports:
+        tl_out = out / "test_logs"
+        tl_out.mkdir(parents=True, exist_ok=True)
+        for report in test_log_reports:
+            src = Path(report.source)
+            try:
+                if src.exists():
+                    import shutil
+                    shutil.copy2(src, tl_out / src.name)
+            except OSError as exc:
+                progress(f"test-log {report.source!r} not copied: {exc}")
+        test_log_lines: list[str] | None = [
+            line for r in test_log_reports for line in r.summary_lines()]
+        test_log_queries: list[str] | None = [
+            q for r in test_log_reports for q in r.rag_queries()]
+        test_log_case_terms: list[str] | None = [
+            t for r in test_log_reports for t in r.case_terms()]
+    else:
+        test_log_lines = test_log_queries = test_log_case_terms = None
+
+    def _open_interactive(client) -> InteractiveShell:
+        shell = InteractiveShell(client)
+        shell.open()
+        return shell
+
+    single_test_driver = overrides.get("single_test_driver")
+    owns_driver = False
+    server_number = getattr(args, "server_number", None)
+    if single_test_driver is None and server_number and session_mode \
+            and not use_console and host.ssh is not None:
+        hint = (target.model_hint or host.model or "").strip()
+        fam = family_for(hint) if hint else None
+        if fam not in (None, "samoa", "nvl72"):
+            progress(f"single tests skipped: hint {hint!r} is not a GB platform")
+        else:
+            client = getattr(runner, "client", None)
+            if client is not None:
+                try:
+                    single_test_driver = SingleTestDriver(
+                        server_number,
+                        shell_factory=lambda c=client: _open_interactive(c),
+                        progress=progress,
+                        artifact_dir=out,
+                    )
+                    owns_driver = True
+                    log.append(trace.session_id, "single_test_enabled", {
+                        "server_number": server_number,
+                        "target": target.label,
+                        "platform_hint": hint or None,
+                    })
+                except SingleTestError as exc:
+                    progress(f"single tests unavailable: {exc}")
 
     bmc_runner = overrides.get("bmc_runner")
     if bmc_runner is None and bmc_password is not None:
@@ -826,7 +939,7 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
                 d,
                 retrieved_snippets=(
                     used_snippets["lines"]
-                    or (retriever(args.symptom, None) if retriever else None)
+                    or (retriever(symptom, None) if retriever else None)
                 ),
                 evidence_fit=(
                     None if d.evidence else evidence_fit_from_dumps(d, dump_sets)
@@ -851,6 +964,10 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
         llm_ident=lambda: ident,
         calibration_root=str(calibration_root),
         priors=_load_priors(args.out_dir),
+        single_test_driver=single_test_driver,
+        test_log_lines=test_log_lines,
+        test_log_queries=test_log_queries,
+        test_log_case_terms=test_log_case_terms,
     )
     if session_mode:
         engine = SessionEngine(
@@ -859,10 +976,14 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
             human_input=human_input,
             max_turns=max_turns,
         )
-        diagnosis = engine.run(args.symptom, initial_answers=_load_context(args))
+        try:
+            diagnosis = engine.run(symptom, initial_answers=_load_context(args))
+        finally:
+            if owns_driver and single_test_driver is not None:
+                single_test_driver.close()
         _save_transcript(out, engine.transcript, log, trace, secrets)
     else:
-        diagnosis = DiagnosticEngine(ctx).run(args.symptom)
+        diagnosis = DiagnosticEngine(ctx).run(symptom)
 
     _audit_commands(log, trace, runner)
     if bmc_runner is not None:
@@ -883,8 +1004,9 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
             decision = ApprovalDecision(action=action, approved=False, note="not prompted")
         gate.record(decision, trace.session_id, log)
 
-    _seat_pending_case(out, diagnosis, target.label, ident, args.symptom,
-                       trace.session_id)
+    _seat_pending_case(out, diagnosis, target.label, ident, symptom,
+                       trace.session_id,
+                       test_log_failures=(test_log_case_terms or []))
     print(f"\npending case: {out / 'pending_case.json'}")
     print("close the learning loop after the repair with:")
     print(f"  harness report --run {trace.session_id} --outcome fixed "
@@ -1377,6 +1499,7 @@ _MAIN_ACTIONS: list[tuple[str, str]] = [
     ("verify", "verify        - compare a run against a baseline"),
     ("runs", "runs          - inspect a previous run (verdict, commands, prompt, dumps)"),
     ("console", "console       - read-only probes over the serial console (lab/qa)"),
+    ("model", "model         - pick the LLM model for reasoning (remembered)"),
     ("docs", "docs          - manage the RAG document library"),
     ("targets", "targets       - manage short target aliases"),
     ("secrets", "secrets       - register credentials (non-agent, never in prompts)"),
@@ -1394,13 +1517,15 @@ _WIZARD_FLAGS: dict[str, str] = {
     "--out-dir": "out_dir",
     "--session-dir": "session_dir",
     "--targets-file": "targets_file",
+    "--test-log": "test_log",
 }
 
 _ALLOWED_FLAGS: dict[str, tuple[str, ...]] = {
     "diagnose": ("--secret-dir", "--docs-lib", "--docs-dir", "--parts-csv",
-                 "--parts-dir", "--out-dir", "--targets-file"),
+                 "--parts-dir", "--out-dir", "--targets-file", "--test-log"),
     "session": ("--secret-dir", "--docs-lib", "--docs-dir", "--parts-csv",
-                "--parts-dir", "--out-dir", "--session-dir", "--targets-file"),
+                "--parts-dir", "--out-dir", "--session-dir", "--targets-file",
+                "--test-log"),
     "console": ("--secret-dir", "--out-dir", "--targets-file"),
     "verify": ("--secret-dir", "--targets-file"),
     "setup": ("--secret-dir",),
@@ -1536,7 +1661,9 @@ def _wizard_flags(args, subcommand: str) -> list[str]:
     for flag in _ALLOWED_FLAGS.get(subcommand, ()):
         value = getattr(args, _WIZARD_FLAGS[flag], None)
         if value:
-            argv += [flag, str(value)]
+            values = value if isinstance(value, list) else [value]
+            for v in values:
+                argv += [flag, str(v)]
     if subcommand in ("diagnose", "session"):
         llm = getattr(args, "llm", None)
         if llm:
@@ -1575,6 +1702,29 @@ def _baselines(out_dir: str | Path) -> list[Path]:
         (p for p in root.iterdir()
          if p.is_dir() and (p / "dumps.json").is_file()),
         key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _menu_model(inv) -> int:
+    """Pick the LLM reasoning model from the catalog (remembered in
+    ``config/models.yaml`` so the next run uses it)."""
+    from ..config.model_catalog import ModelCatalog, picker_rows
+    from .menu import ask_model_profile, select
+
+    catalog = ModelCatalog.load(inv=inv)
+    labels, profiles, add_idx = picker_rows(catalog)
+    idx = select("LLM model (reasoning backend)", labels)
+    if idx is None:
+        return 0
+    if idx == add_idx:
+        profile = ask_model_profile()
+        if profile is None:
+            return 0
+        catalog.add(profile)
+    else:
+        catalog.choose(profiles[idx])
+    catalog.save()
+    print(f"  model: {catalog.current.ident} (remembered for the next run)")
+    return 0
 
 
 def _menu_docs(args) -> int:
@@ -1837,15 +1987,30 @@ def run_menu(args) -> int:
                 spec = _pick_target(inv, store, args, console=console_default)
                 if spec is None:
                     continue
-                symptom = ask_text("Symptom (Enter for no symptom / "
-                                   "live-evidence diagnosis)").strip()
+                symptom = ask_text(
+                    "Symptom (Enter to derive from the test log / live "
+                    "evidence)").strip()
+                test_log = ""
+                while True:
+                    candidate = _strip_surrounding_quotes(ask_text(
+                        "Test-harness/FAT log path (Enter to skip)"))
+                    if not candidate:
+                        break
+                    if Path(candidate).is_file():
+                        test_log = candidate
+                        break
+                    print(f"  no such file: {candidate}")
                 if symptom:
                     argv = ["diagnose", "--inventory", str(inv_path),
                             "--symptom", symptom]
+                elif test_log:
+                    argv = ["diagnose", "--inventory", str(inv_path)]
                 else:
                     print("  (no symptom: diagnosing from live evidence)")
                     argv = ["diagnose", "--inventory", str(inv_path),
                             "--symptom", _MENU_DIAGNOSE_SYMPTOM]
+                if test_log:
+                    argv += ["--test-log", test_log]
                 argv += _target_argv(spec)
                 argv += _wizard_flags(args, "diagnose")
                 _run_wizard_sub(argv)
@@ -1882,6 +2047,8 @@ def run_menu(args) -> int:
                 argv += _target_argv(spec)
                 argv += _wizard_flags(args, "console")
                 _run_wizard_sub(argv)
+            elif key == "model":
+                _menu_model(inv)
             elif key == "docs":
                 _menu_docs(args)
             elif key == "targets":
@@ -1981,12 +2148,23 @@ def build_parser() -> argparse.ArgumentParser:
     docs_sub.add_parser("ls", help="list indexed documents")
     docs_sub.add_parser("reindex", help="re-index all documents (retries failures, "
                                         "picks up files dropped into the library)")
+    t = docs_sub.add_parser("retag", help="set/clear the platform tag on indexed documents")
+    t.add_argument("names", nargs="+", help="document name(s) as shown by 'docs ls'")
+    t.add_argument("--platform", default=None,
+                   help="canonical platform key(s) to tag with (comma-separated "
+                        "for multiple); omit to clear the tag")
     p.set_defaults(func=run_docs)
 
     p = sub.add_parser("diagnose", help="run a read-only diagnosis on one host")
     p.add_argument("--inventory", required=True)
     _add_target_args(p, ssh=True)
-    p.add_argument("--symptom", required=True)
+    p.add_argument("--symptom", default="",
+                   help="symptom to diagnose; may be omitted when --test-log is "
+                        "given (default derives from the log's first failure)")
+    p.add_argument("--test-log", action="append", default=None,
+                   help="harness/FAT run log whose failures seed this diagnosis "
+                        "(repeatable; parsed for error codes/test names, feeds the "
+                        "agent evidence, doc retrieval, and the learning loop)")
     p.add_argument("--secret-dir", help="local dir mapping vault paths to files (lab use)")
     p.add_argument("--parts-csv", help="parts list CSV (columns: slot,fru,pn,sn)")
     p.add_argument("--docs-lib", default=None,
@@ -2006,6 +2184,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "(repeatable; implies session mode)")
     p.add_argument("--max-turns", type=int, default=6,
                    help="session turn budget before a forced diagnosis (default: 6)")
+    p.add_argument("--server-number", type=int, default=None,
+                   help="server number for the vendor FAT single-test menu "
+                        "(GB targets, SSH/session mode only)")
     p.add_argument("--console", action="store_true",
                    help="run probes over the serial console (rack manager + cable) "
                         "instead of SSH (lab/qa only)")
@@ -2019,6 +2200,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--llm", choices=("openai", "gemini", "stub"), default=None,
                    help="LLM backend: openai-compatible endpoint (default) | gemini | "
                         "stub (no reasoning); defaults to the inventory 'llm' block")
+    p.add_argument("--llm-model", default=None,
+                   help="specific LLM model, e.g. gemini/gemini-2.5-pro or gpt-4o; "
+                        "overrides --llm / inventory / the remembered model "
+                        "(config/models.yaml)")
     p.add_argument("--approval", action="store_true", help="prompt y/N for each action")
     p.add_argument("--approve-all", action="store_true", help="record every action approved")
     p.add_argument("--wall-s", type=float, default=900.0, help="supervisor wall-clock budget")
@@ -2082,10 +2267,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="resume a saved session directory at startup")
     p.add_argument("--max-turns", type=int, default=6,
                    help="agent turn budget per diagnosis run (default: 6)")
+    p.add_argument("--server-number", type=int, default=None,
+                   help="server number for the vendor FAT single-test menu "
+                        "(GB targets, SSH targets only)")
     p.add_argument("--llm", choices=("openai", "gemini", "stub"), default=None,
-                   help="LLM backend for routing + reasoning: openai-compatible "
+                   help="LLM backend for conversation + reasoning: openai-compatible "
                         "endpoint (default) | gemini | stub (no reasoning); defaults "
                         "to the inventory 'llm' block")
+    p.add_argument("--llm-model", default=None,
+                   help="specific LLM model for conversation + reasoning, e.g. "
+                        "gemini/gemini-2.5-pro or gpt-4o; overrides --llm / "
+                        "inventory / the remembered model (config/models.yaml)")
     p.set_defaults(func=run_session)
 
     p = sub.add_parser("secrets",

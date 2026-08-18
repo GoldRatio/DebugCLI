@@ -71,6 +71,11 @@ class ConfidenceBreakdown(BaseModel):
     model_agreement: float = 0.0
     penalty: float = 0.0
     calibration_llm: str | None = None  # LLM ident whose calibration resolved model_agreement
+    # The model's own self-reported confidence at report time (pre-scoring). The
+    # scorer overwrites Diagnosis.confidence with the formula output, so this
+    # preserves the raw prediction that calibration bins against -- the bin key
+    # must be built and looked up from the SAME value.
+    self_reported_confidence: float | None = None
     # Root-cause certainty (failure-point runs only): how well the evidence
     # discriminates the named root cause from the failing rail's suspect set.
     # None = not applicable (no power-rail failure point was decoded).
@@ -114,18 +119,29 @@ class Diagnosis(BaseModel):
     failure_point: FailurePoint | None = None
 
 
+class SingleTestRequest(BaseModel):
+    """Request to the FAT single-test driver: list the available tests, or run
+    one by exact label. ``run`` only ever accepts a label from the discovered
+    list -- the agent cannot free-type test numbers or commands."""
+
+    action: Literal["list", "run"]
+    test: str | None = None
+
+
 class TurnResponse(BaseModel):
     """One agent turn in the multi-turn session: ask a question, request further
-    read-only probes, or deliver the final Diagnosis.
+    read-only probes, run a FAT single test, or deliver the final Diagnosis.
 
     The agent never proposes commands -- ``subsystems``/``doc_topics`` are mapped
-    by the harness to curated read-only collectors / the doc library.
+    by the harness to curated read-only collectors / the doc library, and the
+    ``single_test`` action is mapped to the vendor FAT single-test menu driver.
     """
 
-    kind: Literal["question", "probe", "diagnosis"]
+    kind: Literal["question", "probe", "test", "diagnosis"]
     question: str | None = None
     subsystems: list[str] = Field(default_factory=list)
     doc_topics: list[str] = Field(default_factory=list)
+    single_test: SingleTestRequest | None = None
     diagnosis: Diagnosis | None = None
 
 
@@ -163,6 +179,16 @@ class CaseOutcome(BaseModel):
     # Prompt 06 contract (optional): the diagnosis confidence at report time;
     # the per-bin predicted value calibration bins against.
     confidence: float | None = None
+    # Prompt 06 contract (optional): the model's SELF-reported confidence before
+    # the scorer overwrote it. Calibration bins against this (same key as the
+    # lookup in score_diagnosis); legacy records without it fall back to
+    # ``confidence``.
+    self_reported_confidence: float | None = None
+    # Test-log evidence from a --test-log run: failure signatures (e.g.
+    # "P02002001@PCIe Test Fail", "pcie_cmp_chk") so a future run whose harness
+    # log shows the same failure surfaces this verified case pre-probe.
+    # Optional; records created without a test log validate unchanged.
+    test_log_failures: list[str] = Field(default_factory=list)
 
     @property
     def verified(self) -> bool:

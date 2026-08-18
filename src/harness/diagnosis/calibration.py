@@ -3,10 +3,13 @@
 ``model_agreement`` used to be a static 0.5; this makes it a measured store.
 Every verified case (outcome fixed/partial/not_fixed) contributes its predicted
 confidence and its observed outcome to a bin histogram keyed by LLM identity, so
-each model calibrates ITSELF (model swaps stay safe). ``agreement_for`` then maps
-a raw predicted confidence to an agreement value the scorer uses as
-``model_agreement`` -- degrading to 0.5 on absent/thin data instead of
-exaggerating.
+each model calibrates ITSELF (model swaps stay safe). ``agreement_for`` then
+maps a raw predicted confidence to that bin's observed fix rate shrunk toward
+0.5 (never exaggerating on thin data). The predicted value is the model's
+SELF-reported confidence (``CaseOutcome.self_reported_confidence``), the SAME
+value ``score_diagnosis`` looks up the bin with -- bins are built and queried
+from one distribution. Legacy records without the self-report fall back to the
+scored ``confidence``.
 """
 
 from __future__ import annotations
@@ -25,6 +28,12 @@ BIN_MAXES = tuple(BIN_EDGES[1:])
 # Outcome → numeric resolution weight (prompt 03 contract + priors/calibration).
 RESOLUTION = {"fixed": 1.0, "partial": 0.5, "not_fixed": 0.0,
               "inconclusive": 0.25, "unknown": 0.5}
+
+# Shrinkage strength for the fix-rate posterior: pulls the observed bin rate
+# toward the 0.5 neutral by ``SHRINKAGE`` pseudo-samples, so a bin with n
+# samples reports (n*rate + SHRINKAGE*0.5)/(n + SHRINKAGE) instead of an
+# overconfident n-small estimate.
+SHRINKAGE = 5.0
 
 
 def bin_index(predicted: float) -> int:
@@ -58,9 +67,12 @@ def build_calibration(cases: list[CaseOutcome], llm_ident: str,
     """Build a calibration histogram for ONE model identity.
 
     Only cases whose ``outcome`` carries verified signal (fixed/partial/
-    not_fixed) and whose ``llm_ident`` matches count. Bins with fewer than
-    ``min_per_bin`` samples inherit the aggregate bin's observed rate (graceful
-    degradation, never exaggeration). Returns None when fewer than
+    not_fixed) and whose ``llm_ident`` matches count. Each case is binned by its
+    predicted confidence -- the model's SELF-reported value
+    (``self_reported_confidence``) when present, else the legacy scored
+    ``confidence`` -- the same key ``agreement_for`` looks up. Bins with fewer
+    than ``min_per_bin`` samples inherit the aggregate bin's observed rate
+    (graceful degradation, never exaggeration). Returns None when fewer than
     ``min_per_bin`` usable samples exist at all (callers fall back to 0.5).
     """
     usable = [c for c in cases
@@ -70,10 +82,14 @@ def build_calibration(cases: list[CaseOutcome], llm_ident: str,
     if len(usable) < min_per_bin:
         return None
 
+    def _predicted(case: CaseOutcome) -> float:
+        return (case.self_reported_confidence if case.self_reported_confidence
+                is not None else case.confidence) or 0.5
+
     def _bin_rates(group: list[CaseOutcome]) -> list[tuple[float, float, int]]:
         per_bin: dict[int, list[float]] = {i: [] for i in range(len(BIN_MAXES))}
         for case in group:
-            per_bin[bin_index(case.confidence or 0.5)].append(
+            per_bin[bin_index(_predicted(case))].append(
                 RESOLUTION[case.outcome])
         out: list[tuple[float, float, int]] = []
         for i, hi in enumerate(BIN_MAXES):
@@ -174,9 +190,14 @@ def agreement_for(cal: Calibration | None, predicted: float,
                   subsystem: str | None = None) -> float:
     """Predicted confidence → agreement value in [0,1]; 0.5 when uncalibrated.
 
-    ``1 - abs(predicted - observed_fix_rate)`` from the subsystem histogram,
-    falling back to the aggregate histogram when the subsystem is unknown or
-    has no data. Zero total samples anywhere → 0.5 (never exaggerate).
+    ``predicted`` only SELECTS the bin (it must be the same self-reported value
+    the histogram was built from). The returned value is the bin's observed fix
+    rate shrunk toward 0.5 by ``SHRINKAGE`` pseudo-samples -- a correctness
+    prior for "cases predicted in this confidence bin actually got fixed",
+    degrading toward the 0.5 neutral on thin/absent data instead of
+    exaggerating (or rewarding under-confidence). Falls back from the subsystem
+    histogram to the aggregate histogram when the subsystem is unknown or has no
+    data. Zero total samples anywhere → 0.5.
     """
     if cal is None:
         return 0.5
@@ -193,7 +214,8 @@ def agreement_for(cal: Calibration | None, predicted: float,
         # Subsystem bin exists but has no samples: try the aggregate bin.
         if len(cal.aggregate) > idx and cal.aggregate[idx][2] > 0:
             observed_rate = cal.aggregate[idx][1]
+            n = cal.aggregate[idx][2]
         else:
             return 0.5
-    value = 1.0 - abs(max(0.0, min(1.0, float(predicted))) - observed_rate)
+    value = (n * observed_rate + SHRINKAGE * 0.5) / (n + SHRINKAGE)
     return round(max(0.0, min(1.0, value)), 3)

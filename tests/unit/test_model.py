@@ -34,6 +34,18 @@ def test_normalize_product_resolves_alias_variants():
     assert normalize_product("PROLIANT DL380 Gen10 (SFF)") == "proliant_dl380g10"
 
 
+def test_normalize_product_resolves_fleet_platforms():
+    # Grace-Blackwell fleet: node board / spec names -> canonical platform key,
+    # so RAG/topology filters and case-library keying are consistent.
+    assert normalize_product("C4A15") == "samoa"
+    assert normalize_product("C4A14 Server") == "samoa"
+    assert normalize_product("GB200 NVL72") == "nvl72"
+    assert normalize_product("NVL72") == "nvl72"
+    model = DetectedModel(product_name="C4A15", bios_vendor="Microsoft",
+                          bios_version=None, raw="", source="fru")
+    assert model.model_key == "samoa"
+
+
 def test_normalize_product_unknown_passes_clean_slug():
     assert normalize_product("SuperMicro X11DPi-N") == "supermicro_x11dpi-n"
 

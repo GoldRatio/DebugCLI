@@ -103,6 +103,23 @@ Relevant to the console path:
 python -m pytest -q tests/unit/test_serial_console.py -v
 ```
 
+### FAT single-test driver (no SSH needed)
+
+`tests/unit/test_single_test.py` exercises the interactive menu driver and its
+session-engine wiring against a scripted shell (no real SSH): menu parsing,
+FAT selection, run/verdict extraction, server-number + digit-only-send safety
+rails, menu self-healing when the script loops back to the main menu, platform
+gating, and the `list -> run -> diagnosis` agent flow.
+
+```powershell
+python -m pytest -q tests/unit/test_single_test.py -v
+```
+
+First live use is calibration: run `harness diagnose ... --interactive
+--server-number N` and inspect `<out>/single_test_transcript.txt` (and the
+`[test result]` transcript entries) to confirm the menu text matches the
+parser's assumptions.
+
 ---
 
 ## 3. Smoke test against the rack manager (no node yet)

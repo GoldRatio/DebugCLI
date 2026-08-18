@@ -132,7 +132,10 @@ harness> the DIMM error is back on h1
 ```
 
 - Non-slash text routes (LLM, keyword fallback) to diagnose / probe / docs /
-  verify / status / reply.
+  verify / status / reply. A `probe` request runs the read-only collectors for
+  the named subsystem (or doc-named probes mined from the manual) against the
+  active target and reports the decoded registers back in the chat -- it never
+  asks the agent to invent commands.
 - Slash commands: `/help`, `/hosts`, `/use <host|rack cable n|ip|alias>`,
   `/context <note>`, `/status`, `/stop`, `/runs`, `/history`, `/resume <dir>`,
   `/lint`, `/targets ...`, `/docs ...`, `/quit`.
@@ -151,6 +154,57 @@ harness diagnose --inventory inventory.yaml --target d1 --symptom "ECC errors"
 
 Add `--approval` (y/N per action) or `--approve-all` (record all approved),
 `--context "note"` / `--context-file`, and `--max-turns` (default 6).
+
+### Test-log evidence (any target)
+
+Before debugging, hand the pipeline the factory/harness run log (e.g. a Quanta
+FAT `.log`). Its failures — error codes and test names like
+`[FAIL][P02002001@PCIe Test Fail]` / `FAIL: pcie_cmp_chk` — are parsed and
+shown to the agent as evidence in every prompt, and seed doc retrieval:
+
+```powershell
+harness diagnose --inventory inventory.yaml --host h1 `
+    --test-log quanta_qmf_fat_c4a15_p23326287013301e_20260811220125.log
+#   --symptom is optional here: it derives from the log's first failure
+```
+
+- Repeatable (`--test-log a.log --test-log b.log`), works in single-shot AND
+  session mode, and from the menu (the Diagnose step asks for a log path) or
+  the chat REPL (`/testlog <path>` queues one for the next run).
+- The raw log is copied into `harness_runs/<id>/test_logs/` for
+  reproducibility; the audit `test_log_loaded` event records only metadata and
+  failure codes. Cleartext passwords in logs (e.g. `sshpass -p '...'`) are
+  redacted before anything reaches a prompt, transcript, or audit.
+- Learning loop: the run's `pending_case.json` carries the failure signatures.
+  After the repair, confirm with `harness report --run <id> --outcome fixed
+  [--taken "..."]`. A future run whose log shows the same failure code surfaces
+  that verified fix as a Prior Verified Case — even before any probing.
+
+### FAT single tests (GB targets, session mode)
+
+The GB models expose a vendor single-test menu on the host:
+`/mnt/smbfs/single_rtp_l10.sh <ServerNumber>`. In session mode the agent can
+drive it: it lists the FAT tests, then runs the ones it decides will
+discriminate between suspects, and treats the results as evidence.
+
+```powershell
+harness diagnose --inventory inventory.yaml --host h1 --symptom "ECC errors" `
+    --interactive --server-number 3
+harness session --inventory inventory.yaml --host h1 --server-number 3
+```
+
+- Requires `--server-number` (positive integer, supplied by you; the lab doc
+  notes it can sometimes be derived from `ipmitool fru print 2`), an SSH target
+  (not `--console`), and session mode (`--interactive` / `--context*`).
+- The agent is instructed to `{"kind":"test","action":"list"}` first, then
+  `{"kind":"test","action":"run","test":"<exact label>"}` for tests on the
+  listed menu. Menu selections are always bare digits; no free text is ever
+  sent to the menu.
+- Results come back as `[test result]` messages in the transcript; a `FAIL` is
+  treated as strong current-state evidence. The full transcript is saved under
+  the run directory as `single_test_transcript.txt`.
+- Platform gating: only GB platform families (samoa/nvl72, incl. gb200) are
+  allowed; the live-detected model wins.
 
 ## 5. Console path (serial/SOL, lab/QA only)
 

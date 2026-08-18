@@ -86,6 +86,8 @@ class LineReader:
         self._fd = None
         self._restore = None
         self._max_width = len(prompt)
+        self._prompt_printed = False  # echoed the active prompt for this line;
+        # poll() re-fires at 10Hz while a task runs, so this must gate re-echoing
         self._cursor_rows = 0  # physical rows below the line start the cursor
         # sits on (0 = the prompt row); the line may WRAP past the terminal
         # width, and redraw must climb back across those rows, not just "\r"
@@ -216,10 +218,11 @@ class LineReader:
         if not self._raw:
             return input(prompt or self.prompt)
         self._active = prompt or self.prompt
-        if not self._buf:
+        if not self._buf and not self._prompt_printed:
             self._max_width = len(self._active)
             self._cursor_rows = len(self._active) // _terminal_width()
             print(self._active, end="", flush=True)
+            self._prompt_printed = True
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             if timeout is None:
@@ -237,6 +240,7 @@ class LineReader:
                 line, self._buf = self._buf, ""
                 self._max_width = len(self.prompt)
                 self._cursor_rows = 0
+                self._prompt_printed = False
                 print()
                 return line
             if key == "ctrl_c":
@@ -288,6 +292,7 @@ class LineReader:
         print(f"\r{self._active}{self._buf}{' ' * pad}\r{self._active}{self._buf}",
               end="", flush=True)
         self._cursor_rows = n // _terminal_width()
+        self._prompt_printed = True
 
     def redraw(self, n_before: int | None = None) -> None:
         """Re-render the active prompt line in place, crossing line wraps.
@@ -311,6 +316,7 @@ class LineReader:
             seq += f"\x1b[{up}A"
         self._cursor_rows = n // width
         print(seq + f"{self._active}{self._buf}", end="", flush=True)
+        self._prompt_printed = True
 
 
 # ---- selection menu ----
@@ -457,3 +463,27 @@ def confirm(prompt: str, *, default: bool = False) -> bool:
     if not line:
         return default
     return line in ("y", "yes")
+
+
+def ask_model_profile(*, reader: LineReader | None = None):
+    """Three short prompts building a custom LLM ``ModelProfile``.
+
+    Used by the ``+ add a custom model`` row in the model picker (menu and
+    ``/model`` in the REPL). Provider must be ``openai`` or ``gemini``; the URL
+    and API-key vault path are optional and fall back to the provider defaults.
+    Returns None when cancelled.
+    """
+    from ..config.model_catalog import ModelProfile
+
+    provider = ask_text("Provider (openai | gemini)", reader=reader).strip().lower()
+    if provider not in ("openai", "gemini"):
+        print(f"  x unknown provider {provider!r} (openai | gemini)", file=sys.stderr)
+        return None
+    model = ask_text("Model id (e.g. gpt-4o)", reader=reader).strip()
+    if not model:
+        return None
+    url = ask_text("Endpoint URL (Enter = provider default)", reader=reader).strip() or None
+    vault = ask_text("API key vault path (Enter = env fallback)",
+                     reader=reader).strip() or None
+    return ModelProfile(provider=provider, model=model, url=url,
+                        api_key_vault_path=vault)

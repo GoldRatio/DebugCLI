@@ -124,6 +124,38 @@ def test_retriever_serves_from_cache_without_reparsing(tmp_path):
     assert "[k.pdf p.1]" in rag.lines("kernel oops", top_k=1)[0]
 
 
+def test_retag_sets_clears_and_multi_tags(tmp_path):
+    lib = DocLibrary(tmp_path / "lib", parser=_fake_pdf)
+    lib.add([_write_pdf(tmp_path, "node.pdf", "1")])
+
+    status = lib.retag(["node.pdf"], platform="samoa")
+    assert any("tagged node.pdf" in s for s in status)
+    chunks = lib.build_retriever().retriever.chunks
+    assert all(c.platforms == ["samoa"] for c in chunks)
+
+    # multi-platform tag (e.g. a tray guide for node + rack)
+    lib.retag(["node.pdf"], platform="nvl72,samoa")
+    chunks = lib.build_retriever().retriever.chunks
+    assert all(set(c.platforms) == {"nvl72", "samoa"} for c in chunks)
+
+    # clearing returns the chunk to platform-neutral
+    lib.retag(["node.pdf"])
+    assert lib.entries()[0].platform is None
+    chunks = lib.build_retriever().retriever.chunks
+    assert all(c.platforms == [] for c in chunks)
+
+
+def test_retag_reports_missing_and_survives_reload(tmp_path):
+    lib = DocLibrary(tmp_path / "lib", parser=_fake_pdf)
+    lib.add([_write_pdf(tmp_path, "node.pdf", "1")])
+    lib.retag(["node.pdf"], platform="samoa")
+    missing_status = lib.retag(["missing.pdf"], platform="samoa")
+
+    reloaded = DocLibrary(tmp_path / "lib", parser=_fake_pdf)
+    assert reloaded.entries()[0].platform == "samoa"
+    assert any("missing.pdf" in s for s in missing_status)
+
+
 # ---- multi-format ingestion (markdown / text / csv) ----
 
 def test_add_markdown_splits_on_headings(tmp_path):

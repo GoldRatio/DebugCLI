@@ -1,17 +1,20 @@
-"""Interactive session REPL: chat with the harness in natural language.
+"""Interactive session REPL: an agent chat over read-only debugging tools.
 
 ``harness session`` starts a Claude-Code-style REPL: you describe symptoms in
-plain English and the agent runs the read-only pipeline (collect -> decode ->
-RAG -> LLM -> scored diagnosis) *in the background* while you keep typing.
+plain English and a conversation agent (``operator.chat_agent``) explains what
+it is about to do, then calls the harness's read-only tools (diagnose / probe /
+docs / verify) *in the background* while you keep typing. Tool results feed
+back into the conversation, so the agent can chain steps and answer follow-up
+questions grounded in the evidence it gathered.
 
 Design:
 
-- ``BackgroundTask`` runs long actions (routing / diagnose / verify / docs
-  lookup / conversation) in a daemon thread. Every worker print is captured and
+- ``BackgroundTask`` runs the whole agent turn (decide -> say -> tool ->
+  observe -> decide ...) in a daemon thread. Every worker print is captured and
   streamed back through an event queue, so the terminal stays under the REPL's
-  control. NL routing is itself a background task: a slow router LLM never
-  freezes the prompt, and a status line ticks every few seconds so it is always
-  visible that the agent is working in the background.
+  control. The agent's LLM call is itself inside the task: a slow model never
+  freezes the prompt, and the agent's own progress and statements stream in as
+  they happen (use /status on demand to see what is running).
 - ``LineReader`` (in ``operator.menu``) puts the tty in raw mode (termios on
   POSIX, msvcrt on Windows) so the REPL can redraw the in-progress input line
   around background output. When stdin is not a tty it falls back to blocking
@@ -43,19 +46,13 @@ from typing import TextIO
 from ..config.inventory_lint import load_inventory
 from ..config.vault import SecretStore
 from ..diagnosis.schema import Diagnosis
+from ..inspect.base import RegisterDump
 from ..operator.supervisor import Escalation
 from ..targets import TargetError, TargetSpec, resolve_target
+from .chat_agent import ChatTurn, build_evidence, build_messages, decide, fallback_turn
 from .credential_gate import apply_ssh_context
 from .menu import LineReader as _LineReader
-from .router import SessionCommand, route_message
-
-REPLY_SYSTEM = (
-    "You are the assistant of a READ-ONLY server debugging harness. Answer the "
-    "operator concisely about the current session. You have no evidence beyond "
-    "what the harness gathered; never invent registers, commands, or repairs. "
-    "Offer concrete next steps the operator can trigger (diagnose, probe, docs, "
-    "verify). Respond with a JSON object: {\"text\": \"...\"}."
-)
+from .router import _keyword_route
 
 
 @dataclass
@@ -75,6 +72,9 @@ class Session:
     secret_dir: str | None
     console: bool
     max_turns: int
+    server_number: int | None = None
+    llm_ident: str = ""
+    ask_parts: bool = False
     overrides: dict = field(default_factory=dict)
     target: TargetSpec = field(default_factory=TargetSpec)
     target_label: str = ""
@@ -83,7 +83,9 @@ class Session:
     identity_vault_path: str | None = None
     known_hosts_path: str = "config/known_hosts"
     transcript: list[dict] = field(default_factory=list)
+    evidence: str = ""       # digest of the latest diagnosis (chat grounding)
     pending: list[str] = field(default_factory=list)
+    test_logs: list[str] = field(default_factory=list)  # queued --test-log paths
     runs: list[Path] = field(default_factory=list)
     last_run: Path | None = None
     reader: object | None = None
@@ -96,7 +98,6 @@ class Session:
     cred_answer: bytes | None = None
     cred_event: threading.Event = field(default_factory=threading.Event)
     quit: bool = False
-    last_tick: float = field(default_factory=time.monotonic)
 
 
 # ---- background task + captured output ----
@@ -127,6 +128,20 @@ class _Capture(TextIO):
 
     def flush(self) -> None:
         self._real.flush()
+
+    def fileno(self) -> int:
+        """Delegate to the real stream.
+
+        ``typing.TextIO.fileno()`` (the inherited no-op) returns ``None``, which
+        breaks stdlib callers that pass the fd on -- argparse's help color
+        detection calls ``os.isatty(stream.fileno())`` on every worker-thread
+        ``build_parser()`` (the captured stdout is process-global), and
+        ``os.isatty(None)`` raises ``TypeError: 'NoneType' object cannot be
+        interpreted as an integer``. Delegating gives the real fd (or raises
+        ``io.UnsupportedOperation`` for fd-less streams, which the caller's
+        ``OSError`` fallback handles via ``isatty()``).
+        """
+        return self._real.fileno()
 
     def isatty(self) -> bool:
         return self._real.isatty()
@@ -248,6 +263,8 @@ def _diagnose_argv(session: Session, symptom: str, host_name: str | None) -> lis
             "--out-dir", str(session.out_dir),
             "--llm", session.llm_mode,
             "--max-turns", str(session.max_turns)]
+    if session.llm_ident:
+        argv += ["--llm-model", session.llm_ident]
     argv += _target_argv(session)
     if session.secret_dir:
         argv += ["--secret-dir", session.secret_dir]
@@ -257,11 +274,18 @@ def _diagnose_argv(session: Session, symptom: str, host_name: str | None) -> lis
         argv += ["--docs-dir", session.docs_dir]
     if session.parts_csv:
         argv += ["--parts-csv", session.parts_csv]
+    if session.ask_parts:
+        argv.append("--ask-parts")
     if session.console:
         argv.append("--console")
+    if session.server_number:
+        argv += ["--server-number", str(session.server_number)]
     for context_line in session.pending:
         argv += ["--context", context_line]
     session.pending = []
+    for test_log in session.test_logs:
+        argv += ["--test-log", test_log]
+    session.test_logs = []
     return argv
 
 
@@ -282,82 +306,313 @@ def _make_answer_fn(session: Session) -> Callable[[str], str]:
     return answer
 
 
-def _diagnose_task(session: Session, symptom: str,
-                   host_name: str | None) -> BackgroundTask:
-    argv = _diagnose_argv(session, symptom, host_name)
-    label = session.target_label or host_name or (
-        session.host.name if session.host is not None else "(unnamed target)")
+# ---- agent tools (called inline by the conversation agent's loop) ----
 
-    def fn(progress: Callable[[str], None], cancel: threading.Event):
-        from ..operator.cli import build_parser, run_diagnose
-        args = build_parser().parse_args(argv)
-        return run_diagnose(args, overrides={
-            **session.overrides,
-            "store": session.store,
-            "llm": session.llm,
-            "progress": progress,
-            "cancel_event": cancel,
-            "human_input": _make_answer_fn(session),
-        })
+def _apply_turn_target(session: Session, turn: ChatTurn) -> bool:
+    """If the agent's turn names a target, switch the active target first.
+    Returns False when the named target could not be resolved (the error was
+    already printed), so the agent does not launch a doomed run."""
+    spec = None
+    if turn.host is not None and turn.host in session.inv.host_names:
+        spec = TargetSpec(name=turn.host)
+    elif turn.ip is not None:
+        spec = TargetSpec(ip=turn.ip)
+    elif turn.rack is not None and turn.cable is not None:
+        spec = TargetSpec(rack=turn.rack, cable=turn.cable)
+    elif turn.alias is not None:
+        spec = TargetSpec(alias=turn.alias)
+    if spec is not None and spec != session.target:
+        return _set_target(session, spec)
+    return True
 
-    return BackgroundTask(label=label, fn=fn)
+
+def _tool_diagnose(session: Session, turn: ChatTurn,
+                   progress: Callable[[str], None],
+                   cancel: threading.Event):
+    """Run the full read-only diagnose pipeline as one agent tool call."""
+    if not _apply_turn_target(session, turn):
+        return None  # unresolved target: error already printed
+    argv = _diagnose_argv(session, turn.symptom or "", turn.host)
+    from ..operator.cli import build_parser, run_diagnose
+    args = build_parser().parse_args(argv)
+    return run_diagnose(args, overrides={
+        **session.overrides,
+        "store": session.store,
+        "llm": session.llm,
+        "progress": progress,
+        "cancel_event": cancel,
+        "human_input": _make_answer_fn(session),
+    })
 
 
-def _verify_task(session: Session, metric: str,
-                 baseline: str | None) -> BackgroundTask:
+def _tool_verify(session: Session, turn: ChatTurn,
+                 progress: Callable[[str], None]) -> str:
+    """Re-collect a metric and compare against a baseline run; the verdict
+    lines are streamed via ``progress`` AND returned so the agent reasons
+    over them on its next decision."""
+    baseline = turn.baseline
     if not baseline and session.last_run is not None:
         dumps = session.last_run / "dumps.json"
         if dumps.exists():
             baseline = str(dumps)
+    if not baseline:
+        return "(no baseline yet: run a diagnosis first, or pass a baseline path)"
     argv = ["verify", "--inventory", session.inv_path,
             "--symptom", "(session verify)",
-            "--baseline", baseline or ""]
+            "--baseline", baseline]
     argv += _target_argv(session)
     if session.secret_dir:
         argv += ["--secret-dir", session.secret_dir]
-    if metric:
-        argv += ["--metric", metric]
+    if turn.metric:
+        argv += ["--metric", turn.metric]
 
-    def fn(progress: Callable[[str], None], cancel: threading.Event):
-        from ..operator.cli import build_parser, run_verify
+    from ..operator.cli import build_parser, run_verify
+
+    def run():
         args = build_parser().parse_args(argv)
-        return run_verify(args, overrides={
-            **session.overrides, "store": session.store})
+        return run_verify(args, overrides={**session.overrides,
+                                           "store": session.store})
 
-    return BackgroundTask(label="verify", fn=fn)
-
-
-def _docs_task(session: Session, query: str) -> BackgroundTask:
-    def fn(progress: Callable[[str], None], cancel: threading.Event):
-        from types import SimpleNamespace
-
-        from ..operator.cli import _build_docs_retriever
-        retriever, _lib = _build_docs_retriever(SimpleNamespace(
-            docs_lib=session.docs_lib, docs_dir=session.docs_dir))
-        if retriever is None:
-            return "(no doc library; use `harness docs add` to upload PDFs)"
-        lines = retriever(query)
-        if not lines:
-            return f"(no snippets matched {query!r})"
-        return "\n".join(f"- {line}" for line in lines)
-
-    return BackgroundTask(label="docs lookup", fn=fn)
+    # Tee the verdict output: lines stream to the operator via progress while
+    # being collected for the agent's next decision. Thread-owner-aware like
+    # the task-level capture, so the REPL's own prints always pass through.
+    lines: list[str] = []
+    tee = _Capture(lambda l: (lines.append(l), progress(l)), sys.stdout)
+    old, sys.stdout = sys.stdout, tee
+    try:
+        run()
+    finally:
+        sys.stdout = old
+    return "\n".join(lines) or "(verify produced no output)"
 
 
-def _reply_task(session: Session, text: str) -> BackgroundTask:
-    def fn(progress: Callable[[str], None], cancel: threading.Event):
-        if not callable(getattr(session.llm, "chat_json", None)):
-            return ("(no LLM configured for conversation; describe a symptom to "
-                    "diagnose, or see /help)")
-        messages = [{"role": "system", "content": REPLY_SYSTEM}]
-        for entry in session.transcript[-6:]:
-            role = "assistant" if entry.get("role") == "agent" else "user"
-            messages.append({"role": role, "content": entry["content"]})
-        messages.append({"role": "user", "content": text})
-        raw = session.llm.chat_json(messages)
-        return raw.get("text") or raw.get("content") or "(no reply)"
+def _tool_docs(session: Session, turn: ChatTurn) -> str:
+    if not session.docs_lib and not session.docs_dir:
+        return ("(no doc library configured; set --docs-lib / --docs-dir or "
+                "use `harness docs add`)")
+    from types import SimpleNamespace
 
-    return BackgroundTask(label="reply", fn=fn)
+    from ..operator.cli import _build_docs_retriever
+    retriever, _lib = _build_docs_retriever(SimpleNamespace(
+        docs_lib=session.docs_lib, docs_dir=session.docs_dir))
+    if retriever is None:
+        return "(no doc library; use `harness docs add` to upload PDFs)"
+    lines = retriever(turn.query or "", None)
+    if not lines:
+        return f"(no snippets matched {turn.query!r})"
+    return "\n".join(f"- {line}" for line in lines)
+
+
+def _tool_run(session: Session, turn: ChatTurn) -> str:
+    """Load a PAST run's recorded diagnosis + evidence digest (local, read-only).
+
+    Resolves the reference against the session's run root and its own run
+    list, then rebuilds the evidence digest so follow-ups are grounded in that
+    run. Returns a summary line for the transcript; unresolved or unreadable
+    runs come back as an observation string, not an exception.
+    """
+    ref = (turn.run or "").strip().rstrip("/\\")
+    if not ref:
+        return "(run reference missing)"
+    candidates = [Path(ref)]
+    candidates.append(session.out_dir / ref)
+    candidates.append(session.out_dir / ref.split("/")[-1].split("\\")[-1])
+    run_dir = None
+    for cand in candidates:
+        if cand.is_dir():
+            run_dir = cand
+            break
+    if run_dir is None:
+        for run in session.runs:
+            if run.name == ref or str(run).endswith(ref):
+                run_dir = run
+                break
+    if run_dir is None:
+        return (f"(run {ref!r} not found under {session.out_dir}; /runs lists "
+                "the runs this session knows about)")
+    diagnosis_path = run_dir / "diagnosis.json"
+    if not diagnosis_path.exists():
+        return (f"(run {run_dir.name} exists but has no recorded diagnosis.json; "
+                "it may have failed before scoring -- /runs shows the session's runs)")
+    try:
+        diag = Diagnosis.model_validate(json.loads(
+            diagnosis_path.read_text(encoding="utf-8")))
+    except (OSError, ValueError) as exc:
+        return f"(could not read {diagnosis_path}: {exc})"
+    session.last_run = run_dir
+    if run_dir not in session.runs:
+        session.runs.append(run_dir)
+    session.evidence = build_evidence(diag, str(run_dir))
+    summary = (f"loaded run {run_dir.name}: state="
+               f"{getattr(diag.state, 'value', diag.state)} "
+               f"confidence={diag.confidence:.2f} -- {diag.diagnosis}")
+    session.transcript.append(
+        {"role": "agent", "kind": "diagnosis",
+         "content": f"{diag.diagnosis} (confidence {diag.confidence:.2f})"})
+    return summary
+
+
+def _render_decode(d) -> str:
+    """One line for a decoded register: ``MNEMONIC = 0x..  [field=value ...]``."""
+    fields = ", ".join(
+        f"{f.name}={f.raw_value}" + (f"({f.meaning})" if f.meaning else "")
+        for f in getattr(d, "decoded_fields", []))
+    line = f"{d.mnemonic} = {d.raw_hex}"
+    if fields:
+        line += f"  [{fields}]"
+    if getattr(d, "unknown", False):
+        line += "  (unknown register)"
+    return line
+
+
+def _run_probes(session: Session, subsystems: list[str], doc_topics: list[str],
+                progress: Callable[[str], None],
+                cancel: threading.Event) -> str:
+    """Collect + decode read-only probes for the active target; no LLM turn.
+
+    Mirrors the session engine's probe mapping (subsystem -> PROFILE_COLLECTORS,
+    doc topics -> doc-named probe commands) but stands alone: the operator asked
+    for evidence, so this runs the collectors and reports what came back.
+    """
+    from types import SimpleNamespace
+
+    from ..diagnosis.engine import decode_dumps, prebatch_console_plan
+    from ..engine.allowlist import default_policy
+    from ..engine.bmc import BmcRunner
+    from ..engine.session import SSHSession
+    from ..engine.sol import ConsoleRunner, SerialConsole
+    from ..inspect.collectors.bmc_console import BmcConsoleCollector
+    from ..inspect.collectors.doc_guided import DocGuidedProbeCollector
+    from ..inspect.collectors.ipmi import IpmiCollector
+    from ..inspect.decoder import Decoder
+    from ..inspect.model import PROFILE_COLLECTORS
+    from ..inspect.registry import make_collector
+    from ..operator.cli import _build_docs_retriever
+    from ..plan.doc_guided import mine_probe_commands
+
+    if not subsystems and not doc_topics:
+        return "nothing to probe (say which subsystem, e.g. 'probe memory')"
+
+    try:
+        target = resolve_target(
+            session.target, session.inv, session.store,
+            targets_path=session.targets_file,
+            ssh_user=session.ssh_user,
+            identity_vault_path=session.identity_vault_path,
+            known_hosts_path=session.known_hosts_path,
+        )
+    except TargetError as exc:
+        return f"probe failed: {exc}"
+    host = target.host
+
+    use_console = session.console or target.kind == "console"
+    if use_console and host.console is None:
+        return f"probe failed: target {target.label!r} has no console block"
+
+    runner = None
+    owned_session = None
+    try:
+        if use_console:
+            runner = session.overrides.get("console_runner")
+            if runner is None:
+                runner = ConsoleRunner(SerialConsole(host.console, session.store))
+        else:
+            runner = session.overrides.get("session")
+            if runner is None:
+                owned_session = SSHSession(host, default_policy(), session.store)
+                owned_session.open()
+                runner = owned_session
+
+        bmc_runner = None
+        if host.bmc is not None and host.bmc.password_vault_path:
+            try:
+                bmc_password = session.store.get(
+                    host.bmc.password_vault_path).decode()
+            except KeyError:
+                bmc_password = None
+            if bmc_password:
+                bmc_runner = BmcRunner(host.bmc.address, host.bmc.username,
+                                       bmc_password)
+
+        def collector_factory(name, _runner):
+            if _runner.is_console:
+                if name in ("pcie", "storage"):
+                    return None
+                if name in ("cpu_msr", "kernel", "ipmi"):
+                    return BmcConsoleCollector(_runner, subsystem={
+                        "cpu_msr": "cpu", "kernel": "kernel", "ipmi": "ipmi",
+                    }[name])
+            if name == "ipmi":
+                return IpmiCollector(bmc_runner) if bmc_runner is not None else None
+            return make_collector(name, _runner)
+
+        wanted: list[str] = []
+        for subsystem in subsystems:
+            if subsystem not in PROFILE_COLLECTORS:
+                continue
+            for name in PROFILE_COLLECTORS[subsystem]:
+                if name not in wanted:
+                    wanted.append(name)
+
+        lines: list[str] = []
+        doc_commands: list[str] = []
+        if doc_topics:
+            retriever, _lib = _build_docs_retriever(SimpleNamespace(
+                docs_lib=session.docs_lib, docs_dir=session.docs_dir))
+            if retriever is not None:
+                for topic in doc_topics:
+                    snippets = retriever(topic, None)
+                    doc_commands.extend(mine_probe_commands(snippets))
+            else:
+                lines.append("doc topic(s) skipped: no doc library configured")
+
+        if use_console and hasattr(runner, "batch_execute"):
+            # one serial console session for the whole probe set
+            prebatch_console_plan(
+                SimpleNamespace(runner=runner, progress=progress),
+                SimpleNamespace(doc_probes=doc_commands),
+                [(name, collector_factory(name, runner)) for name in wanted],
+            )
+
+        dumps: dict[str, list[RegisterDump]] = {}
+        for subsystem in subsystems:
+            if subsystem not in PROFILE_COLLECTORS:
+                lines.append(f"unknown subsystem {subsystem!r} (skipped)")
+                continue
+            if cancel.is_set():
+                return "\n".join(lines + ["cancelled by operator"])
+            names = PROFILE_COLLECTORS[subsystem]
+            progress(f"probe {subsystem}: {', '.join(names)}")
+            for name in names:
+                if name in dumps:
+                    continue
+                collector = collector_factory(name, runner)
+                if collector is None:
+                    lines.append(f"{subsystem}/{name}: unavailable (skipped)")
+                    continue
+                collected = collector.collect()
+                dumps[name] = collected
+                ok = sum(1 for d in collected if d.ok)
+                lines.append(f"{subsystem}/{name}: {len(collected)} dump(s), {ok} ok")
+
+        if doc_commands:
+            progress(f"probe doc-named: {', '.join(doc_commands)}")
+            dumps["doc_guided"] = DocGuidedProbeCollector(
+                runner, doc_commands).collect()
+            ok = sum(1 for d in dumps["doc_guided"] if d.ok)
+            lines.append(f"doc-guided: {len(dumps['doc_guided'])} dump(s), {ok} ok")
+
+        decoded = decode_dumps(Decoder(),
+                               [d for ds in dumps.values() for d in ds])
+        if decoded:
+            lines.append(f"decoded registers ({len(decoded)}):")
+            lines += [f"  {_render_decode(d)}" for d in decoded]
+        elif not lines:
+            lines.append("no probes ran")
+        return "\n".join(lines)
+    finally:
+        if owned_session is not None:
+            owned_session.close()
 
 
 # ---- rendering ----
@@ -458,19 +713,15 @@ def _finish_task(session: Session, result: object | None,
         _print_line(session, f"  x {task.label}: {error}")
         session.transcript.append({"role": "tool", "kind": "error", "content": error})
         return
-    if isinstance(result, Diagnosis):
-        run_dir = _find_newest_run(session.out_dir, session.session_dir)
-        if run_dir is not None:
-            session.last_run = run_dir
-            session.runs.append(run_dir)
-        _print_line(session, f"  done: diagnosis complete ({task.elapsed():.0f}s) in {run_dir}")
-        session.transcript.append({
-            "role": "agent", "kind": "diagnosis",
-            "content": f"{result.diagnosis} (confidence {result.confidence:.2f})",
-        })
-    else:
+    if result is not None:
         _print_line(session, f"  done: {result}")
-        session.transcript.append({"role": "tool", "kind": "result", "content": str(result)})
+        # The final say / tool result was already recorded in the transcript
+        # when it was produced; only record genuinely new content.
+        last = session.transcript[-1] if session.transcript else {}
+        if not (last.get("kind") in ("say", "result")
+                and last.get("content") == str(result)):
+            session.transcript.append(
+                {"role": "tool", "kind": "result", "content": str(result)})
     if session.pending:
         _print_line(session, f"  {len(session.pending)} queued message(s) seed the next run")
 
@@ -489,94 +740,161 @@ def _status_line(session: Session) -> str:
     return "  idle"
 
 
-def _launch(session: Session, cmd: SessionCommand, raw_text: str) -> BackgroundTask | None:
-    """Start the background task for a routed command; returns it (None when
-    the command only printed, e.g. status / a missing-baseline verify).
+# ---- the conversation agent ----
 
-    The new task is started BEFORE it is published as ``session.task``: while
-    it starts, ``session.task`` still names the routing worker (whose fn is
-    alive until ``_launch`` returns), so the REPL's dead-task cleanup can never
-    observe a not-yet-running task and clear it mid-launch.
+_AGENT_MAX_TOOLS = 4  # tool calls per operator message (the loop then stops)
 
-    The launch announcement is queued on the NEW task (whose events the REPL
-    drains) so it is rendered even though the worker that started it is a
-    different thread whose own queue is already abandoned.
+
+def _say(session: Session, progress: Callable[[str], None], text: str) -> None:
+    """Show the agent's reasoning and record it (always BEFORE a tool runs)."""
+    progress(f"agent: {text}")
+    session.transcript.append({"role": "agent", "kind": "say", "content": text})
+
+
+def _action_text(turn: ChatTurn) -> str:
+    if turn.tool == "diagnose":
+        return f"diagnose: {turn.symptom}"
+    if turn.tool == "probe":
+        return (f"probe: {', '.join(turn.subsystems)}"
+                + (f" docs: {', '.join(turn.doc_topics)}" if turn.doc_topics else ""))
+    if turn.tool == "docs":
+        return f"docs: {turn.query}"
+    if turn.tool == "verify":
+        return f"verify: {turn.metric}"
+    if turn.tool == "run":
+        return f"run: {turn.run}"
+    return "none"
+
+
+def _run_agent(session: Session, line: str,
+               progress: Callable[[str], None],
+               cancel: threading.Event):
+    """One operator message -> agent decisions -> read-only tools -> answer.
+
+    Loop: decide (LLM; keyword fallback on the first decision when the LLM is
+    unavailable/garbage) -> print ``say`` -> run at most one tool -> append the
+    result to the transcript -> decide again. Tool results and the evidence
+    digest of any diagnosis feed back into every decision, so the agent can
+    chain steps and answer follow-ups grounded in what it gathered. Returns a
+    short final string for ``_finish_task`` (None when everything the operator
+    needs was already printed/streamed).
     """
-    if cmd.intent == "diagnose":
-        task = _diagnose_task(session, cmd.symptom or raw_text, cmd.host)
-    elif cmd.intent == "verify":
-        if not cmd.baseline and (session.last_run is None or
-                                 not (session.last_run / "dumps.json").exists()):
-            _print_line(session, "  no baseline yet: run a diagnosis first "
-                                 "(or pass a baseline path)")
+    context_lines = list(session.pending)  # queued notes feed THIS turn
+    first = True
+    tool_calls = 0
+    final: str | None = None
+    while True:
+        if cancel.is_set():
+            raise Escalation("run cancelled by operator")
+        if first:
+            progress("thinking: the agent is considering your message ...")
+        messages = build_messages(
+            transcript=session.transcript, user_text=line,
+            evidence_digest=session.evidence,
+            host_names=tuple(session.inv.host_names),
+            target_label=session.target_label,
+            pending=context_lines if first else [])
+        turn = decide(session.router_llm, messages,
+                      tuple(session.inv.host_names))
+        if turn is None:
+            if not first:
+                break  # mid-chain LLM failure: stop with what we have
+            cmd = _keyword_route(line)
+            if cmd.intent == "status":
+                progress(_status_line(session).strip())
+                return None
+            if cmd.intent == "reply":
+                return fallback_turn(cmd, line).say
+            turn = fallback_turn(cmd, line)
+        first = False
+        if turn.say:
+            _say(session, progress, turn.say)
+        if turn.tool in ("", "none"):
+            return turn.say or final
+        if tool_calls >= _AGENT_MAX_TOOLS:
+            progress("tool-call budget reached for this message; send another "
+                     "message to continue")
+            return final or turn.say
+        tool_calls += 1
+        session.transcript.append(
+            {"role": "agent", "kind": "action", "content": _action_text(turn)})
+        try:
+            result = _run_one_tool(session, turn, progress, cancel)
+        except Escalation:
+            raise  # operator /stop or a supervisor gate still aborts the turn
+        except Exception as exc:  # noqa: BLE001 - tool failure is an observation
+            msg = f"{turn.tool} failed: {exc}"
+            progress(msg)
+            session.transcript.append(
+                {"role": "tool", "kind": "result", "content": msg})
+            final = msg
+            continue  # the agent sees the failure and decides what to do next
+        if result is None:  # printed-only turn (e.g. unresolved target)
+            break
+        if isinstance(result, tuple):
+            final, diag = result
+            run_dir = _find_newest_run(session.out_dir, session.session_dir)
+            if run_dir is not None:
+                session.last_run = run_dir
+                session.runs.append(run_dir)
+            session.evidence = build_evidence(diag, str(run_dir) if run_dir else None)
+        else:
+            session.transcript.append(
+                {"role": "tool", "kind": "result", "content": result})
+            final = result
+    return final
+
+
+def _run_one_tool(session: Session, turn: ChatTurn,
+                  progress: Callable[[str], None],
+                  cancel: threading.Event):
+    """Execute one agent tool call; returns the result string for the transcript
+    (a ``(summary, Diagnosis)`` tuple for the diagnose tool)."""
+    if turn.tool == "diagnose":
+        progress(f"starting read-only diagnosis: {turn.symptom}")
+        t0 = time.monotonic()
+        diag = _tool_diagnose(session, turn, progress, cancel)
+        if diag is None:  # unresolved target: error already printed
             return None
-        task = _verify_task(session, cmd.metric, cmd.baseline)
-    elif cmd.intent == "docs":
-        if not session.docs_lib and not session.docs_dir:
-            _print_line(session, "  no doc library (set --docs-lib / --docs-dir)")
-            return None
-        task = _docs_task(session, cmd.query or raw_text)
-    elif cmd.intent == "status":
-        _print_line(session, _status_line(session))
-        return None
-    else:
-        task = _reply_task(session, cmd.text or raw_text)
-    task.start()
-    session.task = task
-    session.task.events.put(("progress", (
-        f"started in the background: {session.task.label} -- keep typing "
-        f"(messages queue), /status for progress, /stop to cancel")))
-    return session.task
+        progress(f"diagnosis complete ({time.monotonic() - t0:.0f}s)")
+        summary = f"diagnosis complete (confidence {diag.confidence:.2f})"
+        session.transcript.append({
+            "role": "agent", "kind": "diagnosis",
+            "content": f"{diag.diagnosis} (confidence {diag.confidence:.2f})",
+        })
+        return summary, diag
+    if turn.tool == "probe":
+        label = ", ".join(turn.subsystems + turn.doc_topics) or "nothing"
+        progress(f"probing: {label}")
+        return _run_probes(session, turn.subsystems, turn.doc_topics,
+                           progress, cancel)
+    if turn.tool == "docs":
+        progress(f"docs lookup: {turn.query}")
+        return _tool_docs(session, turn)
+    if turn.tool == "verify":
+        progress(f"verify {turn.metric} against "
+                 f"{turn.baseline or 'the latest run'}")
+        return _tool_verify(session, turn, progress)
+    if turn.tool == "run":
+        progress(f"loading run: {turn.run}")
+        return _tool_run(session, turn)
+    return "(no tool)"
 
 
-def _apply_cmd_target(session: Session, cmd: SessionCommand) -> bool:
-    """If the routed message names a target, switch the active target first.
-    Returns False when the named target could not be resolved (the error was
-    already printed), so the caller does not launch a doomed run."""
-    spec = None
-    if cmd.host is not None and cmd.host in session.inv.host_names:
-        spec = TargetSpec(name=cmd.host)
-    elif cmd.ip is not None:
-        spec = TargetSpec(ip=cmd.ip)
-    elif cmd.rack is not None and cmd.cable is not None:
-        spec = TargetSpec(rack=cmd.rack, cable=cmd.cable)
-    elif cmd.alias is not None:
-        spec = TargetSpec(alias=cmd.alias)
-    if spec is not None and spec != session.target:
-        return _set_target(session, spec)
-    return True
-
-
-def _route_task(session: Session, line: str) -> BackgroundTask:
-    """Route one NL message in the background, then hand the command to
-    ``_launch``.
-
-    Routing calls the router LLM, which can take many seconds (or time out).
-    Running it on the worker keeps the REPL responsive: the operator sees the
-    "thinking" progress and can keep typing (lines are queued) while the agent
-    decides what to do.
-
-    Prints made by the worker (target errors, "no baseline yet", status notes)
-    are captured into THIS task's queue, which the REPL drains; the worker must
-    never clear ``session.task`` itself, or the main loop would skip this queue
-    and the message would be lost.
-    """
+def _agent_task(session: Session, line: str) -> BackgroundTask:
+    """Background task wrapper around one full agent turn (decide + tools)."""
+    label = session.target_label or (
+        session.host.name if session.host is not None else "agent")
 
     def fn(progress: Callable[[str], None], cancel: threading.Event):
-        progress("thinking: routing your message to the agent ...")
-        cmd = route_message(line, session.router_llm, session.transcript[-8:],
-                            tuple(session.inv.host_names))
-        if cancel.is_set():
-            return
-        if not _apply_cmd_target(session, cmd):
-            return  # unresolved target: error already printed
-        _launch(session, cmd, line)  # printed-only: leaves a done(None) for the REPL
+        return _run_agent(session, line, progress, cancel)
 
-    return BackgroundTask(label="routing to agent", fn=fn)
+    return BackgroundTask(label=label, fn=fn)
 
 
 def _handle_idle_line(session: Session, line: str) -> bool:
-    """Route one operator message; may start a background task. False = quit."""
+    """Hand one operator message to the agent; starts a background task.
+    False = quit."""
     if not line.strip():
         return True
     if line.startswith("/"):
@@ -584,8 +902,15 @@ def _handle_idle_line(session: Session, line: str) -> bool:
         return not session.quit
     session.transcript.append({"role": "user", "kind": "message", "content": line})
     _save_session(session)
-    session.task = _route_task(session, line)
-    session.task.start()
+    # Same race-avoidance as before: the task is started before it is
+    # published as ``session.task``; the launch announcement is queued on the
+    # NEW task (whose events the REPL drains).
+    task = _agent_task(session, line)
+    task.start()
+    session.task = task
+    task.events.put(("progress", (
+        f"started in the background: {task.label} -- keep typing "
+        f"(messages queue), /status for progress, /stop to cancel")))
     return not session.quit
 
 
@@ -732,11 +1057,57 @@ def _slash_lint(session: Session) -> None:
     _run_sync(session, lambda: run_lint(args))
 
 
+def _set_session_model(session: Session, catalog, profile) -> None:
+    """Switch the session's reasoning + routing adapters to ``profile`` and
+    remember it in ``config/models.yaml`` for the next run."""
+    session.llm = profile.build(session.store)
+    session.router_llm = profile.build(session.store)
+    session.llm_ident = profile.ident
+    session.llm_mode = "stub" if profile.ident == "stub" else profile.ident.split("/")[0]
+    catalog.choose(profile)
+    catalog.save()
+    _print_line(session, f"  model: {profile.ident} (active for the next run; saved)")
+    _save_session(session)
+
+
+def _slash_model(session: Session, arg: str) -> None:
+    """``/model`` / ``/model <ident>`` -- pick the LLM reasoning model from the
+    catalog (arrow-key picker, type-to-filter), or switch straight to a named
+    ident. The choice is applied to the next run and remembered."""
+    from ..config.model_catalog import ModelCatalog, picker_rows
+    from .menu import ask_model_profile, select
+
+    if session.task is not None and session.task.alive:
+        _print_line(session, "  model switching is disabled while a run is active "
+                             "(wait or /stop)")
+        return
+    catalog = ModelCatalog.load(inv=session.inv)
+    arg = arg.strip()
+    if arg:
+        profile = catalog.resolve(model_id=arg)
+        _set_session_model(session, catalog, profile)
+        return
+    labels, profiles, add_idx = picker_rows(catalog)
+    idx = select("LLM model (reasoning backend)", labels, reader=session.reader)
+    if idx is None:
+        return
+    if idx == add_idx:
+        profile = ask_model_profile(reader=session.reader)
+        if profile is None:
+            return
+        catalog.add(profile)
+    else:
+        profile = profiles[idx]
+    _set_session_model(session, catalog, profile)
+
+
 _HELP = """\
 /help      this list
 /hosts     list inventory hosts
 /use <h|rack cable n|ip|alias>   switch the active target
+/model [ident]  pick the LLM model (arrow keys, type to filter); or set one
 /context   queue a note for the next run
+/testlog <path>  queue a harness/FAT test log for the next run (failures become evidence)
 /status    what is running / what was done
 /stop      cancel the running task
 /runs      run directories of this session
@@ -745,17 +1116,22 @@ _HELP = """\
 /lint      validate the inventory
 /targets   ls | add <alias> [--rack R --cable N] [--address ip] | rm <alias>
 /docs      ls | add <pdf...> | rm <name> | reindex  (RAG library)
+/askparts  on | off  prompt for and store missing per-slot parts on rail faults
 /quit      exit
 
-Anything else is routed to the agent in natural language, e.g.
+Anything else goes to the agent in natural language, e.g.
   "the DIMM error is back on h1"
   "probe the memory controller"
   "look up the DIMM reference in the manual"
-  "verify whether the counter changed since the last run"
+  "what do you recommend given the last run?"
 
-Long actions run IN THE BACKGROUND: the agent's progress and a status line
-every few seconds show it is working while you keep typing; lines typed then
-are queued and seed the next run ("/context" does the same explicitly)."""
+The agent explains what it is about to do, then runs read-only tools in the
+background (diagnose / probe / docs / verify) and reports back with what it
+found; it may chain several tools for one message. Long actions run IN THE
+BACKGROUND: the agent keeps working while you keep typing, and its progress and
+statements stream in as they happen ("/status" shows what is running; lines
+typed while busy are queued and the agent reads them on its next turn
+("/context" queues a note explicitly)."""
 
 
 def _print_help() -> None:
@@ -787,6 +1163,8 @@ def _handle_slash(session: Session, line: str) -> None:
                 _print_line(session, f"  unknown host {arg!r}; see /hosts")
             else:
                 _set_target(session, spec)
+    elif cmd in ("/model", "/models"):
+        _slash_model(session, arg)
     elif cmd == "/context":
         if not arg:
             _print_line(session, "  usage: /context <note>")
@@ -794,6 +1172,17 @@ def _handle_slash(session: Session, line: str) -> None:
             session.pending.append(arg)
             session.transcript.append({"role": "user", "kind": "context", "content": arg})
             _print_line(session, "  context queued for the next run")
+    elif cmd in ("/testlog", "/tl"):
+        if not arg:
+            _print_line(session, "  usage: /testlog <path-to-harness-FAT-log>")
+        else:
+            from .cli import _strip_surrounding_quotes
+            path = Path(_strip_surrounding_quotes(arg))
+            if not path.exists():
+                _print_line(session, f"  no such file: {arg}")
+            else:
+                session.test_logs.append(str(path))
+                _print_line(session, f"  test log queued for the next run: {path}")
     elif cmd == "/stop":
         if session.task is not None and session.task.alive:
             session.task.cancel.set()
@@ -820,6 +1209,19 @@ def _handle_slash(session: Session, line: str) -> None:
         _slash_targets(session, arg)
     elif cmd == "/docs":
         _slash_docs(session, arg)
+    elif cmd == "/askparts":
+        if arg in ("on", "1", "yes", "true"):
+            session.ask_parts = True
+            _print_line(session, "  ask-parts ON: diagnoses prompt for and store "
+                                 "missing per-slot parts (kept on this session)")
+            _save_session(session)
+        elif arg in ("off", "0", "no", "false"):
+            session.ask_parts = False
+            _print_line(session, "  ask-parts OFF")
+            _save_session(session)
+        else:
+            state = "ON" if session.ask_parts else "OFF"
+            _print_line(session, f"  ask-parts is {state}; usage: /askparts on|off")
     else:
         _print_line(session, f"  unknown command {cmd!r}; /help for the list")
 
@@ -835,7 +1237,10 @@ def _save_session(session: Session) -> None:
             "target": {k: v for k, v in asdict(session.target).items()
                        if v is not None},
             "llm_mode": session.llm_mode,
-            "transcript": session.transcript,
+            "llm_ident": session.llm_ident,
+            "ask_parts": session.ask_parts,
+            "transcript": list(session.transcript),  # snapshot: worker appends
+            "evidence": session.evidence,
             "runs": [str(p) for p in session.runs],
         }
         (session.session_dir / "session.json").write_text(
@@ -853,6 +1258,32 @@ def _load_session(session: Session, path: Path) -> None:
     session.transcript = payload.get("transcript", [])
     session.pending = []
     session.runs = [Path(p) for p in payload.get("runs", [])]
+    session.evidence = payload.get("evidence") or ""
+    if not session.evidence:
+        # Old sessions (pre-agent) did not persist a digest: rebuild one from
+        # the newest run that still has a diagnosis.json so follow-up
+        # questions are grounded even right after /resume.
+        for run in reversed(session.runs):
+            diagnosis_path = run / "diagnosis.json"
+            if not diagnosis_path.exists():
+                continue
+            try:
+                diag = Diagnosis.model_validate(json.loads(
+                    diagnosis_path.read_text(encoding="utf-8")))
+                session.evidence = build_evidence(diag, str(run))
+            except (OSError, ValueError):
+                continue
+            break
+    session.llm_mode = payload.get("llm_mode") or session.llm_mode
+    session.llm_ident = payload.get("llm_ident") or session.llm_ident
+    session.ask_parts = bool(payload.get("ask_parts", False))
+    if session.llm_ident and session.llm_ident != "stub":
+        from ..config.model_catalog import ModelCatalog
+
+        profile = ModelCatalog.load(inv=session.inv).resolve(
+            model_id=session.llm_ident)
+        session.llm = profile.build(session.store)
+        session.router_llm = profile.build(session.store)
     host = payload.get("host")
     if host and host in session.inv.host_names:
         session.host = session.inv.get(host)
@@ -911,12 +1342,13 @@ def run_session(args, overrides: dict | None = None) -> int:
         return 2
     hosts = sorted(inv.hosts, key=lambda h: h.name)
 
-    from ..operator.cli import _make_store, _resolve_llm
+    from ..operator.cli import _llm_ident_for, _make_store, _resolve_llm
 
     store = overrides.get("store") or _make_store(args)
     llm = overrides.get("llm") or _resolve_llm(args, inv, store)
     router_llm = overrides.get("router_llm") or _resolve_llm(args, inv, store)
-    llm_mode = args.llm or (inv.llm.provider if inv.llm else None) or "openai"
+    llm_ident = _llm_ident_for(args, inv)
+    llm_mode = "stub" if llm_ident == "stub" else llm_ident.split("/")[0]
 
     initial_spec = TargetSpec(
         name=args.host if args.host else (hosts[0].name if hosts
@@ -962,12 +1394,15 @@ def run_session(args, overrides: dict | None = None) -> int:
         llm=llm,
         router_llm=router_llm,
         llm_mode=llm_mode,
+        llm_ident=llm_ident,
         docs_lib=getattr(args, "docs_lib", None),
         docs_dir=getattr(args, "docs_dir", None),
         parts_csv=getattr(args, "parts_csv", None),
+        ask_parts=bool(getattr(args, "ask_parts", False)),
         secret_dir=getattr(args, "secret_dir", None),
         console=bool(getattr(args, "console", False)),
         max_turns=int(getattr(args, "max_turns", 6)),
+        server_number=getattr(args, "server_number", None),
         overrides=overrides,
         target=initial_spec,
         target_label=target.label if target is not None else "",
@@ -993,15 +1428,15 @@ def run_session(args, overrides: dict | None = None) -> int:
     print(f"hosts: {', '.join(f'{h.name}({h.trust_level})' for h in hosts)}")
     active = (f"active target: {session.target_label} ({target.kind})"
               if target is not None else "active target: (none yet - name a rack/cable/IP)")
-    print(f"{active} | llm: {session.llm_mode}")
+    print(f"{active} | llm: {session.llm_ident or session.llm_mode}")
     print("Type /help for commands, or describe a symptom. /quit exits.")
     _save_session(session)
 
     try:
         while not session.quit:
             try:
-                # A task exists the moment a line is handled (the routing worker
-                # may still be assigning the real task). Polling with a timeout
+                # A task exists the moment a line is handled (the agent task's
+                # thread may still be starting). Polling with a timeout
                 # whenever ANY task object exists avoids a blocking idle poll in
                 # the window before the launched task's thread becomes alive,
                 # which would swallow the operator's next line prematurely.
@@ -1022,16 +1457,12 @@ def run_session(args, overrides: dict | None = None) -> int:
             task = session.task
             if (task is not None and not task.alive and task.events.empty()
                     and result is None and error is None):
-                # Printed-only command (status / unresolved target / missing
-                # baseline): its routing task is finished, its queue fully
-                # drained -- return to a blocking idle poll so /quit and the
-                # next message are picked up promptly.
+                # Printed-only turn (status / unresolved target / no baseline):
+                # the agent task is finished, its queue fully drained -- return
+                # to a blocking idle poll so /quit and the next message are
+                # picked up promptly.
                 session.task = None
                 task = None
-            if (task is not None and task.alive
-                    and time.monotonic() - session.last_tick >= 5.0):
-                session.last_tick = time.monotonic()
-                _print_line(session, _status_line(session))
             if line is None:
                 continue
             if session.task is not None and session.task.alive:

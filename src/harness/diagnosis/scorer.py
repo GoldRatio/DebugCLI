@@ -4,6 +4,27 @@
                 + 0.30 * evidence_fit
                 + 0.15 * model_agreement
                 - penalty
+
+Runs that decoded a power-rail FAILURE POINT (a rail fault register, not a root
+cause) switch to the failure-point weights, which add a root-cause-certainty
+component measuring how well the diagnosis's evidence discriminates the named
+root cause from the failing rail's documented suspect set:
+
+``confidence``  = 0.40 * retrieval_citation_support
+                + 0.25 * evidence_fit
+                + 0.10 * model_agreement
+                + 0.25 * root_cause_certainty
+                - penalty
+
+``root_cause_certainty`` = 0.5 * suspect_coverage + 0.5 * discrimination, where
+``suspect_coverage`` is the fraction of the documented suspects (rail loads +
+supplying board) the diagnosis text actually addresses, and ``discrimination``
+is 1.0 only when isolation probes ran AND the diagnosis engages their evidence
+(cites an isolation doc page or proposes a discriminating step such as an
+impedance measurement or a busbar removal). This is the incident lesson: a
+diagnosis that jumps to one FRU off a bare failure point ("replace PDB" when a
+shorted load pulls the rail down) must score LOW, while one that discriminates
+among all documented suspects scores high.
 """
 
 from __future__ import annotations
@@ -13,6 +34,19 @@ import re
 from .schema import ConfidenceBreakdown, Diagnosis
 
 WEIGHTS = {"retrieval": 0.55, "evidence": 0.30, "agreement": 0.15}
+
+# Failure-point runs: the certainty component joins the formula (the other
+# components rebalance); non-failure-point runs keep the classic weights.
+FAILURE_POINT_WEIGHTS = {"retrieval": 0.40, "evidence": 0.25,
+                         "agreement": 0.10, "certainty": 0.25}
+
+# Diagnosis text that engages DISCRIMINATING evidence (an isolation measurement
+# or comparison that separates one suspect from the others on the rail).
+_DISCRIMINATOR_RE = re.compile(
+    r"\b(measur\w+|impedance|isolat\w+|swap[- ]?test|remove the (?:inner|internal)"
+    r" busbar|register dump|fpga dump|dump\w*|decod\w+|compar\w+|each load|"
+    r"both biancas?|one at a time)\b",
+    re.IGNORECASE)
 
 
 def evidence_fit_from_dumps(diagnosis, dump_sets) -> float:
@@ -99,13 +133,81 @@ class Scorer:
               retrieval_citation_support: float,
               evidence_fit: float,
               model_agreement: float,
-              penalty: float = 0.0) -> ConfidenceBreakdown:
+              penalty: float = 0.0,
+              root_cause_certainty: float | None = None) -> ConfidenceBreakdown:
         return ConfidenceBreakdown(
             retrieval_citation_support=round(retrieval_citation_support, 3),
             evidence_fit=round(evidence_fit, 3),
             model_agreement=round(model_agreement, 3),
             penalty=round(penalty, 3),
+            root_cause_certainty=(round(root_cause_certainty, 3)
+                                  if root_cause_certainty is not None else None),
         )
+
+
+def _diagnosis_text(diagnosis: Diagnosis) -> str:
+    """All free text the model produced: verdict + actions + rationales."""
+    parts = [diagnosis.diagnosis or ""]
+    for action in diagnosis.actions:
+        parts.append(action.action or "")
+        parts.append(action.rationale or "")
+    return "\n".join(parts)
+
+
+def root_cause_certainty(diagnosis: Diagnosis) -> float | None:
+    """How well the evidence discriminates the root cause (0..1), or None.
+
+    None when the run decoded no power-rail failure point (component not
+    applicable). Otherwise:
+
+    - ``suspect_coverage``: fraction of the documented suspects on the failing
+      rail (topology loads + supplying board) that the diagnosis text actually
+      addresses. A diagnosis that tunnel-visions on one FRU leaves the others
+      unconsidered. When no documented suspects exist, coverage is a neutral
+      0.5 placeholder.
+    - ``discrimination``: 1.0 only when isolation probes ran AND the diagnosis
+      engages their evidence -- it cites an isolation doc page or proposes a
+      discriminating step (impedance measurement, busbar removal, comparing
+      loads). Otherwise 0.0.
+
+    ``certainty = 0.5 * coverage + 0.5 * discrimination``.
+    """
+    fp = getattr(diagnosis, "failure_point", None)
+    if fp is None:
+        return None
+    text = _diagnosis_text(diagnosis).lower()
+
+    suspects = [s for s in (fp.suspects or []) if s]
+    if suspects:
+        addressed = sum(1 for s in suspects if s.lower() in text)
+        coverage = addressed / len(suspects)
+    else:
+        coverage = 0.5  # no documented suspect set: neutral, documented placeholder
+
+    discrimination = 0.0
+    if fp.isolation_ran:
+        engaged = bool(_DISCRIMINATOR_RE.search(_diagnosis_text(diagnosis)))
+        if not engaged and fp.isolation_refs:
+            joined_refs = "\n".join(fp.isolation_refs)
+            for ref in diagnosis.references:
+                if not _is_doc_ref(ref):
+                    continue
+                if ref.page and (f"[{ref.source} p.{ref.page}]" in joined_refs
+                                 or f"{ref.source} p.{ref.page}]" in joined_refs):
+                    engaged = True
+                    break
+            if not engaged:
+                for action in diagnosis.actions:
+                    for ref in action.references:
+                        if not _is_doc_ref(ref):
+                            continue
+                        if ref.page and (
+                                f"[{ref.source} p.{ref.page}]" in joined_refs
+                                or f"{ref.source} p.{ref.page}]" in joined_refs):
+                            engaged = True
+                            break
+        discrimination = 1.0 if engaged else 0.0
+    return round(0.5 * coverage + 0.5 * discrimination, 3)
 
 
 def apply_to(diagnosis: Diagnosis, breakdown: ConfidenceBreakdown,
@@ -114,20 +216,27 @@ def apply_to(diagnosis: Diagnosis, breakdown: ConfidenceBreakdown,
 
     ``weights`` lets callers drop components that cannot be evaluated (e.g. the
     retrieval/citation component when the diagnosis cites no document, or when
-    no doc snippets were retrieved); confidence is renormalized over the
-    remaining components so an inapplicable component neither inflates nor
-    deflates the score.
+    no doc snippets were retrieved), or add the certainty component for
+    failure-point runs; confidence is renormalized over the remaining
+    components so an inapplicable component neither inflates nor deflates the
+    score.
     """
     w = weights or WEIGHTS
-    total = w["retrieval"] + w["evidence"] + w["agreement"]
+    total = (w["retrieval"] + w["evidence"] + w["agreement"]
+             + w.get("certainty", 0.0))
     diagnosis.confidence_breakdown = breakdown
     if total <= 0:
         diagnosis.confidence = 0.0
     else:
+        certainty_term = 0.0
+        certainty_val = getattr(breakdown, "root_cause_certainty", None)
+        if certainty_val is not None and w.get("certainty"):
+            certainty_term = certainty_val * w["certainty"]
         diagnosis.confidence = round(
             (breakdown.retrieval_citation_support * w["retrieval"]
              + breakdown.evidence_fit * w["evidence"]
-             + breakdown.model_agreement * w["agreement"]) / total
+             + breakdown.model_agreement * w["agreement"]
+             + certainty_term) / total
             - breakdown.penalty,
             3,
         )
@@ -174,21 +283,33 @@ def score_diagnosis(diagnosis: Diagnosis, *,
     (not flagged unknown); 0.3 when the run produced no decoded registers at all.
 
     ``model_agreement`` (prompt 06): None resolves through the calibration store
-    at ``calibration_root`` for ``llm_ident`` using the primary subsystem;
-    any failure resolves to the historical 0.5 default (never an exception to
-    callers). ``ConfidenceBreakdown.calibration_llm`` records which ident the
-    agreement came from (None when uncalibrated).
+    at ``calibration_root`` for ``llm_ident`` using the primary subsystem; any
+    failure resolves to the historical 0.5 default (never an exception to
+    callers). The bin is selected by the model's SELF-reported confidence (the
+    value ``Diagnosis.confidence`` carries when the scorer runs, before it is
+    overwritten) and the returned agreement is that bin's observed fix rate
+    shrunk toward 0.5 -- so it is a correctness prior, not a calibration-error
+    score. ``ConfidenceBreakdown.calibration_llm`` records which ident the
+    agreement came from (None when uncalibrated), and
+    ``ConfidenceBreakdown.self_reported_confidence`` preserves the raw bin key.
 
-    Penalties: unknown registers (0.1 each, capped at 0.3) and an empty action
-    list (0.05).
+    Penalty: an empty action list (0.05). Unknown registers are reported in
+    ``Diagnosis.unknown_registers`` but no longer dock the score -- an
+    incomplete register catalog is a harness gap, not a diagnosis error.
     """
+    # Capture the model's self-reported confidence BEFORE scoring: it selects
+    # the calibration bin and is preserved in the breakdown for the case store.
+    self_reported = diagnosis.confidence
     if model_agreement is None:
         model_agreement, calibration_llm = _resolved_agreement(
             diagnosis, calibration_root, llm_ident)
     else:
         calibration_llm = None
     support = 0.0
-    weights = dict(WEIGHTS)
+    # A decoded power-rail failure point switches the formula to the
+    # failure-point weights: root-cause certainty joins the score.
+    certainty = root_cause_certainty(diagnosis)
+    weights = dict(FAILURE_POINT_WEIGHTS) if certainty is not None else dict(WEIGHTS)
     if retrieved_snippets:
         joined = "\n".join(retrieved_snippets)
         refs = list(diagnosis.references)
@@ -224,8 +345,6 @@ def score_diagnosis(diagnosis: Diagnosis, *,
             evidence_fit = sum(1 for d in evidence if not d.get("unknown")) / len(evidence)
 
     penalty = 0.0
-    if diagnosis.unknown_registers:
-        penalty += min(0.3, 0.1 * len(diagnosis.unknown_registers))
     if not diagnosis.actions:
         penalty += 0.05
 
@@ -234,8 +353,10 @@ def score_diagnosis(diagnosis: Diagnosis, *,
         evidence_fit=evidence_fit,
         model_agreement=model_agreement,
         penalty=penalty,
+        root_cause_certainty=certainty,
     )
     breakdown.calibration_llm = calibration_llm
+    breakdown.self_reported_confidence = self_reported
     return apply_to(diagnosis, breakdown, weights)
 
 

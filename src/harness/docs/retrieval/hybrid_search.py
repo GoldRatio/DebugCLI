@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 from collections import Counter
 
+from ...platforms import family_for, family_members
 from ..ingest.chunk import Chunk
 
 
@@ -50,15 +51,22 @@ class HybridRetriever:
         """Rank chunks against ``question``, restricted to ``platform`` when given.
 
         A chunk is eligible when its ``platforms`` list is empty (platform-
-        neutral knowledge applies everywhere) or contains the requested key.
-        An empty filtered corpus returns []. Stats are computed over the
-        eligible subset so ranking is not skewed by foreign platforms.
+        neutral knowledge applies everywhere) or overlaps the requested
+        platform's family. Family matching means a chunk tagged ``samoa`` is
+        retrieved for a detected ``c4a15`` node (same platform family), while a
+        foreign platform's chunks stay excluded. An empty filtered corpus
+        returns []. Stats are computed over the eligible subset so ranking is
+        not skewed by foreign platforms.
         """
         terms = [t for t in question.lower().split() if len(t) > 2]
         if platform is not None:
-            wanted = platform.lower()
+            wanted_keys = {platform.lower()}
+            family = family_for(platform)
+            if family:
+                wanted_keys |= family_members(family)
             candidates = [c for c in self.chunks
-                          if not c.platforms or wanted in {p.lower() for p in c.platforms}]
+                          if not c.platforms
+                          or bool({p.lower() for p in c.platforms} & wanted_keys)]
         else:
             candidates = self.chunks
         if not candidates:

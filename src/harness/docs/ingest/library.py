@@ -220,6 +220,31 @@ class DocLibrary:
         self._save_manifest(manifest)
         return f"removed {name}"
 
+    def retag(self, names: list[str], platform: str | None = None) -> list[str]:
+        """Set (or clear) the platform tag on already-indexed documents.
+
+        ``platform`` may be a single canonical key or a comma-separated list of
+        keys; None clears the tag (back to platform-neutral). Chunks are rebuilt
+        from the manifest, so previously-tagged chunks are retagged too. Unknown
+        names are reported, never fatal.
+        """
+        manifest = self._manifest()
+        status: list[str] = []
+        for name in names:
+            if name not in manifest:
+                status.append(f"missing {name}: not in library")
+                continue
+            if platform is None:
+                manifest[name].pop("platform", None)
+            else:
+                manifest[name]["platform"] = ",".join(
+                    p.strip() for p in platform.split(",") if p.strip())
+            status.append(f"tagged {name}: platform={platform or '(none)'}")
+        if status:
+            self._save_chunks(self._all_chunks(manifest))
+            self._save_manifest(manifest)
+        return status
+
     def entries(self) -> list[DocEntry]:
         manifest = self._manifest()
         return [DocEntry(name=n, **fields) for n, fields in sorted(manifest.items())]
@@ -242,8 +267,10 @@ class DocLibrary:
             return [], str(exc)
         chunks = Chunker(CharTokenizer()).chunk_pages(pages, title=name)
         if platform:
+            # A comma-separated tag tags one chunk with multiple platforms (e.g.
+            # a compute-tray guide that applies to both the node and the rack).
             for chunk in chunks:
-                chunk.platforms = [platform]
+                chunk.platforms = [p.strip() for p in platform.split(",") if p.strip()]
         return chunks, None
 
     def _pages(self, path: Path) -> list[PageText]:

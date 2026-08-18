@@ -27,7 +27,9 @@ PROFILE_COLLECTORS = {
 
 # canonical model key -> known product-name variants (spellings, short names).
 # Keep it small and reviewed; this map decides case-library and doc-tag
-# matching, so entries are a manual, deliberate act.
+# matching, so entries are a manual, deliberate act. The Grace-Blackwell fleet
+# platforms resolve to canonical keys shared with the RAG/topology taxonomy
+# (see harness.platforms).
 MODEL_ALIASES: dict[str, list[str]] = {
     "poweredge_r650": [
         "poweredge r650", "r650", "r650xe", "r650 xeon",
@@ -38,6 +40,14 @@ MODEL_ALIASES: dict[str, list[str]] = {
     ],
     "proliant_dl380g10": [
         "proliant dl380 gen10", "proliant dl380g10", "dl380 gen10", "dl380g10",
+    ],
+    "samoa": [
+        "c4a15", "c4a14", "c4a14 server", "c4a14_server", "samoa",
+        "samoa system", "azure samoa",
+    ],
+    "nvl72": [
+        "nvl72", "nvl", "gb200 nvl72", "nvl72 rack", "nvl72_rack",
+        "gb_nvl72", "nvl rack",
     ],
 }
 

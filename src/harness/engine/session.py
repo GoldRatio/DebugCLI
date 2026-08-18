@@ -66,6 +66,12 @@ class SSHSession(Runner):
             self._client.close()
             self._client = None
 
+    @property
+    def client(self) -> paramiko.SSHClient | None:
+        """The open transport client, for channels the runner itself doesn't own
+        (e.g. an ``InteractiveShell`` for the FAT single-test menu)."""
+        return self._client
+
     def __enter__(self) -> SSHSession:
         self.open()
         return self

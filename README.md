@@ -69,9 +69,11 @@ harness
 # 3. Diagnose — interactive menu (no flags to remember)
 harness
 
-#    or one-shot / chat session
-harness diagnose --inventory inventory.yaml --host h1 --symptom "ECC errors"
+#    or one-shot / chat session, optionally seeding from a harness/FAT log
+harness diagnose --inventory inventory.yaml --host h1 --test-log quanta_qmf_fat_*.log
 harness session --inventory inventory.yaml --rack Q61 --cable 8
+#   harness> /testlog quanta_qmf_fat_*.log
+#   harness> Diagnose the server in Q61 Cable 8
 ```
 
 ## Targeting a server without per-server YAML
@@ -96,8 +98,8 @@ Resolution order: `--host` > `--target <alias>` > `--rack/--cable` > `--address`
 
 | Command | Purpose |
 |---|---|
-| `harness` / `harness menu` | Interactive menu: pick target + action |
-| `harness session` | Chat REPL; background runs, slash commands, `/quit` |
+| `harness` / `harness menu` | Interactive menu: pick target + action (includes a **model** picker) |
+| `harness session` | Chat REPL; background runs, slash commands (`/model`, `/quit`) |
 | `harness diagnose` | One-shot read-only diagnosis of a target |
 | `harness console` | Run read-only probes over the serial console (lab/QA only) |
 | `harness verify --baseline <dumps.json>` | Re-run collectors, compare error counters |
@@ -106,9 +108,50 @@ Resolution order: `--host` > `--target <alias>` > `--rack/--cable` > `--address`
 | `harness secrets add-ssh \| set-password \| list \| rm \| check` | Register credentials (never via the agent) |
 | `harness targets add \| ls \| rm` | Short aliases for repeated targets (path-only file) |
 
+## Test-log evidence (`--test-log`)
+
+Before debugging, an operator can hand the pipeline a factory/harness run log
+(e.g. a Quanta FAT `.log`) whose failures are parsed for error codes and test
+names (`[FAIL][P02002001@PCIe Test Fail]`, `FAIL: pcie_cmp_chk`) and injected
+as evidence into every prompt, seed doc (RAG) retrieval, and record on the
+learning loop:
+
+```powershell
+harness diagnose --inventory inventory.yaml --host h1 --test-log quanta_qmf_fat_*.log
+#  (--symptom is optional here; it derives from the log's first failure)
+```
+
+- Works in single-shot and session mode; `harness session` queues logs with
+  `/testlog <path>`.
+- The raw log is copied into `harness_runs/<id>/test_logs/`, and an audit
+  `test_log_loaded` event records only metadata + failure codes (cleartext
+  passwords in logs are redacted before anything reaches a prompt).
+- Learning: `pending_case.json` carries the failure signatures; after the
+  operator confirms the outcome (`harness report --run <id> --outcome fixed`),
+  a future run whose log shows the same failure code surfaces the verified fix
+  as a Prior Verified Case, pre-probe.
+
 Common flags: `--inventory`, `--secret-dir`, `--docs-lib`, `--docs-dir`,
-`--parts-csv`, `--out-dir`, `--llm {openai,gemini,stub}`, `--approval` /
+`--parts-csv`, `--out-dir`, `--llm {openai,gemini,stub}`,
+`--llm-model <ident>` (e.g. `gemini/gemini-2.5-pro`), `--approval` /
 `--approve-all`, `--max-turns`.
+
+## Model selection
+
+The LLM reasoning backend is picked like in opencode/pi:
+
+- **`harness menu` → `model`** — arrow-key picker (type to filter) over the
+  catalog: inventory `llm` block + well-known defaults + any custom models you
+  have added. `+ add a custom model` registers a provider/model/url/key vault
+  path for your own endpoint.
+- **`harness session` → `/model`** (or `/model <ident>`) — same picker, or a
+  direct ident, right inside the chat; the switch applies to the next run.
+- **`--llm-model <ident>`** — pin one model for a one-shot `diagnose`/`session`.
+
+The pick is remembered in `config/models.yaml` (machine-local, git-ignored) so
+the next run keeps it. Precedence: `--llm-model` > `--llm` > remembered >
+inventory `llm` block > default `openai/harness-diag`. Calibration is keyed per
+model ident, so a swap never inherits another model's calibration.
 
 ## Documentation
 

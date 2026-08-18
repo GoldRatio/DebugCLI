@@ -223,8 +223,11 @@ def test_run_menu_lint_then_quit(tmp_path, monkeypatch, capsys):
     _write_inventory(tmp_path)
     monkeypatch.chdir(tmp_path)
     from harness.operator import menu as menu_mod
-    # main menu: 8 = lint, then 9 = quit
-    monkeypatch.setattr(menu_mod, "select", _scripted_select([8, 9]))
+    # main menu: pick lint, then quit (indices resolved by action key so menu
+    # reordering never breaks this test)
+    keys = [k for k, _ in cli_mod._MAIN_ACTIONS]
+    monkeypatch.setattr(menu_mod, "select",
+                        _scripted_select([keys.index("lint"), keys.index("quit")]))
 
     assert run_menu(_menu_args()) == 0
     out = capsys.readouterr().out
@@ -488,3 +491,17 @@ def test_poll_backspace_redraws_wrapped_line(capsys, monkeypatch):
     assert "\x1b[1A" in out          # climbed across the wrap
     assert "\x1b[2A" not in out      # never overshoots
     assert out.endswith("> abcdefghi\n")
+
+
+def test_poll_busy_timeouts_do_not_reprint_prompt(capsys):
+    """A background run busy-polls ``poll(0.1)`` at 10Hz with an empty buffer;
+    the prompt must not be re-echoed on every timeout -- regression: the REPL
+    flooded the terminal with ``harness> harness> ...`` while a task ran."""
+    reader = LineReader()
+    reader._raw = True
+    reader.read_key = lambda timeout: None  # busy poll: always times out
+    assert reader.poll(0.1) is None
+    assert reader.poll(0.1) is None
+    assert reader.poll(0.1) is None
+    out = capsys.readouterr().out
+    assert out.count("harness> ") == 1

@@ -27,11 +27,20 @@ from ..inspect.base import RegisterDecode, RegisterDump
 from ..inspect.model import PROFILE_COLLECTORS
 from ..plan.doc_guided import mine_probe_commands
 from ..plan.profile import plan_collection
-from .engine import EngineContext, _to_subsystems, decode_dumps
+from ..platforms import family_for
+from .engine import EngineContext, _to_subsystems, case_query, decode_dumps, retrieve_snippets
 from .llm import LLMError
 from .prompt import TURN_CONTRACT, TURN_SYSTEM_PREAMBLE, build_turn_evidence
 from .schema import Diagnosis, TurnResponse
 from .summarize import EvidenceSummary, summarize
+
+#: Platform families where the vendor FAT single-test menu is documented.
+_SINGLE_TEST_FAMILIES = frozenset({"samoa", "nvl72"})
+
+
+def _test_output_excerpt(output: str, limit: int = 1500) -> str:
+    """Tail excerpt of a single-test transcript for the evidence prompt."""
+    return output[-limit:] if len(output) > limit else output
 
 
 class SessionError(RuntimeError):
@@ -65,6 +74,8 @@ class SessionEngine:
         self._base_snippets: list[str] = []
         self._model = None
         self._plan = None
+        self._single_tests: list[object] = []
+        self._single_results: list[object] = []
         self._prompt_seq = 0
 
     def run(self, symptom: str, initial_answers: list[str] | tuple[str, ...] = ()) -> Diagnosis:
@@ -100,6 +111,12 @@ class SessionEngine:
                     "role": "tool", "content": result or "(nothing new)",
                     "kind": "probe",
                 })
+            elif resp.kind == "test":
+                result = self._apply_single_test(resp)
+                _emit(result)
+                self.transcript.append({
+                    "role": "tool", "content": result, "kind": "test",
+                })
             else:  # diagnosis
                 diag = self._finalize(resp.diagnosis, symptom)
                 self.transcript.append({"role": "agent", "content": diag.diagnosis,
@@ -125,8 +142,7 @@ class SessionEngine:
                 bios_version=None, raw="")
             self._note("model=unknown (detection failed; no alias hint)")
         model_key = self._model.model_key if self._model.product_name != "unknown" else None
-        self._base_snippets = (self.ctx.docs_retriever(symptom, model_key)
-                               if self.ctx.docs_retriever else [])
+        self._base_snippets = retrieve_snippets(self.ctx, symptom, model_key)
         self._plan = plan_collection(symptom, self._base_snippets,
                                      priors=self.ctx.priors)
         # Console runners: run the whole plan's probes in ONE serial session
@@ -147,9 +163,7 @@ class SessionEngine:
                 self._model = recovered
                 self._note(f"model={recovered.model_key} "
                            "(recovered from console pre-batch)")
-                self._base_snippets = (
-                    self.ctx.docs_retriever(symptom, recovered.model_key)
-                    if self.ctx.docs_retriever else [])
+                self._base_snippets = retrieve_snippets(self.ctx, symptom, recovered.model_key)
         self._collect_all(self._plan.collectors)
         self._collect_doc_probes(self._plan.doc_probes)
 
@@ -217,6 +231,39 @@ class SessionEngine:
                 lines.append(f"doc-named probes: {', '.join(added) or 'already run'}")
         return "; ".join(lines)
 
+    def _apply_single_test(self, resp: TurnResponse) -> str:
+        driver = getattr(self.ctx, "single_test_driver", None)
+        if driver is None:
+            return "single tests unavailable (requires --server-number and an SSH target)"
+        family = family_for(self._model_key())
+        if family is not None and family not in _SINGLE_TEST_FAMILIES:
+            self._note(f"single tests skipped: platform {family!r} is not GB")
+            return (f"single tests unavailable on platform {family!r} "
+                    f"(GB platforms only)")
+        req = resp.single_test
+        try:
+            if req.action == "list":
+                tests = driver.discover()
+                self._single_tests = list(tests)
+                listed = ", ".join(
+                    f"{t.number}) {t.label}" for t in tests)
+                return f"FAT single tests available: {listed or '(none)'}"
+            label = (req.test or "").strip()
+            if not label:
+                return "single test run requested without a test label"
+            if not driver.discovered:
+                self._single_tests = list(driver.discover())
+            if self.ctx.supervisor is not None:
+                self.ctx.supervisor("single_test_run")
+            result = driver.run_test(label)
+            self._single_results.append(result)
+            return (f"[test result] {result.test}: "
+                    f"{result.verdict or 'unknown'} ({result.elapsed_s:.1f}s)\n"
+                    f"{_test_output_excerpt(result.output)}")
+        except Exception as exc:  # noqa: BLE001 - a failed test never crashes the loop
+            self._note(f"single test failed: {exc}")
+            return f"single test failed: {exc}"
+
     def _refresh(self) -> None:
         all_dumps = [d for dumps in self._dumps.values() for d in dumps]
         self._decoded = decode_dumps(self.ctx.decoder, all_dumps)
@@ -242,11 +289,13 @@ class SessionEngine:
             role = "assistant" if entry["role"] == "agent" else "user"
             content = entry["content"]
             if entry["role"] == "tool":
-                content = f"[probe result] {content}"
+                prefix = "[test result] " if entry.get("kind") == "test" \
+                    else "[probe result] "
+                content = f"{prefix}{content}"
             messages.append({"role": role, "content": content})
         parts = self.ctx.parts_refs() if self.ctx.parts_refs else []
         conversation = [f"{t['role']}: {t['content']}" for t in self.transcript]
-        prior = (self.ctx.case_library(symptom, self._model_key())
+        prior = (self.ctx.case_library(case_query(self.ctx, symptom), self._model_key())
                  if self.ctx.case_library else None)
         messages.append({"role": "user", "content": build_turn_evidence(
             model=self._model,
@@ -257,6 +306,9 @@ class SessionEngine:
             parts_refs=parts,
             conversation=conversation,
             prior_cases=prior or [],
+            single_tests=self._single_tests,
+            single_results=self._single_results,
+            test_log_lines=self.ctx.test_log_lines,
         )})
         if self.ctx.prompt_callback is not None:
             self._prompt_seq += 1
@@ -265,19 +317,37 @@ class SessionEngine:
         return messages
 
     def _forced_diagnosis(self, symptom: str) -> Diagnosis:
-        """Turns exhausted: force a final diagnosis from the agent."""
+        """Turns exhausted: retry a final diagnosis once, then fall back to a
+        deterministic one so the collected evidence is never thrown away."""
         messages = self._turn_messages(symptom)
         messages[-1] = {"role": "user", "content": messages[-1]["content"] + (
             "\n\nYou have exhausted the turn budget. Return the final diagnosis now: "
             f'{{"kind": "diagnosis", "diagnosis": {{...}}}} {TURN_CONTRACT}')}
-        try:
-            raw = self.llm.chat_json(messages)
-        except LLMError as exc:
-            raise SessionError(f"no diagnosis before turn budget exhausted: {exc}") from exc
-        resp = self._parse_turn(raw)
-        if resp is None or resp.kind != "diagnosis" or resp.diagnosis is None:
-            raise SessionError("agent did not produce a diagnosis within the turn budget")
-        return self._finalize(resp.diagnosis, symptom)
+        for attempt in range(2):
+            try:
+                raw = self.llm.chat_json(messages)
+            except LLMError as exc:
+                self._note(f"forced diagnosis call failed: {exc}")
+                break
+            resp = self._parse_turn(raw)
+            if resp is not None and resp.kind == "diagnosis" \
+                    and resp.diagnosis is not None:
+                return self._finalize(resp.diagnosis, symptom)
+            self._note("forced diagnosis call did not return a diagnosis; "
+                       f"attempt {attempt + 1}/2")
+        self._note("agent did not produce a diagnosis within the turn budget; "
+                   "building a deterministic diagnosis from collected evidence")
+        fallback = Diagnosis(
+            diagnosis=(
+                "Agent did not conclude within the turn budget; the harness "
+                "built this diagnosis deterministically from the collected "
+                f"evidence ({len(self._decoded)} register(s) decoded, no LLM "
+                "reasoning)."
+            ),
+            confidence=0.0,
+            actions=[],
+        )
+        return self._finalize(fallback, symptom)
 
     def _finalize(self, diag: Diagnosis, symptom: str) -> Diagnosis:
         assert self._plan is not None
@@ -301,6 +371,11 @@ class SessionEngine:
         if resp.kind == "question" and not resp.question:
             return None
         if resp.kind == "probe" and not resp.subsystems and not resp.doc_topics:
+            return None
+        if resp.kind == "test" and resp.single_test is None:
+            return None
+        if resp.kind == "test" and resp.single_test.action == "run" \
+                and not (resp.single_test.test or "").strip():
             return None
         if resp.kind == "diagnosis" and resp.diagnosis is None:
             return None

@@ -17,6 +17,11 @@ from .schema import CaseOutcome
 _OUTCOME_WEIGHTS = {"fixed": 1.0, "partial": 0.5, "inconclusive": 0.25,
                     "not_fixed": 0.1, "unknown": 0.5}
 _SAME_MODEL_MULTIPLIER = 1.5
+#: Per shared test-log failure identity (e.g. "P02002001@PCIe Test Fail").
+#: A case whose log showed the same harness failure as the current run's log is
+#: exactly on-topic, so it is boosted -- but still soft, not a hard filter, so
+#: near-matches (same test, different code) keep surfacing.
+_LOG_FAILURE_MULTIPLIER = 0.5
 _K1, _B = 1.5, 0.75
 
 
@@ -52,6 +57,12 @@ class CaseLibrary:
             score *= _OUTCOME_WEIGHTS.get(case.outcome, 0.5)
             if model_key and case.model_key == model_key:
                 score *= _SAME_MODEL_MULTIPLIER
+            if case.test_log_failures:
+                matched = sum(
+                    1 for f in case.test_log_failures
+                    if f.lower() in symptom.lower())
+                if matched:
+                    score *= (1.0 + _LOG_FAILURE_MULTIPLIER * matched)
             if score > 0.0:
                 scored.append((case, round(score, 6)))
         scored.sort(key=lambda t: t[1], reverse=True)
@@ -60,7 +71,7 @@ class CaseLibrary:
 
 def _case_text(case: CaseOutcome) -> str:
     return " ".join([case.symptom, *case.actions_recommended, *case.actions_taken,
-                     *case.evidence_summary])
+                     *case.evidence_summary, *case.test_log_failures])
 
 
 def _corpus_stats(texts: list[str]) -> tuple[float, Counter]:
@@ -102,7 +113,10 @@ def render(records: list[tuple[CaseOutcome, float]]) -> list[str]:
     for case, _score in records:
         model = case.model_key or "unknown"
         first_action = case.actions_taken[0] if case.actions_taken else "n/a"
+        extra = ""
+        if case.test_log_failures:
+            extra = " [" + ", ".join(case.test_log_failures) + "]"
         lines.append(
             f"[case {case.run_id}] model={model} outcome={case.outcome}: "
-            f"{case.symptom} -> {first_action}")
+            f"{case.symptom}{extra} -> {first_action}")
     return lines

@@ -143,6 +143,36 @@ def test_engine_injects_prior_cases_at_diagnosis_time():
     assert any("[case r1] model=poweredge_r650" in p for p in prompts)
 
 
+def test_engine_wires_test_log_evidence_rag_and_case_query():
+    prompts = []
+    retrieved = []
+    case_calls = []
+
+    def llm(prompt):
+        prompts.append(prompt)
+        return StubLLM()(prompt)
+
+    engine = DiagnosticEngine(EngineContext(
+        runner=_FleetRunner(),
+        decoder=Decoder(),
+        collector_factory=lambda name, _r: None,
+        llm=llm,
+        docs_retriever=lambda q, _k: retrieved.append(q) or [f"[doc] {q}"],
+        case_library=lambda q, _k: case_calls.append(q) or [],
+        test_log_lines=["source=fat.log", "P02002001@PCIe Test Fail",
+                        "test=pcie_cmp_chk"],
+        test_log_queries=["PCIe Test Fail P02002001"],
+        test_log_case_terms=["P02002001@PCIe Test Fail"],
+    ))
+    engine.run("PCIe compare failure")
+    # dedicated prompt section with the failure identity
+    assert any("## Factory Test Log Evidence" in p for p in prompts)
+    assert any("P02002001@PCIe Test Fail" in p for p in prompts)
+    # failure-derived retrieval + case-library queries used
+    assert any("PCIe Test Fail P02002001" in q for q in retrieved)
+    assert case_calls and "P02002001@PCIe Test Fail" in case_calls[0]
+
+
 def test_case_library_ranking_outcome_and_model(tmp_path):
     store = CaseStore(tmp_path / "cases")
     Verifier().record(_case("fixed-1",
@@ -159,3 +189,52 @@ def test_case_library_ranking_outcome_and_model(tmp_path):
     assert cross_model[0][0].run_id == "fixed-1"
     blocked = lib.similar("ECC errors DIMM", outcome_min=0.5, top_k=10)
     assert all(c.outcome != "not_fixed" for c, _ in blocked)
+
+
+def _fat_log_case(run_id, **kw):
+    return _case(run_id,
+                 symptom="Factory test log failure",
+                 test_log_failures=["P02002001@PCIe Test Fail", "pcie_cmp_chk"],
+                 **kw)
+
+
+def test_case_carries_test_log_failures(tmp_path):
+    store = CaseStore(tmp_path / "cases")
+    case = _fat_log_case("pcie-1", outcome="fixed",
+                         actions_taken=["replaced NVMe backplane"])
+    Verifier().record(case, store)
+    stored = store.get("pcie-1")
+    assert stored.test_log_failures == ["P02002001@PCIe Test Fail", "pcie_cmp_chk"]
+
+
+def test_case_library_matches_by_failure_code(tmp_path):
+    store = CaseStore(tmp_path / "cases")
+    Verifier().record(_fat_log_case("pcie-1", outcome="fixed",
+                                    actions_taken=["replaced backplane"]), store)
+    Verifier().record(_case("ecc-1", outcome="fixed",
+                            symptom="ECC errors"), store)
+    lib = CaseLibrary(store)
+    # A fresh run whose test log shows the same failure code surfaces the case
+    # pre-probe, even with a generic symptom.
+    records = lib.similar("Factory test log failure P02002001@PCIe Test Fail",
+                          model_key="t6t", top_k=5)
+    assert records[0][0].run_id == "pcie-1"
+    # Near-match on the test name alone also surfaces it.
+    near = lib.similar("Factory test log failure pcie_cmp_chk",
+                       model_key="t6t", top_k=5)
+    assert near[0][0].run_id == "pcie-1"
+
+
+def test_render_shows_test_log_failure_identity():
+    case = _fat_log_case("pcie-1", outcome="fixed",
+                         actions_taken=["replaced NVMe backplane"])
+    lines = render([(case, 1.0)])
+    assert "P02002001@PCIe Test Fail" in lines[0]
+    assert "replaced NVMe backplane" in lines[0]
+
+
+def test_case_text_indexes_test_log_failures():
+    from harness.diagnosis.case_library import _case_text
+    text = _case_text(_fat_log_case("pcie-1"))
+    assert "P02002001@PCIe Test Fail" in text
+    assert "pcie_cmp_chk" in text

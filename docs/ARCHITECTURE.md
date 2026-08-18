@@ -11,6 +11,9 @@ src/harness/
   plan/        symptom -> subsystem -> minimal collector set (collector profiles)
   docs/        PDF ingestion (pymupdf), chunking, hybrid BM25+dense retrieval
                (RAG), parts graph (FRU/PN lookup)
+  testlog/     operator-supplied test-harness log evidence (--test-log): parser
+               for Quanta FAT `.log` files, structured failure model, log-source
+               seam (files now, a website fetcher later)
   diagnosis/   pydantic schema, summarizer, LLM orchestrator, scorer,
                verifier (baseline diff), session state
   audit/       append-only hash-chained trace, secret redaction
@@ -23,15 +26,25 @@ src/harness/
 ## Pipeline (diagnose)
 
 ```
+--test-log (optional) ─▶ testlog.parse ─▶ failure codes/test names (redacted)
 symptom ─▶ plan.symptom -> subsystem ─▶ minimal collector set
    ─▶ engine.runner (allowlist + force_read_only) ─▶ RegisterDump per probe
    ─▶ inspect.decoder ─▶ evidence
-   ─▶ docs.retrieval (RAG over PDFs) + parts graph ─▶ context
+   ─▶ docs.retrieval (RAG over PDFs, seeded by symptom + test-log failures)
+        + parts graph ─▶ context
    ─▶ diagnosis.engine (LLM) ─▶ prioritized repair actions (JSON schema)
    ─▶ diagnosis.scorer + diagnosis.verifier (baseline compare)
    ─▶ operator.gate (human approval) ─▶ operator.supervisor (time budget)
    ─▶ audit.trace (append-only, redacted)
+   ─▶ pending_case.json (carries test_log_failures) ─▶ harness report ─▶
+        case store ─▶ case_library.similar matches future runs by failure code
 ```
+
+A `--test-log` run renders a `## Factory Test Log Evidence` section into every
+prompt (single-shot and session), seeds doc retrieval with its failure queries
+(capped), records its failure signatures on the pending case, and — after the
+operator confirms the outcome with `harness report` — the verified case is
+retrieved for future runs whose log shows the same failure code.
 
 ## Execution domains
 

@@ -61,6 +61,41 @@ class EngineContext:
     # and where its fix-rate calibration lives. Missing store -> 0.5, never an error.
     llm_ident: Callable[[], str] | None = None
     calibration_root: str | None = None
+    # FAT single-test driver (None = capability unavailable). Exposed to the
+    # session engine's ``kind=test`` turn; the driver handles the vendor menu.
+    single_test_driver: object | None = None
+    # Operator-supplied test-log evidence (--test-log): pre-rendered prompt
+    # lines, failure-derived doc-retrieval queries, and failure identity terms
+    # appended to the case-library query.
+    test_log_lines: list[str] | None = None
+    test_log_queries: list[str] | None = None
+    test_log_case_terms: list[str] | None = None
+
+
+def retrieve_snippets(ctx: EngineContext, symptom: str, model_key: str | None,
+                      queries: list[str] | None = None) -> list[str]:
+    """Doc retrieval for one reasoning round: the symptom query plus any
+    operator-supplied test-log failure queries (deduped, capped).
+
+    Failure codes like ``P02002001`` retrieve the troubleshooting sections for
+    the exact harness test that failed, so the agent sees the relevant
+    procedure even before probing.
+    """
+    if ctx.docs_retriever is None:
+        return []
+    snippets = list(ctx.docs_retriever(symptom, model_key) or [])
+    for query in (queries or (ctx.test_log_queries or []))[:3]:
+        for s in ctx.docs_retriever(query, model_key) or []:
+            if s not in snippets:
+                snippets.append(s)
+    return snippets
+
+
+def case_query(ctx: EngineContext, symptom: str) -> str:
+    """Case-library query: the symptom plus test-log failure terms so a prior
+    verified case for the same harness failure is retrieved pre-probe."""
+    parts = [symptom, *(ctx.test_log_case_terms or [])]
+    return " ".join(p for p in parts if p).strip() or symptom
 
 
 def prebatch_console_plan(ctx: EngineContext, plan, collectors) -> None:
@@ -150,8 +185,7 @@ class DiagnosticEngine:
 
         # 0. Retrieve docs FIRST so doc-named probes join the plan (the heuristic
         # cannot know which registers a failure mode needs). Reused for the prompt.
-        snippets = (self.ctx.docs_retriever(symptom, model_key)
-                    if self.ctx.docs_retriever else [])
+        snippets = retrieve_snippets(self.ctx, symptom, model_key)
         _step("retrieve")
         _emit(f"retrieve: {len(snippets)} doc snippet(s)")
 
@@ -184,8 +218,7 @@ class DiagnosticEngine:
                 model_key = recovered.model_key
                 _emit(f"model={recovered.model_key} "
                       "(recovered from console pre-batch)")
-                snippets = (self.ctx.docs_retriever(symptom, model_key)
-                            if self.ctx.docs_retriever else [])
+                snippets = retrieve_snippets(self.ctx, symptom, model_key)
                 _emit(f"retrieve: {len(snippets)} doc snippet(s) (model-keyed)")
         if self.ctx.model_hook is not None:
             self.ctx.model_hook(model, model_drifted)
@@ -231,7 +264,7 @@ class DiagnosticEngine:
         parts = self.ctx.parts_refs() if self.ctx.parts_refs else []
 
         # 5. Build prompt and call the LLM.
-        prior_cases = (self.ctx.case_library(symptom, model_key)
+        prior_cases = (self.ctx.case_library(case_query(self.ctx, symptom), model_key)
                        if self.ctx.case_library else None)
         prompt = build_prompt(
             model=model,
@@ -244,6 +277,7 @@ class DiagnosticEngine:
             parts_refs=parts,
             symptom=symptom,
             prior_cases=prior_cases,
+            test_log_lines=self.ctx.test_log_lines,
         )
         if self.ctx.prompt_callback is not None:
             self.ctx.prompt_callback(prompt)
@@ -364,6 +398,7 @@ class DiagnosticEngine:
             parts_refs=parts,
             symptom=symptom,
             prior_cases=prior_cases,
+            test_log_lines=self.ctx.test_log_lines,
         )
         prompt2 += (
             "\n\n## Follow-up Round\nYour previous recommendations did not "

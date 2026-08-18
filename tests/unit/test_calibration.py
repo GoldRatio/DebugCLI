@@ -16,11 +16,12 @@ from harness.diagnosis.schema import CaseOutcome, Diagnosis, ServerState
 from harness.diagnosis.scorer import score_diagnosis
 
 
-def _case(run_id, outcome, subsystem=None, confidence=0.5, ident="openai/gpt-4o"):
+def _case(run_id, outcome, subsystem=None, confidence=0.5, ident="openai/gpt-4o",
+          self_reported=None):
     return CaseOutcome(
         run_id=run_id, target_id="t1", symptom=f"symptom {run_id}",
         outcome=outcome, subsystem_primary=subsystem, llm_ident=ident,
-        confidence=confidence,
+        confidence=confidence, self_reported_confidence=self_reported,
     )
 
 
@@ -97,8 +98,8 @@ def test_agreement_for_empty_calibration_is_half():
     assert agreement_for(empty, 0.9) == 0.5
 
 
-def test_agreement_for_overconfident_penalized():
-    # predicted 0.9, observed fix rate 0.4 -> agreement ~ 1 - 0.5 = 0.5
+def test_agreement_for_is_shrunk_fix_rate_posterior():
+    # predicted 0.9, observed fix rate 0.4 (n=5): (5*0.4 + 5*0.5)/10 = 0.45
     cal = build_calibration(
         [_case(f"c{i}", "not_fixed", confidence=0.9,
                subsystem="memory") for i in range(3)]
@@ -106,36 +107,61 @@ def test_agreement_for_overconfident_penalized():
                  subsystem="memory") for i in range(2)],
         "openai/gpt-4o")
     assert cal is not None
-    # observed rate for the 0.8-1.0 bin: 2/5 = 0.4
+    # observed rate for the 0.8-1.0 bin: 2/5 = 0.4 -> shrunk toward 0.5
     agreement = agreement_for(cal, 0.9, "memory")
-    assert agreement == pytest.approx(0.5, abs=0.01)
+    assert agreement == pytest.approx(0.45, abs=0.01)
 
 
-def test_agreement_for_well_calibrated_is_one():
-    # Bin (0.8-1.0] with observed rate 0.9: a prediction of 0.9 lands on it.
+def test_agreement_for_high_fix_rate_bin():
+    # Bin (0.8-1.0] with observed rate 0.9 (n=5): (5*0.9 + 5*0.5)/10 = 0.7
     cases = [*[_case(f"f{i}", "fixed", confidence=0.9) for i in range(4)],
              _case("p", "partial", confidence=0.9)]
     cal = build_calibration(cases, "openai/gpt-4o")
     assert cal is not None
     agreement = agreement_for(cal, 0.9)
-    assert agreement == pytest.approx(1.0, abs=0.01)
+    assert agreement == pytest.approx(0.7, abs=0.01)
 
 
 def test_agreement_for_clamped():
+    # 5 not_fixed at 0.9 -> observed rate 0.0 (n=5): (0 + 5*0.5)/10 = 0.25
     cal = build_calibration([_case(f"c{i}", "not_fixed", confidence=0.9)
                              for i in range(5)], "openai/gpt-4o")
     assert cal is not None
     agreement = agreement_for(cal, 0.9, None)
     assert 0.0 <= agreement <= 1.0
-    assert agreement < 1.0  # overconfident: observed rate 0.0 -> 1 - 0.9 = 0.1
+    assert agreement == pytest.approx(0.25, abs=0.01)
 
 
 def test_agreement_for_unknown_subsystem_falls_back_to_aggregate():
     cal = build_calibration([_case(f"c{i}", "fixed", confidence=0.9)
                              for i in range(5)], "openai/gpt-4o")
     assert cal is not None
-    # subsystem absent from the histogram -> aggregate top bin (fix rate 1.0)
-    assert agreement_for(cal, 1.0, "nonexistent") == pytest.approx(1.0, abs=0.01)
+    # subsystem absent from the histogram -> aggregate top bin (fix rate 1.0,
+    # n=5): (5*1.0 + 5*0.5)/10 = 0.75
+    assert agreement_for(cal, 1.0, "nonexistent") == pytest.approx(0.75, abs=0.01)
+
+
+def test_build_calibration_bins_on_self_reported_confidence():
+    # self-report 0.9 (top bin) differs from scored confidence 0.4 (bin 1); the
+    # histogram must bin on the SELF-REPORT, the same key agreement_for uses.
+    cases = [_case(f"c{i}", "not_fixed", confidence=0.4, self_reported=0.9)
+             for i in range(5)]
+    cal = build_calibration(cases, "openai/gpt-4o")
+    assert cal is not None
+    assert cal.aggregate[4][1] == pytest.approx(0.0)  # top bin: all not_fixed
+    assert cal.aggregate[4][2] == 5
+    # scored-confidence bin 1 (0.2-0.4] has no samples -> neutral rate
+    assert cal.aggregate[1][1] == pytest.approx(0.5)
+    assert cal.aggregate[1][2] == 0
+
+
+def test_build_calibration_legacy_records_fall_back_to_scored_confidence():
+    # No self-report recorded (legacy record): bin on scored confidence 0.9.
+    cases = [_case(f"c{i}", "not_fixed", confidence=0.9) for i in range(5)]
+    cal = build_calibration(cases, "openai/gpt-4o")
+    assert cal is not None
+    assert cal.aggregate[4][1] == pytest.approx(0.0)
+    assert cal.aggregate[4][2] == 5
 
 
 def test_calibration_store_round_trip(tmp_path):
@@ -170,7 +196,7 @@ def _calibrated_score_diagnosis(calibration_root: Path | None):
 
 
 def test_scorer_uses_calibration_when_root_present(tmp_path):
-    # skewed calibration: top bin fix rate 0.0 -> predicted 0.9 -> agreement 0.1
+    # skewed calibration: top bin fix rate 0.0 (n=5) -> posterior (0 + 2.5)/10
     cases = [_case(f"c{i}", "not_fixed", confidence=0.9) for i in range(5)]
     store = CalibrationStore(tmp_path / "cal")
     store.save(build_calibration(cases, "openai/gpt-4o"))
@@ -180,12 +206,15 @@ def test_scorer_uses_calibration_when_root_present(tmp_path):
         diag, retrieved_snippets=None, evidence_fit=0.5,
         calibration_root=tmp_path / "cal", llm_ident="openai/gpt-4o")
     assert scored.confidence_breakdown.calibration_llm == "openai/gpt-4o"
-    assert scored.confidence_breakdown.model_agreement == pytest.approx(0.1, abs=0.01)
+    assert scored.confidence_breakdown.model_agreement == pytest.approx(0.25, abs=0.01)
+    # the self-report used as the bin key is preserved for the case store
+    assert scored.confidence_breakdown.self_reported_confidence == 0.9
 
     # empty/missing root keeps the 0.5 default and no calibration_llm
     plain = _calibrated_score_diagnosis(tmp_path / "does-not-exist")
     assert plain.confidence_breakdown.model_agreement == 0.5
     assert plain.confidence_breakdown.calibration_llm is None
+    assert plain.confidence_breakdown.self_reported_confidence == 0.5
 
 
 def test_scorer_existing_model_agreement_wins_over_calibration(tmp_path):

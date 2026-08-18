@@ -146,17 +146,21 @@ def test_session_malformed_and_question_loops_bounded_then_forced():
             return {"kind": "question", "question": "more info?"}
 
     engine = SessionEngine(_ctx(), llm=NeverDiagnoses(), max_turns=2)
-    with pytest.raises(SessionError):
-        engine.run("MCE uncorrectable ECC error")
-    assert len(engine.transcript) == 4  # 2 questions + 2 "(no answer)"
+    diag = engine.run("MCE uncorrectable ECC error")
+    # The turn budget is exhausted but the collected evidence is preserved via
+    # a deterministic fallback diagnosis rather than a SessionError.
+    assert "turn budget" in diag.diagnosis
+    assert any("turn budget" in n for n in engine.notes)
+    assert [t["kind"] for t in engine.transcript[:4]] == [
+        "question", "answer", "question", "answer"]
 
     class Malformed:
         def chat_json(self, messages):
             return {"kind": "nonsense"}
 
     engine = SessionEngine(_ctx(), llm=Malformed(), max_turns=3)
-    with pytest.raises(SessionError):
-        engine.run("MCE uncorrectable ECC error")
+    diag = engine.run("MCE uncorrectable ECC error")
+    assert "turn budget" in diag.diagnosis
     assert any("malformed" in n for n in engine.notes)
 
 
@@ -173,6 +177,38 @@ def test_session_context_seeded_before_first_turn():
     assert any(t["kind"] == "context" and "PSU was replaced" in t["content"]
                for t in engine.transcript)
     assert any("PSU was replaced" in m["content"] for m in llm.calls[0])
+
+
+def test_session_renders_test_log_evidence_and_seeds_rag_query():
+    ctx = _ctx(snippets=True)
+    ctx.test_log_lines = ["source=fat.log", "P02002001@PCIe Test Fail",
+                          "test=pcie_cmp_chk"]
+    ctx.test_log_queries = ["PCIe Test Fail P02002001"]
+    retrieved = []
+    ctx.docs_retriever = lambda q, _k: retrieved.append(q) or \
+        [f"[doc p.1] section about {q}"]
+    llm = ScriptedLLM({"kind": "diagnosis", "diagnosis": _stub_diagnosis().model_dump()})
+    engine = SessionEngine(ctx, llm=llm)
+    engine.run("MCE uncorrectable ECC error")
+
+    # test-log evidence appears in every turn's evidence block
+    assert any("## Factory Test Log Evidence" in m["content"]
+               for m in llm.calls[0])
+    assert any("P02002001@PCIe Test Fail" in m["content"]
+               for m in llm.calls[0])
+    # failure-derived query seeded doc retrieval
+    assert any("PCIe Test Fail P02002001" in q for q in retrieved)
+
+
+def test_session_case_library_query_carries_test_log_terms():
+    ctx = _ctx(snippets=True)
+    ctx.test_log_case_terms = ["P02002001@PCIe Test Fail"]
+    seen = []
+    ctx.case_library = lambda q, _k: seen.append(q) or []
+    llm = ScriptedLLM({"kind": "diagnosis", "diagnosis": _stub_diagnosis().model_dump()})
+    engine = SessionEngine(ctx, llm=llm)
+    engine.run("MCE uncorrectable ECC error")
+    assert seen and "P02002001@PCIe Test Fail" in seen[0]
 
 
 class FakeConsoleRunner(Runner):

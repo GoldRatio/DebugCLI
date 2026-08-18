@@ -15,7 +15,9 @@ from harness.engine.allowlist import AllowPolicy, AllowRule
 from harness.engine.runner import CommandResult, Runner
 from harness.operator import cli as cli_mod
 from harness.operator.cli import (
+    _llm_ident_for,
     _resolve_llm,
+    _strip_surrounding_quotes,
     build_parser,
     run_console,
     run_diagnose,
@@ -29,6 +31,8 @@ FAKE_POLICY = AllowPolicy([
     AllowRule("/bin/dmesg", ("-l", "*")),
     AllowRule("/bin/dmidecode", ()),
     AllowRule("/usr/bin/lspci", ("-xxx",)),
+    AllowRule("/bin/smartctl", ("-a", "*")),
+    AllowRule("/bin/smartctl", ("-x", "*")),
 ])
 
 OUTPUT = {
@@ -537,6 +541,107 @@ def test_diagnose_single_shot_has_no_transcript(tmp_path):
     assert not (run_dir / "transcript.json").exists()
 
 
+FAT_LOG = (
+    "INFO :2026-08-11 22:01:34 || Model     : T6T\n"
+    "INFO :2026-08-11 22:01:34 || Station   : FAT test start\n"
+    "INFO :2026-08-11 22:01:34 || Chassis SN: P23326287013301E\n"
+    "DEBUG:2026-08-11 22:02:00 || [START] pcie_cmp_chk\n"
+    "ERROR:2026-08-11 22:02:01 || [FAIL][P02002001@PCIe Test Fail]\n"
+    "ERROR:2026-08-11 22:02:01 || PCIe compare check test Failed!\n"
+    "DEBUG:2026-08-11 22:02:01 || [END] pcie_cmp_chk\n"
+    "DEBUG:2026-08-11 22:02:01 || FAIL: pcie_cmp_chk\n"
+    "DEBUG:2026-08-11 22:02:01 || AssertionError: pcie_cmp_chk failed with code 1\n"
+)
+
+
+def test_diagnose_test_log_seeds_evidence_audit_and_pending(tmp_path):
+    log_file = tmp_path / "fat.log"
+    log_file.write_text(FAT_LOG, encoding="utf-8")
+    args = build_parser().parse_args([
+        "diagnose", "--inventory", _inventory(tmp_path), "--host", "h1",
+        "--symptom", "PCIe compare failure", "--test-log", str(log_file),
+        "--out-dir", str(tmp_path / "runs"), "--llm", "stub", "--approve-all"])
+    diag = run_diagnose(args, overrides={"session": FakeSession(), "llm": _fake_llm})
+    assert diag.schema_version == "1.1.0"
+
+    run_dir = next((tmp_path / "runs").iterdir())
+    assert (run_dir / "test_logs" / "fat.log").exists()  # raw log preserved
+
+    audit = AuditLog(run_dir / "audit.jsonl")
+    tl = next(e for e in audit.read() if e.kind == "test_log_loaded")
+    assert tl.payload["count"] == 1
+    log_entry = tl.payload["logs"][0]
+    assert log_entry["failures"] == ["P02002001@PCIe Test Fail"]
+    assert log_entry["model"] == "T6T"
+    assert log_entry["serial"] == "P23326287013301E"
+    assert audit.verify() == []
+
+    # single-shot mode (no --interactive) still shows the evidence section
+    prompt = (run_dir / "prompt.txt").read_text(encoding="utf-8")
+    assert "## Factory Test Log Evidence (operator-supplied test run)" in prompt
+    assert "P02002001@PCIe Test Fail" in prompt
+    assert "test=pcie_cmp_chk" in prompt
+
+    # learning-loop seed records the failure identity for `harness report`
+    pending = json.loads((run_dir / "pending_case.json").read_text(encoding="utf-8"))
+    assert pending["test_log_failures"] == ["P02002001@PCIe Test Fail",
+                                            "pcie_cmp_chk"]
+    # the run dir is the same id `harness report --run` expects, so the loop
+    # actually closes (dir name and pending run_id are the same trace)
+    assert run_dir.name == pending["run_id"]
+
+
+def test_diagnose_test_log_derives_symptom(tmp_path):
+    log_file = tmp_path / "fat.log"
+    log_file.write_text(FAT_LOG, encoding="utf-8")
+    args = build_parser().parse_args([
+        "diagnose", "--inventory", _inventory(tmp_path), "--host", "h1",
+        "--test-log", str(log_file),
+        "--out-dir", str(tmp_path / "runs"), "--llm", "stub", "--approve-all"])
+    run_diagnose(args, overrides={"session": FakeSession(), "llm": _fake_llm})
+    run_dir = next((tmp_path / "runs").iterdir())
+    audit = AuditLog(run_dir / "audit.jsonl")
+    run_start = next(e.payload for e in audit.read() if e.kind == "run_start")
+    assert "P02002001@PCIe Test Fail" in run_start["symptom"]
+    prompt = (run_dir / "prompt.txt").read_text(encoding="utf-8")
+    assert "P02002001@PCIe Test Fail" in prompt
+
+
+def test_diagnose_requires_symptom_or_test_log(tmp_path):
+    args = build_parser().parse_args([
+        "diagnose", "--inventory", _inventory(tmp_path), "--host", "h1",
+        "--out-dir", str(tmp_path / "runs"), "--llm", "stub"])
+    with pytest.raises(SystemExit) as exc:
+        run_diagnose(args, overrides={"session": FakeSession()})
+    assert exc.value.code == 2
+
+
+def test_diagnose_test_log_path_surrounded_by_quotes(tmp_path):
+    """A path pasted into a prompt with surrounding quotes (\"...\") must load;
+    the quotes are shell-paste artifacts, not part of the path."""
+    log_file = tmp_path / "fat.log"
+    log_file.write_text(FAT_LOG, encoding="utf-8")
+    quoted = f'"{log_file}"'  # what a user would paste into the menu
+    args = build_parser().parse_args([
+        "diagnose", "--inventory", _inventory(tmp_path), "--host", "h1",
+        "--test-log", quoted,
+        "--out-dir", str(tmp_path / "runs"), "--llm", "stub", "--approve-all"])
+    run_diagnose(args, overrides={"session": FakeSession(), "llm": _fake_llm})
+    run_dir = next((tmp_path / "runs").iterdir())
+    assert (run_dir / "test_logs" / "fat.log").exists()
+    pending = json.loads((run_dir / "pending_case.json").read_text(encoding="utf-8"))
+    assert pending["test_log_failures"] == ["P02002001@PCIe Test Fail",
+                                            "pcie_cmp_chk"]
+
+
+def test_strip_surrounding_quotes():
+    assert _strip_surrounding_quotes('"C:\\a\\b.log"') == "C:\\a\\b.log"
+    assert _strip_surrounding_quotes("'C:\\a\\b.log'") == "C:\\a\\b.log"
+    assert _strip_surrounding_quotes("C:\\a\\b.log") == "C:\\a\\b.log"
+    assert _strip_surrounding_quotes('"C:\\a\\b.log" trailing') == \
+        '"C:\\a\\b.log" trailing'  # only one level, both ends
+
+
 def test_resolve_llm_flag_precedence(tmp_path):
     inv = load_inventory(_inventory(tmp_path))  # no llm block in inventory
     store = MemorySecretStore()
@@ -566,6 +671,53 @@ def test_resolve_llm_from_inventory_block(tmp_path):
 
     missing = MemorySecretStore()              # key absent -> env fallback, no crash
     assert _resolve_llm(SimpleNamespace(llm=None), inv, missing).api_key is None
+
+
+def test_resolve_llm_model_flag(tmp_path, monkeypatch):
+    """``--llm-model <ident>`` pins the exact model, beating --llm / inventory /
+    the remembered config/models.yaml (isolated via chdir)."""
+    monkeypatch.chdir(tmp_path)
+    inv = load_inventory(_inventory(tmp_path))  # no llm block
+    store = MemorySecretStore()
+    args = SimpleNamespace(llm=None, llm_model="gemini/gemini-2.5-flash")
+    llm = _resolve_llm(args, inv, store)
+    assert isinstance(llm, GeminiLLM)
+    assert llm.model == "gemini-2.5-flash"
+    assert _llm_ident_for(args, inv) == "gemini/gemini-2.5-flash"
+
+
+def test_resolve_llm_remembered_model(tmp_path, monkeypatch):
+    """A remembered config/models.yaml current model is used when no flag is
+    given, and an explicit --llm provider still wins over it."""
+    monkeypatch.chdir(tmp_path)
+    inv = load_inventory(_inventory(tmp_path))  # no llm block
+    store = MemorySecretStore()
+    models = tmp_path / "config" / "models.yaml"
+    models.parent.mkdir()
+    models.write_text(json.dumps({"current": {"provider": "stub"}}),
+                      encoding="utf-8")
+    assert isinstance(_resolve_llm(SimpleNamespace(llm=None), inv, store),
+                      StubLLM)
+    assert _llm_ident_for(SimpleNamespace(llm=None), inv) == "stub"
+    # explicit flag beats the remembered model
+    assert isinstance(_resolve_llm(SimpleNamespace(llm="gemini"), inv, store),
+                      GeminiLLM)
+
+
+def test_diagnose_parser_accepts_llm_model(tmp_path):
+    args = build_parser().parse_args([
+        "diagnose", "--inventory", _inventory(tmp_path), "--host", "h1",
+        "--symptom", "x", "--llm", "stub",
+        "--llm-model", "gemini/gemini-2.5-pro"])
+    assert args.llm == "stub"
+    assert args.llm_model == "gemini/gemini-2.5-pro"
+
+
+def test_session_parser_accepts_llm_model(tmp_path):
+    args = build_parser().parse_args([
+        "session", "--inventory", _inventory(tmp_path), "--host", "h1",
+        "--llm-model", "gemini/gemini-2.5-flash"])
+    assert args.llm_model == "gemini/gemini-2.5-flash"
 
 
 def test_diagnose_llm_from_inventory(tmp_path):

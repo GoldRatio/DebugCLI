@@ -129,12 +129,13 @@ def test_score_diagnosis_evidence_fit_from_known_registers():
     assert scored.confidence_breakdown.evidence_fit == 0.5
 
 
-def test_score_diagnosis_penalties():
+def test_score_diagnosis_unknown_registers_not_penalized():
     diag = Diagnosis(diagnosis="x", confidence=0.0, unknown_registers=["R1", "R2"],
                      evidence=[{"unknown": True}])
     scored = score_diagnosis(diag, retrieved_snippets=None)
-    # 0.3 evidence_fit fallback * 0.30 + 0.15*0.5 - (0.2 + 0.05)
-    assert scored.confidence_breakdown.penalty == pytest.approx(0.25)
+    # Unknown registers are a catalog gap, not a diagnosis error: only the
+    # empty-actions penalty (0.05) applies now.
+    assert scored.confidence_breakdown.penalty == pytest.approx(0.05)
     assert scored.confidence >= 0.0
 
 
