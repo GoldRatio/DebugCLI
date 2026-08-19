@@ -83,8 +83,13 @@ What it does, in order:
    prompting. Decline (or a failed install) prints the manual
    `echo "<pub>" >> ~/.ssh/authorized_keys` one-liner instead. Leave the IP
    blank to skip and add `console_defaults:` later.
-5. **BMC credentials** (optional) — registers `bmc-ro` password and BMC `sudo`
-   password vaults when your inventory has BMC sections.
+5. **BMC credentials** (optional) — registers the BMC sudo password
+   (console-shell escalation for `--rack/--cable`) and the BMC read-only
+   password (IPMI over LAN for named hosts), but **only the vaults the
+   inventory references** — a fresh `hosts: []` inventory with `console_defaults`
+   asks for sudo only, a host inventory with `bmc:` blocks asks for bmc-ro only.
+   Sudo is prompted first; when both apply, bmc-ro offers to reuse the same
+   password.
 6. **Verification** — resolves every vault path referenced by the inventory and
    exits 1 if any is missing, printing which ones to register.
 

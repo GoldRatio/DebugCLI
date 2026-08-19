@@ -434,14 +434,44 @@ def _mirror_rackmgr_identity(store: DirSecretStore) -> bool:
     return True
 
 
-def _setup_bmc(args, overrides: dict, store: DirSecretStore, ssh_material:
-               bytes | None) -> None:
+def _setup_bmc(args, overrides: dict, inv_path: Path, store: DirSecretStore) -> None:
+    """Register the BMC credentials the inventory actually references.
+
+    Only vaults the inventory mentions are offered, in a fixed order: the BMC
+    **sudo** password (console-shell escalation, ``console_defaults.sudo_vault_path``)
+    first, then the BMC **read-only** password (IPMI over LAN, ``bmc.password_vault_path``).
+    When both are needed, the second offers to reuse the first. Nothing is
+    prompted when the inventory references neither vault.
+    """
+    try:
+        inv = load_inventory(inv_path)
+    except Exception as exc:  # noqa: BLE001 - report, never crash the wizard
+        print(f"bmc: could not read inventory: {exc}")
+        return
+    sudo_needed = bool(
+        inv.console_defaults is not None
+        and inv.console_defaults.sudo_vault_path == BMC_SUDO_VAULT)
+    if not sudo_needed:
+        sudo_needed = any(
+            h.console is not None and h.console.sudo_vault_path == BMC_SUDO_VAULT
+            for h in (inv.hosts or []))
+    bmc_ro_needed = any(
+        h.bmc is not None and h.bmc.password_vault_path == BMC_PASSWORD_VAULT
+        for h in (inv.hosts or []))
+    needed = []
+    if sudo_needed:
+        needed.append(("BMC sudo password", BMC_SUDO_VAULT))
+    if bmc_ro_needed:
+        needed.append(("BMC read-only password", BMC_PASSWORD_VAULT))
+    if not needed:
+        print("bmc: no BMC vaults referenced -- add hosts with bmc: blocks, "
+              "or a console_defaults.sudo_vault_path, to register them")
+        return
     if not _confirm(args, overrides, "Register BMC credentials now?",
                     default=False):
         return
-    for label, vault, kind in (
-            ("BMC read-only password", BMC_PASSWORD_VAULT, "password"),
-            ("BMC sudo password", BMC_SUDO_VAULT, "password"),):
+    first_value = None
+    for label, vault in needed:
         try:
             store.get(vault)
             print(f"bmc: {vault} already registered")
@@ -451,13 +481,19 @@ def _setup_bmc(args, overrides: dict, store: DirSecretStore, ssh_material:
         if not _confirm(args, overrides, f"Set {label}? (vault {vault})",
                         default=True):
             continue
-        if kind == "password":
-            value = _ask_secret(args, overrides, f"{label}: ")
-            if value:
-                store.put(vault, value.encode("utf-8"))
-                print(f"bmc: {vault} stored")
+        if first_value is not None and _confirm(
+            args, overrides,
+            f"Use the same password as the {needed[0][0]}?",
+            default=False,
+        ):
+            value = first_value
         else:
-            store.put(vault, ssh_material)
+            value = _ask_secret(args, overrides, f"{label}: ")
+        if value:
+            store.put(vault, value.encode("utf-8"))
+            print(f"bmc: {vault} stored")
+            if first_value is None:
+                first_value = value
 
 
 # ---- verification ----
@@ -502,11 +538,7 @@ def run_setup(args, overrides: dict | None = None) -> int:
     _setup_llm(args, overrides, inv_path, store, inventory_text)
     public = _setup_ssh(args, overrides, store)
     _setup_console_defaults(args, overrides, inv_path, store)
-    try:
-        ssh_material = store.get(DIAGBOT_SSH_VAULT)
-    except KeyError:
-        ssh_material = None
-    _setup_bmc(args, overrides, store, ssh_material)
+    _setup_bmc(args, overrides, inv_path, store)
     if public:
         print("\ngrant access from the remote machine "
               "(append once, per machine):")

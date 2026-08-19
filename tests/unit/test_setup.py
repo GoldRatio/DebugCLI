@@ -483,3 +483,177 @@ def test_setup_console_defaults_writes_and_installs_key(tmp_path, monkeypatch,
     out = capsys.readouterr().out
     assert "console: installed" in out
     assert "host key recorded at config/rackmgr_known_hosts" in out
+
+
+# ---- BMC credential prompts (sudo first, bmc-ro second, inventory-conditioned) ----
+
+
+def _bmc_host_inventory() -> str:
+    return (
+        "trust_level: lab\n"
+        "llm:\n"
+        "  provider: gemini\n"
+        "  model: gemini-2.5-flash\n"
+        "  api_key_vault_path: secret/harness/llm/gemini-key\n"
+        "hosts:\n"
+        "  - name: h1\n"
+        "    address: 10.0.0.1\n"
+        "    model: model_x\n"
+        "    ssh:\n"
+        "      user: diagbot\n"
+        "      identity_vault_path: secret/harness/diagbot/id_ed25519\n"
+        "      known_hosts_path: config/known_hosts\n"
+        "    bmc:\n"
+        "      address: 10.0.0.2\n"
+        "      username: bmc-ro\n"
+        "      password_vault_path: secret/harness/bmc/bmc-ro\n")
+
+
+def _console_sudo_inventory() -> str:
+    return (
+        "trust_level: lab\n"
+        "llm:\n"
+        "  provider: gemini\n"
+        "  model: gemini-2.5-flash\n"
+        "  api_key_vault_path: secret/harness/llm/gemini-key\n"
+        "console_defaults:\n"
+        "  address: 192.168.202.51\n"
+        "  user: log\n"
+        f"  identity_vault_path: {DIAGBOT_SSH_VAULT}\n"
+        "  known_hosts_path: config/rackmgr_known_hosts\n"
+        f"  sudo_vault_path: {BMC_SUDO_VAULT}\n"
+        "hosts: []\n")
+
+
+def _both_bmc_inventory() -> str:
+    """console_defaults.sudo_vault_path AND a host bmc block: both referenced."""
+    return (
+        "trust_level: lab\n"
+        "llm:\n"
+        "  provider: gemini\n"
+        "  model: gemini-2.5-flash\n"
+        "  api_key_vault_path: secret/harness/llm/gemini-key\n"
+        "console_defaults:\n"
+        "  address: 192.168.202.51\n"
+        "  user: log\n"
+        f"  identity_vault_path: {DIAGBOT_SSH_VAULT}\n"
+        "  known_hosts_path: config/rackmgr_known_hosts\n"
+        f"  sudo_vault_path: {BMC_SUDO_VAULT}\n"
+        "hosts:\n"
+        "  - name: h1\n"
+        "    address: 10.0.0.1\n"
+        "    model: model_x\n"
+        "    ssh:\n"
+        "      user: diagbot\n"
+        "      identity_vault_path: secret/harness/diagbot/id_ed25519\n"
+        "      known_hosts_path: config/known_hosts\n"
+        "    bmc:\n"
+        "      address: 10.0.0.2\n"
+        "      username: bmc-ro\n"
+        "      password_vault_path: secret/harness/bmc/bmc-ro\n")
+
+
+def test_setup_bmc_skips_when_nothing_referenced(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    inv_path = tmp_path / "inventory.yaml"
+    inv_path.write_text("trust_level: lab\nhosts: []\n", encoding="utf-8")
+    store = DirSecretStore(tmp_path / "secrets")
+    monkeypatch.setattr(
+        mod, "_confirm", lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must not prompt when nothing is referenced")))
+    monkeypatch.setattr(
+        mod, "_ask_secret", lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must not ask a secret when nothing is referenced")))
+    mod._setup_bmc(_args(tmp_path), _answers(), inv_path, store)
+    assert "no BMC vaults referenced" in capsys.readouterr().out
+
+
+def test_setup_bmc_prompts_sudo_first_when_console_references(tmp_path,
+                                                              monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    inv_path = tmp_path / "inventory.yaml"
+    inv_path.write_text(_console_sudo_inventory(), encoding="utf-8")
+    store = DirSecretStore(tmp_path / "secrets")
+
+    prompts = []
+    monkeypatch.setattr(
+        mod, "_ask_secret",
+        lambda *a, **k: prompts.append(a[2]) or "sudo-pw")
+    overrides = dict(_answers(), confirm=lambda prompt, default=False: True)
+    mod._setup_bmc(_args(tmp_path), overrides, inv_path, store)
+
+    assert store.get(BMC_SUDO_VAULT) == b"sudo-pw"
+    assert "BMC sudo password" in prompts[0]
+    with pytest.raises(KeyError):
+        store.get(BMC_PASSWORD_VAULT)  # bmc-ro not referenced -> never asked
+    out = capsys.readouterr().out
+    assert f"bmc: {BMC_SUDO_VAULT} stored" in out
+    assert "bmc-ro" not in out
+
+
+def test_setup_bmc_prompts_bmc_ro_when_host_references(tmp_path, monkeypatch,
+                                                       capsys):
+    monkeypatch.chdir(tmp_path)
+    inv_path = tmp_path / "inventory.yaml"
+    inv_path.write_text(_bmc_host_inventory(), encoding="utf-8")
+    store = DirSecretStore(tmp_path / "secrets")
+
+    prompts = []
+    monkeypatch.setattr(
+        mod, "_ask_secret",
+        lambda *a, **k: prompts.append(a[2]) or "bmc-ro-pw")
+    overrides = dict(_answers(), confirm=lambda prompt, default=False: True)
+    mod._setup_bmc(_args(tmp_path), overrides, inv_path, store)
+
+    assert store.get(BMC_PASSWORD_VAULT) == b"bmc-ro-pw"
+    assert "BMC read-only password" in prompts[0]
+    with pytest.raises(KeyError):
+        store.get(BMC_SUDO_VAULT)  # no console_defaults -> sudo not asked
+    out = capsys.readouterr().out
+    assert f"bmc: {BMC_PASSWORD_VAULT} stored" in out
+
+
+def test_setup_bmc_shared_password_shortcut(tmp_path, monkeypatch, capsys):
+    """Both vaults referenced: sudo prompted first, bmc-ro reuses its value."""
+    monkeypatch.chdir(tmp_path)
+    inv_path = tmp_path / "inventory.yaml"
+    inv_path.write_text(_both_bmc_inventory(), encoding="utf-8")
+    store = DirSecretStore(tmp_path / "secrets")
+
+    secret_calls = []
+    confirm_prompts = []
+    monkeypatch.setattr(
+        mod, "_ask_secret",
+        lambda *a, **k: secret_calls.append(a[2]) or "shared-pw")
+    overrides = dict(
+        _answers(),
+        confirm=lambda prompt, default=False: confirm_prompts.append(prompt) or True)
+    mod._setup_bmc(_args(tmp_path), overrides, inv_path, store)
+
+    assert store.get(BMC_SUDO_VAULT) == b"shared-pw"
+    assert store.get(BMC_PASSWORD_VAULT) == b"shared-pw"
+    assert len(secret_calls) == 1  # second vault reused the first
+    assert any("Use the same password" in p for p in confirm_prompts)
+    assert "BMC sudo password" in secret_calls[0]
+
+
+def test_setup_bmc_shared_password_declined_prompts_again(tmp_path,
+                                                          monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    inv_path = tmp_path / "inventory.yaml"
+    inv_path.write_text(_both_bmc_inventory(), encoding="utf-8")
+    store = DirSecretStore(tmp_path / "secrets")
+
+    def confirm(prompt, default=False):
+        return "same password" not in prompt
+
+    secret_calls = []
+    monkeypatch.setattr(
+        mod, "_ask_secret",
+        lambda *a, **k: secret_calls.append(a[2]) or f"pw-{len(secret_calls)}")
+    overrides = dict(_answers(), confirm=confirm)
+    mod._setup_bmc(_args(tmp_path), overrides, inv_path, store)
+
+    assert store.get(BMC_SUDO_VAULT) == b"pw-1"
+    assert store.get(BMC_PASSWORD_VAULT) == b"pw-2"
+    assert len(secret_calls) == 2  # shortcut declined -> separate prompt
