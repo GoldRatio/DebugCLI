@@ -72,9 +72,20 @@ What it does, in order:
    DIAG remote account. The private key lives under `--secret-dir` (0o600,
    git-ignored) at `secret/harness/diagbot/id_ed25519` — it is shared by all
    hosts; per-host keys still win (see lookup order above).
-4. **BMC credentials** (optional) — registers `bmc-ro` password and BMC `sudo`
+4. **Rack manager console** (optional) — prompts for the rack-manager console
+   IP; answering writes a `console_defaults:` block into the inventory so
+   `--rack/--cable` targeting works immediately after setup. The console
+   identity reuses the diagbot key (same lab keypair), so no extra vault is
+   needed. It then **offers to install that public key onto the rack manager
+   now**: one-time password auth through paramiko, the host-key fingerprint is
+   shown for verification, and the verified host key is pinned into
+   `config/rackmgr_known_hosts` so every later console session connects without
+   prompting. Decline (or a failed install) prints the manual
+   `echo "<pub>" >> ~/.ssh/authorized_keys` one-liner instead. Leave the IP
+   blank to skip and add `console_defaults:` later.
+5. **BMC credentials** (optional) — registers `bmc-ro` password and BMC `sudo`
    password vaults when your inventory has BMC sections.
-5. **Verification** — resolves every vault path referenced by the inventory and
+6. **Verification** — resolves every vault path referenced by the inventory and
    exits 1 if any is missing, printing which ones to register.
 
 Re-running `harness setup` never overwrites an existing SSH key and skips

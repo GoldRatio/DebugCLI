@@ -278,6 +278,162 @@ def _setup_ssh(args, overrides: dict, store: DirSecretStore) -> str:
     return _public_key_for(private)
 
 
+# ---- rack manager console (console_defaults) ----
+
+def _console_defaults_block(address: str) -> str:
+    """``console_defaults:`` inventory block for the rack manager console. The
+    rack manager user is ``log`` (the sample inventory default); the identity
+    reuses the setup-registered diagbot key path so verification passes and
+    ``--rack/--cable`` targeting works right after setup."""
+    return (
+        "console_defaults:\n"
+        f"  address: {address}\n"
+        "  user: log\n"
+        f"  identity_vault_path: {DIAGBOT_SSH_VAULT}\n"
+        "  known_hosts_path: config/rackmgr_known_hosts\n"
+        "  tool: jumpin\n"
+        "  trust_level: lab\n"
+        "  prompts: [\"RScmCli#\", \"~#\"]\n"
+        "  port: 2200\n"
+        f"  sudo_vault_path: {BMC_SUDO_VAULT}\n"
+    )
+
+
+def _insert_console_defaults(text: str, block: str) -> str:
+    """Insert a top-level ``console_defaults:`` block before the first top-level
+    ``hosts:`` key (or append when there is none), leaving everything else."""
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    inserted = False
+    for line in lines:
+        if not inserted and (line == "hosts:" or line.startswith("hosts: ")):
+            out.append(block)
+            inserted = True
+        out.append(line)
+    if not inserted:
+        if text and not text.endswith("\n"):
+            out.append("\n")
+        out.append(block)
+    return "".join(out)
+
+
+def _setup_console_defaults(args, overrides: dict, inv_path: Path,
+                            store: DirSecretStore) -> None:
+    """Ask for the rack-manager console IP and write a ``console_defaults:``
+    block so ``--rack/--cable`` targeting works after setup.
+
+    A ``console_defaults:`` block already in the inventory is kept untouched.
+    The console identity vault reuses the diagbot key material (same key, one
+    lab keypair per machine), so the verification step resolves it.
+    """
+    text = inv_path.read_text(encoding="utf-8")
+    if "\nconsole_defaults:" in text or text.startswith("console_defaults:"):
+        print("console_defaults: already present in the inventory (kept)")
+        return
+    address = _ask(args, overrides,
+                   "Rack manager console IP (for --rack/--cable targeting; "
+                   "Enter to skip)").strip()
+    if not address:
+        print("console_defaults: skipped -- add a console_defaults block to "
+              "enable --rack/--cable targeting later")
+        return
+    inv_path.write_text(
+        _insert_console_defaults(text, _console_defaults_block(address)),
+        encoding="utf-8")
+    print(f"console_defaults: rack manager {address} written to {inv_path}")
+    if not _mirror_rackmgr_identity(store):
+        print("  note: no SSH key registered yet; run `harness setup` again "
+              "or `harness secrets add-ssh` to unlock --rack/--cable")
+        return
+    _install_rackmgr_key(args, overrides, address, store)
+
+
+def _install_rackmgr_key(args, overrides: dict, address: str,
+                         store: DirSecretStore) -> None:
+    """Install the rack-manager console key onto the rack manager now.
+
+    One-time password auth (never stored), host-key fingerprint shown for
+    confirmation, then the verified host key is pinned into the
+    ``known_hosts_path`` so every later console session connects without
+    prompting. On any decline/failure, prints the manual one-liner instead.
+    """
+    from .credential_gate import (  # lazy: credential_gate imports this module
+        append_pubkey_to_target,
+        derive_public_key_line,
+        save_host_key,
+    )
+    try:
+        material = store.get(RACKMGR_SSH_VAULT)
+    except KeyError:
+        return
+    try:
+        publine = derive_public_key_line(material)
+    except ValueError as exc:
+        print(f"  console: {exc} -- key registered without install")
+        return
+    target = f"log@{address}:22"
+    if not _confirm(
+        args, overrides,
+        f"Install this public key on the rack manager {target} now? "
+        "(one-time password auth; the password is never stored)",
+        default=True,
+    ):
+        _print_rackmgr_manual(publine)
+        return
+    password = _ask_secret(args, overrides, f"Password for {target}: ")
+    if not password:
+        _print_rackmgr_manual(publine)
+        return
+
+    def confirm_host(fingerprint: str) -> bool:
+        return _confirm(
+            args, overrides,
+            f"Host key fingerprint for {address}:\n    SHA256:{fingerprint}\n"
+            "Verify and trust this key? (y/N)",
+            default=False,
+        )
+
+    ok, message, host_key = append_pubkey_to_target(
+        address, "log", 22, publine, password, confirm_host=confirm_host)
+    print(f"  console: {message}")
+    if ok and host_key is not None:
+        known_hosts = "config/rackmgr_known_hosts"
+        if _confirm(
+            args, overrides,
+            f"Record this host key in {known_hosts} so pinned console "
+            "sessions work?",
+            default=True,
+        ):
+            save_host_key(known_hosts, address, host_key)
+            print(f"  console: host key recorded at {known_hosts}")
+    elif not ok:
+        _print_rackmgr_manual(publine)
+
+
+def _print_rackmgr_manual(publine: str) -> None:
+    print("  console: grant access from the rack manager (append once):")
+    print(f'    echo "{publine}" >> ~/.ssh/authorized_keys')
+
+
+def _mirror_rackmgr_identity(store: DirSecretStore) -> bool:
+    """Reuse the diagbot key for the rack-manager console identity, so the
+    ``console_defaults.identity_vault_path`` resolves. Returns True when the
+    rack-manager identity exists after the call."""
+    try:
+        store.get(RACKMGR_SSH_VAULT)
+        return True
+    except KeyError:
+        pass
+    try:
+        material = store.get(DIAGBOT_SSH_VAULT)
+    except KeyError:
+        return False
+    store.put(RACKMGR_SSH_VAULT, material)
+    print(f"ssh: rack manager identity {RACKMGR_SSH_VAULT} reuses the "
+          "diagbot key")
+    return True
+
+
 def _setup_bmc(args, overrides: dict, store: DirSecretStore, ssh_material:
                bytes | None) -> None:
     if not _confirm(args, overrides, "Register BMC credentials now?",
@@ -345,6 +501,7 @@ def run_setup(args, overrides: dict | None = None) -> int:
     inventory_text = inv_path.read_text(encoding="utf-8")
     _setup_llm(args, overrides, inv_path, store, inventory_text)
     public = _setup_ssh(args, overrides, store)
+    _setup_console_defaults(args, overrides, inv_path, store)
     try:
         ssh_material = store.get(DIAGBOT_SSH_VAULT)
     except KeyError:

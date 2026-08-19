@@ -247,3 +247,239 @@ def test_check_inventory_secrets_lists_missing(tmp_path):
     assert missing == ["llm api key: secret/harness/llm/gemini-key"]
     store.put("secret/harness/llm/gemini-key", b"k")
     assert _check_inventory_secrets(inv_path, store) == []
+
+
+# ---- rack manager console (console_defaults) ----
+
+def test_console_defaults_block_reuses_diagbot_identity():
+    block = mod._console_defaults_block("192.168.202.51")
+    assert block.startswith("console_defaults:\n")
+    assert "address: 192.168.202.51" in block
+    assert f"identity_vault_path: {DIAGBOT_SSH_VAULT}" in block
+    assert f"sudo_vault_path: {BMC_SUDO_VAULT}" in block
+
+
+def test_insert_console_defaults_before_hosts():
+    text = ("trust_level: lab\n"
+            "llm:\n  provider: gemini\n"
+            "hosts: []\n")
+    out = mod._insert_console_defaults(
+        text, mod._console_defaults_block("10.0.0.5"))
+    assert out.index("console_defaults:") < out.index("hosts: []")
+    assert "trust_level: lab" in out.split("console_defaults:")[0]
+    assert "hosts: []" in out
+
+
+def test_insert_console_defaults_appends_when_no_hosts():
+    text = "trust_level: lab\n"
+    out = mod._insert_console_defaults(
+        text, mod._console_defaults_block("10.0.0.5"))
+    assert out.index("console_defaults:") > out.index("trust_level:")
+    assert "  address: 10.0.0.5" in out
+    assert out.endswith(f"  sudo_vault_path: {BMC_SUDO_VAULT}\n")
+    assert "hosts:" not in out
+
+
+def test_setup_console_defaults_writes_block(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    inv_path = tmp_path / "inventory.yaml"
+    inv_path.write_text("trust_level: lab\nhosts: []\n", encoding="utf-8")
+    store = DirSecretStore(tmp_path / "secrets")
+    store.put(DIAGBOT_SSH_VAULT, FAKE_PRIVATE)
+
+    answers = dict(_answers(), ask=lambda prompt, default="":
+                   "192.168.202.51"
+                   if "console IP" in prompt else (default or ""))
+    mod._setup_console_defaults(_args(tmp_path), answers, inv_path, store)
+
+    inv = load_inventory(inv_path)
+    assert inv.console_defaults is not None
+    assert inv.console_defaults.address == "192.168.202.51"
+    assert inv.console_defaults.user == "log"
+    assert store.get(mod.RACKMGR_SSH_VAULT) == FAKE_PRIVATE  # identity mirrored
+    out = capsys.readouterr().out
+    assert "console_defaults: rack manager 192.168.202.51" in out
+
+
+def test_setup_console_defaults_skipped_on_blank(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    inv_path = tmp_path / "inventory.yaml"
+    inv_path.write_text("trust_level: lab\nhosts: []\n", encoding="utf-8")
+    store = DirSecretStore(tmp_path / "secrets")
+    store.put(DIAGBOT_SSH_VAULT, FAKE_PRIVATE)
+
+    mod._setup_console_defaults(_args(tmp_path), _answers(), inv_path, store)
+
+    assert load_inventory(inv_path).console_defaults is None
+    assert "console_defaults: skipped" in capsys.readouterr().out
+
+
+def test_setup_console_defaults_keeps_existing_block(tmp_path, monkeypatch,
+                                                     capsys):
+    monkeypatch.chdir(tmp_path)
+    inv_path = tmp_path / "inventory.yaml"
+    inv_path.write_text(
+        "trust_level: lab\n"
+        "console_defaults:\n"
+        "  address: 192.168.202.99\n"
+        "  user: log\n"
+        f"  identity_vault_path: {DIAGBOT_SSH_VAULT}\n"
+        "hosts: []\n", encoding="utf-8")
+    store = DirSecretStore(tmp_path / "secrets")
+    store.put(DIAGBOT_SSH_VAULT, FAKE_PRIVATE)
+
+    mod._setup_console_defaults(_args(tmp_path), _answers(), inv_path, store)
+
+    inv = load_inventory(inv_path)
+    assert inv.console_defaults.address == "192.168.202.99"
+    assert "already present" in capsys.readouterr().out
+
+
+def test_setup_full_flow_writes_console_defaults(tmp_path, monkeypatch, capsys):
+    """End-to-end: a fresh `harness setup` that answers the console-IP prompt
+    produces a discoverable inventory with a working console_defaults block."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(mod, "_generate_ed25519", _generate_fixture(tmp_path))
+    args = _args(tmp_path, name=None)
+
+    def ask(prompt, default=""):
+        if "provider" in prompt:
+            return "gemini"
+        if "Model for" in prompt:
+            return "gemini-2.5-flash"
+        if prompt.startswith("Generate a new"):
+            return "generate"
+        if "console IP" in prompt:
+            return "192.168.202.51"
+        return default or ""
+
+    overrides = {
+        "ask": ask,
+        "confirm": lambda prompt, default=False: True,
+        "secret": lambda prompt: "test-api-key-123",
+    }
+    assert run_setup(args, overrides=overrides) == 0
+
+    inv = load_inventory(tmp_path / "inventory.yaml")
+    assert inv.console_defaults is not None
+    assert inv.console_defaults.address == "192.168.202.51"
+    assert "setup complete" in capsys.readouterr().out
+
+
+def _real_key_bytes() -> bytes:
+    """A real ed25519 private key (OpenSSH format) for install-path tests."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    priv = Ed25519PrivateKey.generate()
+    return priv.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.OpenSSH,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+
+def _install_overrides():
+    """confirm accepts the install + host-key prompts; secret supplies a password."""
+    def confirm(prompt, default=False):
+        if "Host key fingerprint" in prompt:
+            return True
+        return True
+
+    return dict(_answers(), confirm=confirm)
+
+
+def test_install_rackmgr_key_pins_host_key(tmp_path, monkeypatch, capsys):
+    from harness.operator import credential_gate as cg
+
+    calls = {"install": [], "save": []}
+    monkeypatch.setattr(
+        cg, "append_pubkey_to_target",
+        lambda *a, **k: calls["install"].append((a, k)) or (True, "installed", object()))
+    monkeypatch.setattr(
+        cg, "save_host_key",
+        lambda path, host, key: calls["save"].append((path, host, key)))
+
+    store = DirSecretStore(tmp_path / "secrets")
+    store.put(mod.RACKMGR_SSH_VAULT, _real_key_bytes())
+    mod._install_rackmgr_key(_args(tmp_path), _install_overrides(),
+                             "192.168.202.51", store)
+
+    assert calls["install"], "append_pubkey_to_target never called"
+    args, kwargs = calls["install"][0]
+    assert args[0] == "192.168.202.51"  # host
+    assert args[1] == "log"             # user
+    assert args[2] == 22                # port
+    assert "ssh-ed25519 " in args[3]    # publine
+    assert "confirm_host" in kwargs
+    assert calls["save"][0][0] == "config/rackmgr_known_hosts"
+    assert calls["save"][0][1] == "192.168.202.51"
+    out = capsys.readouterr().out
+    assert "host key recorded at config/rackmgr_known_hosts" in out
+
+
+def test_install_rackmgr_key_declined_prints_manual(tmp_path, monkeypatch,
+                                                    capsys):
+    store = DirSecretStore(tmp_path / "secrets")
+    store.put(mod.RACKMGR_SSH_VAULT, _real_key_bytes())
+    overrides = dict(_answers(), confirm=lambda prompt, default=False: False)
+    mod._install_rackmgr_key(_args(tmp_path), overrides, "192.168.202.51", store)
+    out = capsys.readouterr().out
+    assert "grant access from the rack manager" in out
+    assert "ssh-ed25519 " in out
+
+
+def test_install_rackmgr_key_no_password_prints_manual(tmp_path, monkeypatch,
+                                                       capsys):
+    store = DirSecretStore(tmp_path / "secrets")
+    store.put(mod.RACKMGR_SSH_VAULT, _real_key_bytes())
+    overrides = dict(_answers(), secret=lambda prompt: "")
+    mod._install_rackmgr_key(_args(tmp_path), overrides, "192.168.202.51", store)
+    assert "grant access from the rack manager" in capsys.readouterr().out
+
+
+def test_install_rackmgr_key_failure_prints_manual(tmp_path, monkeypatch,
+                                                   capsys):
+    from harness.operator import credential_gate as cg
+
+    monkeypatch.setattr(
+        cg, "append_pubkey_to_target", lambda *a, **k: (False, "auth failed", None))
+    store = DirSecretStore(tmp_path / "secrets")
+    store.put(mod.RACKMGR_SSH_VAULT, _real_key_bytes())
+    mod._install_rackmgr_key(_args(tmp_path), _install_overrides(),
+                             "192.168.202.51", store)
+    out = capsys.readouterr().out
+    assert "auth failed" in out
+    assert "grant access from the rack manager" in out
+
+
+def test_setup_console_defaults_writes_and_installs_key(tmp_path, monkeypatch,
+                                                        capsys):
+    """Full console_defaults step: block written, identity mirrored, and the
+    key installed on the rack manager with the host key pinned."""
+    from harness.operator import credential_gate as cg
+
+    calls = {"save": []}
+    monkeypatch.setattr(
+        cg, "append_pubkey_to_target",
+        lambda *a, **k: (True, "installed", object()))
+    monkeypatch.setattr(
+        cg, "save_host_key",
+        lambda path, host, key: calls["save"].append((path, host)))
+
+    monkeypatch.chdir(tmp_path)
+    inv_path = tmp_path / "inventory.yaml"
+    inv_path.write_text("trust_level: lab\nhosts: []\n", encoding="utf-8")
+    store = DirSecretStore(tmp_path / "secrets")
+    store.put(DIAGBOT_SSH_VAULT, _real_key_bytes())
+
+    answers = dict(_install_overrides(), ask=lambda prompt, default="":
+                   "192.168.202.51" if "console IP" in prompt else (default or ""))
+    mod._setup_console_defaults(_args(tmp_path), answers, inv_path, store)
+
+    inv = load_inventory(inv_path)
+    assert inv.console_defaults.address == "192.168.202.51"
+    assert calls["save"] == [("config/rackmgr_known_hosts", "192.168.202.51")]
+    out = capsys.readouterr().out
+    assert "console: installed" in out
+    assert "host key recorded at config/rackmgr_known_hosts" in out
