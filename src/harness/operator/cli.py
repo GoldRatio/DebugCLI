@@ -62,6 +62,8 @@ from collections.abc import Callable
 from dataclasses import asdict, replace
 from pathlib import Path
 
+import yaml
+
 from ..audit.auditlog import AuditLog
 from ..audit.redact import Redactor
 from ..audit.trace import SessionTrace
@@ -1534,9 +1536,10 @@ _ALLOWED_FLAGS: dict[str, tuple[str, ...]] = {
 
 def _discover_inventory() -> list[Path]:
     """Inventory candidates: well-known names plus ``config/*.yaml``. A file
-    only counts when it loads, passes lint AND carries hosts or a
-    ``console_defaults`` block (so ``config/targets.yaml`` etc. never look
-    like an inventory)."""
+    only counts when it loads, passes lint AND declares a top-level ``hosts:``
+    or ``console_defaults:`` key -- even when empty, so a minimal inventory
+    created by ``harness setup`` (``hosts: []``) is discoverable while
+    ``config/targets.yaml`` etc. never look like an inventory."""
     candidates: list[Path] = []
     seen: set[str] = set()
     names: list[Path] = []
@@ -1553,11 +1556,14 @@ def _discover_inventory() -> list[Path]:
             continue
         seen.add(key)
         try:
-            inv = load_inventory(p)
+            raw = yaml.safe_load(p.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict) or not (
+                    "hosts" in raw or "console_defaults" in raw):
+                continue
+            load_inventory(p)  # lint: unreadable/lint-failing files are skipped
         except Exception:  # noqa: BLE001, S112 - unreadable/lint-failing files are skipped
             continue
-        if inv.hosts or inv.console_defaults is not None:
-            candidates.append(p)
+        candidates.append(p)
     return candidates
 
 
@@ -1569,9 +1575,21 @@ def _pick_inventory(args) -> Path | None:
         return Path(explicit)
     found = _discover_inventory()
     if not found:
-        print("no inventory found: pass --inventory <file> or put one under config/",
-              file=sys.stderr)
-        return None
+        interactive = (sys.stdin.isatty()
+                       and os.environ.get("HARNESS_NO_PROMPT") != "1")
+        if interactive:
+            print("no inventory found: launching `harness setup` to create one "
+                  "(LLM key, SSH key, inventory.yaml)...", file=sys.stderr)
+            try:
+                _run_wizard_sub(["setup"] + _wizard_flags(args, "setup"))
+            except KeyboardInterrupt:
+                print("  setup cancelled", file=sys.stderr)
+                return None
+            found = _discover_inventory()
+        if not found:
+            print("no inventory found: pass --inventory <file> or put one under config/",
+                  file=sys.stderr)
+            return None
     if len(found) == 1:
         print(f"  inventory: {found[0]}")
         return found[0]

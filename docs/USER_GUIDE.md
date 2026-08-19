@@ -9,8 +9,10 @@ targeting, diagnosing, verifying, and reading the outputs.
 pip install -e ".[test,docs]"
 ```
 
-Create your inventory (vault paths only). The packaged sample is
-`src/harness/config/inventory.yaml`; copy it and adjust:
+The very first `harness` run finds no inventory and auto-launches
+`harness setup` (see §2b) to create one; or create your inventory by hand
+(vault paths only). The packaged sample is `src/harness/config/inventory.yaml`;
+copy it and adjust:
 
 ```powershell
 Copy-Item src\harness\config\inventory.yaml .\inventory.yaml

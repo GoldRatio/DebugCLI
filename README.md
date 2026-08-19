@@ -55,6 +55,9 @@ Dependencies: `pydantic`, `PyYAML`, `paramiko`; optional extras add
 ## Quick start
 
 ```powershell
+# First run with no inventory yet? `harness` auto-launches `harness setup`
+# to create inventory.yaml + register credentials -- or do it by hand:
+
 # 1. Point at an inventory (vault paths only — see src/harness/config/inventory.yaml)
 harness lint --inventory inventory.yaml
 

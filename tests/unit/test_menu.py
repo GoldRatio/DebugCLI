@@ -1,6 +1,7 @@
 """Interactive menu: key translation, selection logic, inventory discovery,
 wizard dispatch, and the bare-`harness` default."""
 
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -174,6 +175,93 @@ def test_discover_inventory_filters_non_inventories(tmp_path, monkeypatch):
     assert {p.name for p in found} == {"rack.yaml", "inventory.yaml"}
 
 
+def test_discover_inventory_finds_empty_host_inventory(tmp_path, monkeypatch):
+    """A minimal inventory with hosts: [] (e.g. created by `harness setup`)
+    must be discoverable -- zero-YAML --address/--rack targeting needs it."""
+    minimal = ("trust_level: lab\n"
+               "llm:\n"
+               "  provider: gemini\n"
+               "  api_key_vault_path: secret/harness/llm/gemini-key\n"
+               "hosts: []\n")
+    _write_inventory(tmp_path, "inventory.yaml", minimal)
+    monkeypatch.chdir(tmp_path)
+
+    assert [p.name for p in _discover_inventory()] == ["inventory.yaml"]
+
+
+def test_discover_inventory_excludes_plain_llm_file(tmp_path, monkeypatch):
+    """A YAML with an llm block but neither hosts: nor console_defaults: is
+    not an inventory (e.g. config/models.yaml must never be picked)."""
+    _write_inventory(tmp_path, "config/models.yaml",
+                     "llm:\n  provider: stub\n")
+    monkeypatch.chdir(tmp_path)
+
+    assert _discover_inventory() == []
+
+
+def test_pick_inventory_auto_launches_setup_when_none_found(tmp_path,
+                                                            monkeypatch,
+                                                            capsys):
+    """Fresh install, interactive: no inventory -> auto-run `harness setup`,
+    then re-discover the created minimal inventory."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    built = []
+
+    def fake_sub(argv):
+        built.append(argv)
+        (tmp_path / "inventory.yaml").write_text(
+            "trust_level: lab\n"
+            "llm:\n  provider: gemini\n  api_key_vault_path: "
+            "secret/harness/llm/gemini-key\n"
+            "hosts: []\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(cli_mod, "_run_wizard_sub", fake_sub)
+
+    inv = _pick_inventory(SimpleNamespace(inventory=None, secret_dir=None,
+                                          docs_lib=None, docs_dir=None,
+                                          parts_csv=None, parts_dir=None,
+                                          out_dir="harness_runs",
+                                          session_dir="harness_runs/sessions",
+                                          llm=None, console=False,
+                                          ask_parts=False,
+                                          targets_file="config/targets.yaml"))
+    assert inv == Path("inventory.yaml")
+    assert built == [["setup"]]
+    out = capsys.readouterr().out
+    assert "inventory: inventory.yaml" in out
+
+
+def test_pick_inventory_no_autolaunch_noninteractive(tmp_path, monkeypatch,
+                                                     capsys):
+    """Non-interactive (CI/automation) keeps the plain error + exit path."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    built = []
+    monkeypatch.setattr(cli_mod, "_run_wizard_sub",
+                        lambda argv: built.append(argv) or 0)
+
+    assert _pick_inventory(SimpleNamespace(inventory=None)) is None
+    assert built == []
+    assert "no inventory found" in capsys.readouterr().err
+
+
+def test_pick_inventory_setup_cancel_returns_none(tmp_path, monkeypatch,
+                                                  capsys):
+    """Ctrl-C during auto-launched setup backs out cleanly."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+
+    def fake_sub(argv):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_mod, "_run_wizard_sub", fake_sub)
+
+    assert _pick_inventory(SimpleNamespace(inventory=None)) is None
+    assert "setup cancelled" in capsys.readouterr().err
+
+
 def test_pick_inventory_explicit_wins(tmp_path):
     inv = _write_inventory(tmp_path)
     args = SimpleNamespace(inventory=str(inv))
@@ -272,7 +360,8 @@ def test_run_menu_diagnose_uses_typed_symptom(tmp_path, monkeypatch):
 
     monkeypatch.setattr(menu_mod, "select", _scripted_select([1, 0, 9]))
     monkeypatch.setattr(menu_mod, "ask_text",
-                        lambda prompt, **kw: "amber light on power rail")
+                        lambda prompt, **kw: ("amber light on power rail"
+                                              if "Symptom" in prompt else ""))
     monkeypatch.setattr(cli_mod, "_run_wizard_sub", fake_sub)
 
     assert run_menu(_menu_args()) == 0
