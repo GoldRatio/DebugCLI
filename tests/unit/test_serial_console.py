@@ -248,6 +248,41 @@ def test_console_allowed_at_lab():
     assert sc.open is not None  # construction ok at lab
 
 
+def test_console_open_tolerates_missing_known_hosts(tmp_path, monkeypatch):
+    """A known_hosts path whose parent dir does not exist (e.g. setup declined
+    the rack-manager install) must not crash open() with FileNotFoundError; the
+    host-key policy still fails closed."""
+    import harness.engine.sol as sol_mod
+
+    calls = {"load": 0, "connect": 0}
+
+    class _Client:
+        def set_missing_host_key_policy(self, policy):
+            self.policy = policy
+
+        def load_host_keys(self, path):
+            calls["load"] += 1
+            raise FileNotFoundError(f"no such directory: {path}")
+
+        def connect(self, **kw):
+            calls["connect"] += 1
+
+    monkeypatch.setattr(sol_mod.paramiko, "SSHClient", _Client)
+    monkeypatch.setattr(sol_mod, "load_key_material",
+                        lambda store, vault, tmp: tmp_path / "id.pem")
+    from harness.config.vault import MemorySecretStore
+    from harness.engine.sol import SerialConsole
+
+    sc = SerialConsole(
+        _lab_console(known_hosts_path=str(tmp_path / "no" / "such" / "kh")),
+        MemorySecretStore({"secret/bmc/sudo": b"x\n"}),
+    )
+    sc.open()
+    assert calls["load"] == 1
+    assert calls["connect"] == 1
+    assert isinstance(sc._client, _Client)
+
+
 class _FakeClient:
     def __init__(self, out=b"", err=b"", exit_code=0):
         self.written = ""
@@ -870,3 +905,42 @@ def test_bmc_console_collector_batches_non_i2c_probes():
     assert executed == ["sudo -S ipmitool sensor list",
                         "sudo -S i2cdump -y 8 0xb"]
     assert [d.source for d in dumps] == executed
+
+
+def test_ssh_session_open_tolerates_missing_known_hosts(tmp_path, monkeypatch):
+    """SSHSession.open must not crash when the known_hosts path's parent dir is
+    missing; the reject policy still fails closed on unknown hosts."""
+    import harness.engine.session as sess_mod
+    from harness.config.models import BMCDomain, Host, SSHDomain
+    from harness.config.vault import MemorySecretStore
+    from harness.engine.allowlist import default_policy
+
+    calls = {"load": 0, "connect": 0}
+
+    class _Client:
+        def set_missing_host_key_policy(self, policy):
+            self.policy = policy
+
+        def load_host_keys(self, path):
+            calls["load"] += 1
+            raise FileNotFoundError(f"no such directory: {path}")
+
+        def connect(self, **kw):
+            calls["connect"] += 1
+
+    monkeypatch.setattr(sess_mod.paramiko, "SSHClient", _Client)
+    monkeypatch.setattr(sess_mod, "load_key_material",
+                        lambda store, vault, tmp: tmp_path / "id.pem")
+    host = Host(
+        name="h1", address="10.0.0.10", model="model_x",
+        ssh=SSHDomain(user="diagbot",
+                      identity_vault_path="secret/harness/diagbot/id_ed25519",
+                      known_hosts_path=str(tmp_path / "no" / "such" / "kh")),
+        bmc=BMCDomain(address="10.0.0.11", username="bmc-ro",
+                      password_vault_path="secret/harness/bmc/bmc-ro"),
+        collector_profile="cpu_msr",
+    )
+    sess = sess_mod.SSHSession(host, default_policy(), MemorySecretStore())
+    sess.open()
+    assert calls["load"] == 1
+    assert calls["connect"] == 1

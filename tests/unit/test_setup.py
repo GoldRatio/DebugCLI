@@ -301,6 +301,27 @@ def test_setup_console_defaults_writes_block(tmp_path, monkeypatch, capsys):
     assert "console_defaults: rack manager 192.168.202.51" in out
 
 
+def test_setup_console_defaults_creates_known_hosts_file(tmp_path, monkeypatch,
+                                                         capsys):
+    """The inventory references config/rackmgr_known_hosts; the file (and its
+    config/ parent) must exist after setup even when the key install is
+    declined, so session opens never raise FileNotFoundError."""
+    monkeypatch.chdir(tmp_path)
+    inv_path = tmp_path / "inventory.yaml"
+    inv_path.write_text("trust_level: lab\nhosts: []\n", encoding="utf-8")
+    store = DirSecretStore(tmp_path / "secrets")
+    store.put(DIAGBOT_SSH_VAULT, FAKE_PRIVATE)
+
+    answers = dict(_answers(), ask=lambda prompt, default="":
+                   "192.168.202.51"
+                   if "console IP" in prompt else (default or ""))
+    mod._setup_console_defaults(_args(tmp_path), answers, inv_path, store)
+
+    known_hosts = tmp_path / "config" / "rackmgr_known_hosts"
+    assert known_hosts.is_file()
+    assert known_hosts.read_text(encoding="utf-8") == ""
+
+
 def test_setup_console_defaults_skipped_on_blank(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     inv_path = tmp_path / "inventory.yaml"

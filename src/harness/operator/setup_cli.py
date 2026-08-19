@@ -317,6 +317,14 @@ def _insert_console_defaults(text: str, block: str) -> str:
     return "".join(out)
 
 
+def _ensure_known_hosts_file(known_hosts_path: str | Path) -> None:
+    """Make the pinned known_hosts file exist (empty) so session opens never
+    hit ``FileNotFoundError`` before any host key is recorded."""
+    path = Path(known_hosts_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch(exist_ok=True)
+
+
 def _setup_console_defaults(args, overrides: dict, inv_path: Path,
                             store: DirSecretStore) -> None:
     """Ask for the rack-manager console IP and write a ``console_defaults:``
@@ -341,6 +349,7 @@ def _setup_console_defaults(args, overrides: dict, inv_path: Path,
         _insert_console_defaults(text, _console_defaults_block(address)),
         encoding="utf-8")
     print(f"console_defaults: rack manager {address} written to {inv_path}")
+    _ensure_known_hosts_file("config/rackmgr_known_hosts")
     if not _mirror_rackmgr_identity(store):
         print("  note: no SSH key registered yet; run `harness setup` again "
               "or `harness secrets add-ssh` to unlock --rack/--cable")

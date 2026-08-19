@@ -470,7 +470,10 @@ class SerialConsole:
         client = paramiko.SSHClient()
         # Pin host keys; do NOT auto-accept (never replicate StrictHostKeyChecking=no).
         client.set_missing_host_key_policy(_MissingHostReject())
-        client.load_host_keys(self.console.known_hosts_path)
+        try:
+            client.load_host_keys(self.console.known_hosts_path)
+        except FileNotFoundError:
+            pass  # no pinned keys yet; _MissingHostReject fails closed
         key_path = load_key_material(self._store, self.console.identity_vault_path, self._tmp_dir)
         try:
             client.connect(

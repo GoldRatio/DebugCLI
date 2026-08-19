@@ -45,7 +45,10 @@ class SSHSession(Runner):
     def open(self) -> None:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(_MissingHostReject())  # never auto-add
-        client.load_host_keys(self.host.ssh.known_hosts_path)
+        try:
+            client.load_host_keys(self.host.ssh.known_hosts_path)
+        except FileNotFoundError:
+            pass  # no pinned keys yet; _MissingHostReject fails closed
         key_path = load_key_material(self._store, self.host.ssh.identity_vault_path, self._tmp_dir)
         try:
             client.connect(
