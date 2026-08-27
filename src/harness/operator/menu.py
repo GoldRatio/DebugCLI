@@ -1,15 +1,19 @@
-"""Interactive selection menus for the operator CLI (Claude-Code-style).
+"""Interactive selection menus + raw-mode line editor for the operator CLI.
 
 The operator launches ``harness`` (or ``harness menu``) and drives everything
 from inside: pick an inventory, pick a target, pick an action, describe the
 symptom in plain text. This module provides:
 
-- ``LineReader``: the raw-mode key reader (moved from ``operator.repl`` and
-  extended with arrow-key / escape-sequence handling). ``poll()`` reads whole
-  lines for the chat REPL; ``read_key()`` reads single key events for menus.
-  Falls back to blocking ``input()`` when stdin is not a tty.
-- ``select()``: arrow-key picker with type-to-filter; numbered fallback when
-  the terminal is not interactive.
+- ``LineReader``: the raw-mode key reader (POSIX termios, Windows msvcrt).
+  ``poll()`` is a full single-line editor for the chat REPL: cursor movement
+  (arrows / Home / End / Delete), Emacs bindings (Ctrl-A/E/B/F/U/K/W/L),
+  up/down history recall, incremental UTF-8 decoding (multi-byte input never
+  degrades), Windows surrogate-pair joining, bracketed-paste support, and
+  wrap-aware repaint math measured in DISPLAY COLUMNS (wide chars count 2),
+  not code points. Falls back to blocking ``input()`` off-tty.
+- ``select()``: arrow-key picker with type-to-filter and a scrolling viewport
+  bounded by the terminal height (long lists never climb into scrollback);
+  numbered fallback when the terminal is not interactive.
 - ``ask_text()`` / ``confirm()``: small prompts on top of the same reader.
 
 Menus render with ANSI clear/rewrite and enable VT processing on Windows
@@ -22,23 +26,47 @@ import os
 import sys
 import time
 
-# Windows scan codes (msvcrt.getwch after an \x00/\xe0 prefix).
-_NT_SCAN = {"H": "up", "P": "down", "K": "left", "M": "right"}
+from . import ui as _ui
 
-# POSIX escape-sequence suffixes (bytes after ESC '[').
-_POSIX_ESC = {
-    b"[A": "up", b"[B": "down", b"[C": "right", b"[D": "left",
-    b"[H": "up", b"[F": "down",  # home/end keys read as up/down
-    b"[1~": "home", b"[4~": "end", b"[3~": "delete",
+# Windows scan codes (msvcrt.getwch after an \x00/\xe0 prefix).
+_NT_SCAN = {
+    "H": "up", "P": "down", "K": "left", "M": "right",
+    "G": "home", "O": "end", "S": "delete",
+}
+
+# POSIX escape-sequence suffixes (bytes between ESC '[' and the final byte).
+_POSIX_CSI = {
+    b"A": "up", b"B": "down", b"C": "right", b"D": "left",
+    b"H": "home", b"F": "end",
+}
+_POSIX_SS3 = {  # application-mode arrow keys: ESC O <letter>
+    b"A": "up", b"B": "down", b"C": "right", b"D": "left",
+}
+_POSIX_TILDE = {  # CSI <num> ~ forms
+    b"1": "home", b"4": "end", b"3": "delete",
+    b"200": "paste_start", b"201": "paste_end",
 }
 
 
 def decode_escape(rest: bytes) -> str | None:
     """Decode the bytes that followed ESC into a key token (or None if it is
-    not a recognized sequence -- a lone ESC reads as "esc")."""
-    if len(rest) < 2 or not rest.startswith(b"["):
+    not a recognized sequence -- a lone ESC reads as "esc").
+
+    Accepts the classic two-byte forms (``[A``), tilde forms of any digit
+    length (``[200~``), and SS3 application-mode arrows (``OA``).
+    """
+    if len(rest) < 2:
         return None
-    return _POSIX_ESC.get(rest[:2]) or _POSIX_ESC.get(rest)
+    if rest.startswith(b"["):
+        body, final = rest[1:-1], rest[-1:]
+        if not body and final in _POSIX_CSI:
+            return _POSIX_CSI[final]
+        if final == b"~":
+            return _POSIX_TILDE.get(body)
+        return None
+    if rest.startswith(b"O"):
+        return _POSIX_SS3.get(rest[1:])
+    return None
 
 
 def _enable_vt() -> None:
@@ -59,38 +87,42 @@ def _enable_vt() -> None:
 
 
 def _terminal_width() -> int:
-    """Current terminal width in columns (best-effort; 80 when unknown)."""
-    try:
-        import shutil
-        return max(1, shutil.get_terminal_size((80, 24)).columns)
-    except Exception:  # noqa: BLE001 - cosmetic path, never fatal
-        return 80
+    """Current terminal width in columns (best-effort; 80 when unknown).
+
+    Module-level indirection so tests can monkeypatch the width the editor
+    and menus see.
+    """
+    return _ui.terminal_width()
 
 
 class LineReader:
     """Raw-mode line/key reader (POSIX termios + Windows msvcrt).
 
-    ``poll(timeout)`` returns a complete line (the chat REPL); ``read_key``
-    returns single key events ("up"/"down"/"enter"/"esc"/... or the char
-    itself) for menus. When stdin is not a tty both fall back to blocking
-    ``input()``.
+    ``poll(timeout)`` edits and returns one complete line (the chat REPL);
+    ``read_key`` returns single key events ("up"/"down"/"enter"/"esc"/... or
+    the char itself) for menus. When stdin is not a tty both fall back to
+    blocking ``input()``.
     """
 
     def __init__(self, prompt: str = "harness> ") -> None:
         self.prompt = prompt
         self._active = prompt  # prompt of the line being edited (poll can
-        # override it; redraw/clear_line must use the ACTIVE one, not the
-        # default, or backspacing rewrites with the wrong prompt)
+        # override it; repaints must use the ACTIVE one, not the default,
+        # or backspacing rewrites with the wrong prompt)
         self._buf = ""
+        self._pos = 0          # cursor position INSIDE the buffer
         self._raw = False
         self._fd = None
         self._restore = None
-        self._max_width = len(prompt)
+        self._block_cols = 0   # display columns of prompt+buffer as last
+        # echoed; the physical cursor sits at (cols-1)//width rows below the
+        # line start (deferred-wrap aware -- terminals leave the cursor ON
+        # the last column until the NEXT char actually wraps).
         self._prompt_printed = False  # echoed the active prompt for this line;
         # poll() re-fires at 10Hz while a task runs, so this must gate re-echoing
-        self._cursor_rows = 0  # physical rows below the line start the cursor
-        # sits on (0 = the prompt row); the line may WRAP past the terminal
-        # width, and redraw must climb back across those rows, not just "\r"
+        self._history: list[str] = []  # in-memory recall (not persisted)
+        self._hist_idx = -1    # index while walking history (-1 = live draft)
+        self._draft = ""       # buffer being typed before history navigation
         if not sys.stdin.isatty():
             self._raw = False
         elif os.name == "nt":
@@ -133,7 +165,9 @@ class LineReader:
         """One key event within ``timeout`` seconds (None = block).
 
         Returns a single character, or one of: "enter", "up", "down", "left",
-        "right", "tab", "esc", "backspace", "ctrl_c", "ctrl_d". None = timeout.
+        "right", "home", "end", "delete", "tab", "esc", "backspace",
+        "ctrl_c", "ctrl_d", "ctrl_<letter>", "paste_start", "paste_end".
+        None = timeout.
         """
         if os.name == "nt":
             return self._read_key_nt(timeout)
@@ -165,15 +199,50 @@ class LineReader:
             data += chunk
         return data
 
+    def _decode_utf8(self, first: bytes) -> str:
+        """Decode one (possibly multi-byte) UTF-8 character.
+
+        Reads continuation bytes as needed instead of decoding each byte
+        separately -- per-byte ``errors="replace"`` turned every non-ASCII
+        keystroke into replacement characters.
+        """
+        data = first
+        for _ in range(3):  # UTF-8 sequences are at most 4 bytes
+            try:
+                return data.decode("utf-8")
+            except UnicodeDecodeError:
+                nxt = self._read_bytes_posix(1, None)  # continuation imminent
+                if not nxt:
+                    break
+                data += nxt
+        return data.decode("utf-8", errors="replace")
+
+    def _read_csi(self) -> bytes | None:
+        """Read a full CSI/SS3 sequence: everything up to the final byte
+        (0x40-0x7E). Variable-length forms like bracketed paste (``[200~``)
+        need this -- reading a fixed 3 bytes left ``0~`` behind as garbage."""
+        data = b""
+        while True:
+            try:
+                chunk = self._read_bytes_posix(1, 0.05)
+            except EOFError:
+                return None
+            if not chunk:
+                return None  # incomplete sequence: treat as lone ESC
+            data += chunk
+            if 0x40 <= data[-1] <= 0x7E:
+                return data
+
     def _read_key_posix(self, timeout: float | None) -> str | None:
         first = self._read_bytes_posix(1, timeout)
         if not first:
             return None
-        ch = first.decode("utf-8", errors="replace")
-        if ch == "\x1b":
-            rest = self._read_bytes_posix(3, 0.05)
+        if first == b"\x1b":
+            rest = self._read_csi()
+            if rest is None:
+                return "esc"
             return decode_escape(rest) or "esc"
-        return self._token(ch)
+        return self._token(self._decode_utf8(first))
 
     def _read_key_nt(self, timeout: float | None) -> str | None:
         import msvcrt
@@ -193,6 +262,15 @@ class LineReader:
             if ch in ("\x00", "\xe0"):  # function/arrow key: scan code follows
                 scan = msvcrt.getwch()
                 return _NT_SCAN.get(scan, "esc")  # unmapped keys read as esc
+            if "\ud800" <= ch <= "\udbff":  # astral char: high surrogate first
+                if msvcrt.kbhit():
+                    lo = msvcrt.getwch()
+                    if "\udc00" <= lo <= "\udfff":
+                        return chr(0x10000 + ((ord(ch) - 0xD800) << 10)
+                                   + (ord(lo) - 0xDC00))
+                return ""  # lone high surrogate: unusable, drop silently
+            if "\udc00" <= ch <= "\udfff":
+                return ""  # stray low surrogate
             return self._token(ch)
 
     @staticmethod
@@ -209,6 +287,22 @@ class LineReader:
             return "tab"
         if ch == "\x1b":
             return "esc"
+        if ch == "\x01":
+            return "ctrl_a"
+        if ch == "\x02":
+            return "ctrl_b"
+        if ch == "\x05":
+            return "ctrl_e"
+        if ch == "\x06":
+            return "ctrl_f"
+        if ch == "\x0b":
+            return "ctrl_k"
+        if ch == "\x0c":
+            return "ctrl_l"
+        if ch == "\x15":
+            return "ctrl_u"
+        if ch == "\x17":
+            return "ctrl_w"
         return ch
 
     # ---- line-level input (chat REPL) ----
@@ -219,10 +313,7 @@ class LineReader:
             return input(prompt or self.prompt)
         self._active = prompt or self.prompt
         if not self._buf and not self._prompt_printed:
-            self._max_width = len(self._active)
-            self._cursor_rows = len(self._active) // _terminal_width()
-            print(self._active, end="", flush=True)
-            self._prompt_printed = True
+            self._begin_line()
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             if timeout is None:
@@ -234,89 +325,245 @@ class LineReader:
             key = self.read_key(remaining)
             if key is None:
                 return None
-            if key in ("up", "down", "left", "right", "tab", "esc"):
-                continue  # navigation keys are ignored while typing a line
+            if key in ("esc", "tab", ""):
+                continue  # navigation/no-op keys are ignored while typing
             if key == "enter":
-                line, self._buf = self._buf, ""
-                self._max_width = len(self.prompt)
-                self._cursor_rows = 0
-                self._prompt_printed = False
-                print()
+                line, self._buf, self._pos = self._buf, "", 0
+                if line.strip() and (not self._history
+                                     or self._history[-1] != line):
+                    self._history.append(line)
+                self._hist_idx = -1
+                self._draft = ""
+                self._end_line()
                 return line
+            if key == "up":
+                self._history_nav(1)
+                continue
+            if key == "down":
+                self._history_nav(-1)
+                continue
+            if key == "left":
+                if self._pos > 0:
+                    self._pos -= 1
+                    print("\x1b[D", end="", flush=True)
+                continue
+            if key == "right":
+                if self._pos < len(self._buf):
+                    self._pos += 1
+                    print("\x1b[C", end="", flush=True)
+                continue
+            if key in ("home", "ctrl_a"):
+                self._move_home_end(0)
+                continue
+            if key in ("end", "ctrl_e"):
+                self._move_home_end(len(self._buf))
+                continue
+            if key == "ctrl_b":
+                if self._pos > 0:
+                    self._pos -= 1
+                    print("\x1b[D", end="", flush=True)
+                continue
+            if key == "ctrl_f":
+                if self._pos < len(self._buf):
+                    self._pos += 1
+                    print("\x1b[C", end="", flush=True)
+                continue
+            if key == "backspace":
+                if self._pos > 0:
+                    old = self._block_cols
+                    self._buf = self._buf[:self._pos - 1] + self._buf[self._pos:]
+                    self._pos -= 1
+                    self._repaint(old)
+                continue
+            if key == "delete":
+                if self._pos < len(self._buf):
+                    old = self._block_cols
+                    self._buf = self._buf[:self._pos] + self._buf[self._pos + 1:]
+                    self._repaint(old)
+                continue
+            if key == "ctrl_u":
+                self._replace_line("")
+                continue
+            if key == "ctrl_k":
+                old = self._block_cols
+                self._buf = self._buf[:self._pos]
+                self._repaint(old)
+                continue
+            if key == "ctrl_w":
+                head = self._buf[:self._pos].rstrip()
+                cut = max(head.rfind(" "), 0)
+                old = self._block_cols
+                self._buf = head[:cut] + self._buf[self._pos:]
+                self._pos = cut
+                self._repaint(old)
+                continue
+            if key == "ctrl_l":
+                print("\x1b[2J\x1b[H", end="")
+                self._block_cols = 0
+                self._repaint(0)
+                continue
+            if key == "paste_start":
+                self._consume_paste()
+                continue
             if key == "ctrl_c":
+                self._abort_line("^C")
                 raise KeyboardInterrupt
             if key == "ctrl_d":
                 raise EOFError
-            if key == "backspace":
-                if self._buf:
-                    self._buf = self._buf[:-1]
-                    self.redraw(len(self._active) + len(self._buf) + 1)
+            # printable text (possibly several code points: paste w/o brackets)
+            self._insert(key)
+
+    # ---- editor internals ----
+
+    def _begin_line(self) -> None:
+        self._buf = ""
+        self._pos = 0
+        self._hist_idx = -1
+        self._draft = ""
+        self._block_cols = 0
+        self._prompt_printed = True
+        if os.name == "posix":
+            sys.stdout.write("\x1b[?2004h")  # bracketed paste on
+        print(self._active, end="", flush=True)
+        self._block_cols = _ui.disp_width(self._active)
+
+    def _end_line(self) -> None:
+        if os.name == "posix":
+            sys.stdout.write("\x1b[?2004l")  # bracketed paste off
+        print()
+
+    def _abort_line(self, echo: str) -> None:
+        """Discard the in-progress line (Ctrl-C) and start fresh next poll."""
+        if echo:
+            print(echo)
+        self._buf = ""
+        self._pos = 0
+        self._hist_idx = -1
+        self._draft = ""
+        self._block_cols = 0
+        self._prompt_printed = False
+
+    def _sanitize(self, text: str) -> str:
+        """Strip control characters from inserted text; tabs become spaces."""
+        out = []
+        for ch in text:
+            if ch == "\t":
+                out.append("    ")
+            elif ch.isprintable():
+                out.append(ch)
+        return "".join(out)
+
+    def _insert(self, text: str) -> None:
+        text = self._sanitize(text)
+        if not text:
+            return
+        if self._pos == len(self._buf):
+            # fast path: appending at the end, the terminal echoes for us
+            self._buf += text
+            self._pos = len(self._buf)
+            self._block_cols += _ui.disp_width(text)
+            print(text, end="", flush=True)
+        else:
+            old = self._block_cols
+            self._buf = self._buf[:self._pos] + text + self._buf[self._pos:]
+            self._pos += len(text)
+            self._repaint(old)
+
+    def _consume_paste(self) -> None:
+        """Accumulate a bracketed paste as ONE insertion: multi-line pastes
+        must not submit early on embedded newlines, and the chunk lands in
+        the buffer verbatim instead of keystroke-by-keystroke."""
+        chunk: list[str] = []
+        while True:
+            key = self.read_key(None)
+            if key is None or key in ("paste_end", "ctrl_c", "ctrl_d", "esc"):
+                break
+            if key == "enter":
+                chunk.append("\n")  # newlines INSIDE the paste are content
                 continue
-            self._buf += key
-            n = len(self._active) + len(self._buf)
-            self._max_width = max(self._max_width, n)
-            self._cursor_rows = n // _terminal_width()
-            print(key, end="", flush=True)
+            chunk.append(key)
+        text = "".join(chunk)
+        text = " ".join(text.splitlines())  # single-line editor: flatten
+        self._insert(text)
+
+    def _history_nav(self, step: int) -> None:
+        if not self._history:
+            return
+        if self._hist_idx == -1 and step > 0:
+            self._draft = self._buf  # leaving the live draft; remember it
+        new_idx = self._hist_idx + step
+        if new_idx >= len(self._history):
+            return
+        if new_idx < 0:  # stepped back past the newest entry: restore draft
+            self._hist_idx = -1
+            self._replace_line(self._draft)
+            return
+        self._hist_idx = new_idx
+        self._replace_line(self._history[new_idx])
+
+    def _replace_line(self, text: str) -> None:
+        old = self._block_cols
+        self._buf = text
+        self._pos = len(text)
+        self._repaint(old)
+
+    def _move_home_end(self, target: int) -> None:
+        old = self._block_cols
+        self._pos = target
+        self._repaint(old)
+
+    # ---- repaint plumbing ----
+
+    def _erase_block(self, cols: int) -> None:
+        """Erase every physical row the echoed input occupies.
+
+        ``cols`` is the tracked display width of the block; the PHYSICAL
+        cursor sits ``(max(cols,1)-1)//width`` rows below the line start
+        (a terminal defers wrapping until the next character), so climb that
+        far, then ``\\x1b[J`` clears the whole block below -- immune to the
+        off-by-one at exact width multiples that made ``\\x1b[K``-per-row
+        repaints drift upward.
+        """
+        width = _terminal_width()
+        up = max(cols - 1, 0) // width if cols else 0
+        seq = (f"\x1b[{up}A" if up else "") + "\r\x1b[J"
+        print(seq, end="", flush=True)
+
+    def _repaint(self, old_cols: int) -> None:
+        """Redraw prompt+buffer from the block start (see ``_erase_block``)."""
+        self._erase_block(old_cols)
+        print(f"{self._active}{self._buf}", end="", flush=True)
+        self._block_cols = _ui.disp_width(self._active) + _ui.disp_width(self._buf)
+        self._prompt_printed = True
 
     def clear_line(self) -> None:
-        """Erase every physical row the echoed input line occupies.
-
-        A long line WRAPS past the terminal width, so a plain ``\\r`` + spaces
-        only re-anchors the last row and leaves stale copies of the wrapped
-        rows on screen (each background event then re-copies the input line).
-        ``_cursor_rows`` tracks how far below the line start the cursor sits;
-        climb back that far, clear each row down to the cursor, then return to
-        the first row so the caller can print there.
-        """
+        """Erase the echoed input block so the caller can print there."""
         if not self._raw:
             return
-        rows = self._cursor_rows
-        up = rows
-        seq = (f"\x1b[{up}A" if up else "")
-        seq += "\r\x1b[K" + "\x1b[B\x1b[K" * rows
-        seq += (f"\x1b[{up}A" if up else "") + "\r"
-        print(seq, end="", flush=True)
+        self._erase_block(self._block_cols)
 
     def refresh_line(self) -> None:
         """Re-echo the active prompt + buffer at the CURRENT cursor position.
 
         Used by the chat REPL after printing a background event line on the
         cleared input rows: writes the input line fresh below the event and
-        updates the wrap tracking for the next ``clear_line``.
+        updates the column tracking for the next ``clear_line``.
         """
         if not self._raw:
             return
-        n = len(self._active) + len(self._buf)
-        self._max_width = max(self._max_width, n)
-        pad = self._max_width - n
-        print(f"\r{self._active}{self._buf}{' ' * pad}\r{self._active}{self._buf}",
-              end="", flush=True)
-        self._cursor_rows = n // _terminal_width()
+        print(f"{self._active}{self._buf}", end="", flush=True)
+        self._block_cols = _ui.disp_width(self._active) + _ui.disp_width(self._buf)
         self._prompt_printed = True
 
     def redraw(self, n_before: int | None = None) -> None:
-        """Re-render the active prompt line in place, crossing line wraps.
+        """Re-render the active prompt line in place (legacy entry point).
 
-        ``n_before`` is the length (prompt+text) before the edit; the cursor
-        is ``n_before // width`` rows below the line start, so we climb back
-        exactly that far, clear exactly those rows plus the current one
-        (``\\x1b[K`` per row -- never erase below the block), then rewrite.
+        ``n_before`` (columns occupied before the edit) defaults to the
+        tracked value.
         """
         if not self._raw:
             return
-        width = _terminal_width()
-        if n_before is not None:
-            self._cursor_rows = n_before // width
-        up = self._cursor_rows
-        n = len(self._active) + len(self._buf)
-        self._max_width = max(self._max_width, n)
-        seq = (f"\x1b[{up}A" if up else "") + "\r"
-        seq += "\x1b[K" + "\x1b[B\x1b[K" * up
-        if up:
-            seq += f"\x1b[{up}A"
-        self._cursor_rows = n // width
-        print(seq + f"{self._active}{self._buf}", end="", flush=True)
-        self._prompt_printed = True
+        self._repaint(self._block_cols if n_before is None else n_before)
 
 
 # ---- selection menu ----
@@ -325,8 +572,8 @@ def select(title: str, options: list[str], *, reader: LineReader | None = None,
            default: int = 0, allow_cancel: bool = True) -> int | None:
     """Pick one option; returns its index or None when cancelled.
 
-    Uses an arrow-key menu with type-to-filter when the terminal supports raw
-    mode; otherwise a numbered ``input()`` fallback.
+    Uses an arrow-key menu with type-to-filter and a scrolling viewport when
+    the terminal supports raw mode; otherwise a numbered ``input()`` fallback.
     """
     reader = reader or LineReader()
     if not options:
@@ -365,17 +612,46 @@ def _select_numbered(title: str, options: list[str], default: int,
         print(f"  enter 1-{len(options)}")
 
 
+def _view_limit(total: int) -> int:
+    """How many option rows fit on screen: terminal-height driven, clamped
+    so short menus look normal and huge ones never overflow the window."""
+    available = max(4, _ui.terminal_height() - 6)
+    return max(3, min(total, available))
+
+
 def _render_rows(title: str, options: list[str], filtered: list[int],
                  cursor: int, query: str) -> list[str]:
-    lines = [f"? {title}  (up/down, type to filter, Enter, Esc)"]
-    if filtered:
-        for i, idx in enumerate(filtered):
-            marker = "> " if i == cursor else "  "
-            lines.append(f"{marker}{options[idx]}")
-    else:
-        lines.append("  (no matches)")
+    """One frame of the picker: title, a VIEWPORT of options, status footer.
+
+    Every line is width-clamped so a long option can never wrap into a second
+    physical row -- the redraw math assumes one screen row per rendered line.
+    """
+    width = _terminal_width()
+    lines = [_ui.heading(
+        _ui.clip(f"? {title}  (up/down, type to filter, Enter, Esc)", width))]
+    total = len(filtered)
+    limit = _view_limit(total)
+    start = min(max(0, cursor - limit // 2), max(0, total - limit))
+    window = filtered[start:start + limit]
+    if not window:
+        lines.append(_ui.dim("  (no matches)"))
+    for i, idx in enumerate(window):
+        pos = start + i
+        label = _ui.clip(options[idx], width - 2)
+        if pos == cursor:
+            lines.append(_ui.selected(f"{_ui.GLYPH_POINT} {label}"))
+        else:
+            lines.append(f"  {label}")
+    # status footer: position, scroll indicators, active filter
+    bits = [f"{min(cursor + 1, total) if total else 0}/{total}"]
+    above, below = start, max(0, total - (start + limit))
+    if above:
+        bits.append(f"^{above} more")
+    if below:
+        bits.append(f"v{below} more")
     if query:
-        lines.append(f"filter: {query!r} {len(filtered)}/{len(options)}")
+        bits.append(f"filter: {query!r}")
+    lines.append(_ui.dim(_ui.clip("  " + "  ".join(bits), width)))
     return lines
 
 
@@ -405,8 +681,7 @@ def _select_raw(reader: LineReader, title: str, options: list[str],
             first = False
         else:
             # The cursor sits exactly `last_rows` rows below the previous block
-            # start; move up THAT many and erase everything below (also covers
-            # physical rows left behind when a line wrapped), then rewrite.
+            # start; move up THAT many and erase everything below, then rewrite.
             print(f"\x1b[{last_rows}A\x1b[2K\x1b[J", end="")
             for line in rows:
                 print(line)
@@ -416,9 +691,9 @@ def _select_raw(reader: LineReader, title: str, options: list[str],
         except KeyboardInterrupt:
             _clear_rows(last_rows)
             return None
-        if key == "up":
+        if key in ("up", "home"):
             cursor = (cursor - 1) % len(filtered) if filtered else 0
-        elif key == "down":
+        elif key in ("down", "end"):
             cursor = (cursor + 1) % len(filtered) if filtered else 0
         elif key == "backspace":
             query = query[:-1]
@@ -430,7 +705,9 @@ def _select_raw(reader: LineReader, title: str, options: list[str],
             if not filtered:
                 continue  # nothing selected; keep the menu open
             _clear_rows(last_rows)
-            print(f"? {title}: {options[filtered[cursor]]}")
+            chosen = _ui.clip(f"? {title}: {options[filtered[cursor]]}",
+                              _terminal_width())
+            print(_ui.accent(chosen))
             return filtered[cursor]
         elif len(key) == 1 and key.isprintable():
             query += key
@@ -469,15 +746,16 @@ def ask_model_profile(*, reader: LineReader | None = None):
     """Three short prompts building a custom LLM ``ModelProfile``.
 
     Used by the ``+ add a custom model`` row in the model picker (menu and
-    ``/model`` in the REPL). Provider must be ``openai`` or ``gemini``; the URL
-    and API-key vault path are optional and fall back to the provider defaults.
-    Returns None when cancelled.
+    ``/model`` in the REPL). Provider must be ``openai``, ``gemini`` or
+    ``local``; the URL and API-key vault path are optional and fall back to
+    the provider defaults. Returns None when cancelled.
     """
     from ..config.model_catalog import ModelProfile
 
-    provider = ask_text("Provider (openai | gemini)", reader=reader).strip().lower()
-    if provider not in ("openai", "gemini"):
-        print(f"  x unknown provider {provider!r} (openai | gemini)", file=sys.stderr)
+    provider = ask_text("Provider (openai | gemini | local)", reader=reader).strip().lower()
+    if provider not in ("openai", "gemini", "local"):
+        print(f"  x unknown provider {provider!r} (openai | gemini | local)",
+              file=sys.stderr)
         return None
     model = ask_text("Model id (e.g. gpt-4o)", reader=reader).strip()
     if not model:

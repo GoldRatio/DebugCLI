@@ -76,7 +76,7 @@ class LLMConfig:
     """LLM backend for reasoning. ``api_key_vault_path`` is a vault path, never
     inline; absent = fall back to env (e.g. ``GEMINI_API_KEY``)."""
 
-    provider: Literal["openai", "gemini", "stub"] = "openai"
+    provider: Literal["openai", "gemini", "local", "stub"] = "openai"
     model: str | None = None
     url: str | None = None
     api_key_vault_path: str | None = None

@@ -28,10 +28,14 @@ from prior diagnoses.
 
 ## 2. Pre-flight on the new model
 
-The eval CLI selects a *backend* (`--llm {stub,openai,gemini}`); the concrete
-model name comes from the `HARNESS_LLM_MODEL` environment variable (or the
-inventory `llm.model`). The report's `llm_ident` records exactly what was
-replayed, so old- vs new-model runs are distinguishable.
+The eval CLI selects a *backend* (`--llm {stub,openai,local,gemini}`); the
+concrete model name comes from the `HARNESS_LLM_MODEL` environment variable
+(or the inventory `llm.model`). `local` additionally takes `--llm-url` (or
+`HARNESS_LLM_URL`) for an OpenAI-compatible server you host yourself, and
+`--llm-tunnel HOST:PORT` when that server sits behind a rack-manager hop. The
+report's `llm_ident` records exactly what was replayed (`local/<model>` for
+self-hosted), so old- vs new-model runs are distinguishable and a *temporary*
+debug model never inherits another backend's calibration bins.
 
 1. Freeze the OLD model's numbers as the reference baseline:
    ```powershell
@@ -102,7 +106,9 @@ $r.cases | Where-Object { $_.citation_support -lt 0.9 } |
 Nothing in the swap is destructive; a rollback is a config change only:
 
 1. Point live runs back at the old model (inventory `llm: model:` / the
-   `--llm` backend or `HARNESS_LLM_MODEL`, whichever you changed).
+   `--llm` backend or `HARNESS_LLM_MODEL`, whichever you changed; for a
+   temporary `local` model simply drop the `--llm`/`--llm-url`/
+   `--llm-tunnel` flags).
 2. The old calibration file was never touched, so `model_agreement` resolves
    against the old ident again automatically.
 3. Optionally restore the old baseline:

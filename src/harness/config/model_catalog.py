@@ -12,7 +12,8 @@ opencode/pi keep the selected model for the session and the project.
 Sources of *available* models (deduplicated by ident):
 - the persisted ``models:`` list (operator-added custom endpoints/models),
 - the inventory ``llm`` block,
-- the well-known defaults (``openai/harness-diag``, ``gemini/gemini-2.5-flash``),
+- the well-known defaults (``openai/harness-diag``, ``gemini/gemini-2.5-flash``,
+  ``local/harness-diag`` for a locally served vLLM/Ollama endpoint),
 - ``stub`` (pipeline-only, no reasoning) -- always available last.
 
 Resolution precedence for the *current* model:
@@ -24,12 +25,13 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
-_PROVIDERS = ("openai", "gemini", "stub")
+_PROVIDERS = ("openai", "gemini", "local", "stub")
 
-_DEFAULT_MODELS = {"openai": "harness-diag", "gemini": "gemini-2.5-flash"}
+_DEFAULT_MODELS = {"openai": "harness-diag", "gemini": "gemini-2.5-flash",
+                   "local": "harness-diag"}
 
 
 @dataclass(frozen=True)
@@ -58,7 +60,7 @@ class ModelProfile:
         """Build the live adapter. The API key, when vault-path configured, is
         resolved through the secret store; otherwise the adapter falls back to
         env (``GEMINI_API_KEY`` / ``HARNESS_LLM_API_KEY``)."""
-        from ..diagnosis.llm import GeminiLLM, OpenAICompatLLM, StubLLM
+        from ..diagnosis.llm import GeminiLLM, LocalLLM, OpenAICompatLLM, StubLLM
 
         api_key = None
         if self.api_key_vault_path:
@@ -71,6 +73,9 @@ class ModelProfile:
         if self.provider == "gemini":
             return GeminiLLM(url=self.url, api_key=api_key, model=self.model,
                              timeout=self.timeout)
+        if self.provider == "local":
+            return LocalLLM(url=self.url, api_key=api_key, model=self.model,
+                            timeout=self.timeout)
         return OpenAICompatLLM(url=self.url, api_key=api_key, model=self.model,
                                timeout=self.timeout)
 
@@ -162,9 +167,19 @@ class ModelCatalog:
         return cls(available=available, current=current, user_models=user_models)
 
     def resolve(self, provider: str | None = None,
-                model_id: str | None = None) -> ModelProfile:
+                model_id: str | None = None,
+                url: str | None = None) -> ModelProfile:
         """The effective profile under the resolution precedence (flag-provider
-        and ``model_id`` come from the CLI; otherwise the remembered current)."""
+        and ``model_id`` come from the CLI; otherwise the remembered current).
+        ``url``, when given (``--llm-url``), overrides whatever endpoint the
+        resolved profile carried -- per-run endpoint pinning."""
+        profile = self._resolve_base(provider=provider, model_id=model_id)
+        if url and profile.url != url:
+            return replace(profile, url=url.strip())
+        return profile
+
+    def _resolve_base(self, provider: str | None = None,
+                      model_id: str | None = None) -> ModelProfile:
         if model_id:
             found = self.get(model_id)
             if found is not None:
@@ -201,6 +216,9 @@ class ModelCatalog:
         # provider known but not present in the catalog -> a sensible default
         if provider == "gemini":
             return ModelProfile(provider="gemini", model="gemini-2.5-flash")
+        if provider == "local":
+            return ModelProfile(provider="local",
+                                model=_DEFAULT_MODELS["local"])
         return ModelProfile(provider="openai", model="harness-diag")
 
     def choose(self, profile: ModelProfile) -> None:
@@ -237,6 +255,8 @@ _DEFAULTS = [
     DEFAULT_CURRENT,
     ModelProfile(provider="gemini", model="gemini-2.5-flash",
                  label="gemini-2.5-flash (Google Gemini, OpenAI-compatible)"),
+    ModelProfile(provider="local", model=_DEFAULT_MODELS["local"],
+                 label="harness-diag (local OpenAI-compatible endpoint, e.g. vLLM)"),
     _STUB,
 ]
 

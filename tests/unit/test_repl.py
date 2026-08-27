@@ -416,6 +416,19 @@ def test_session_repl_quit_directly(tmp_path, capsys):
     assert "Type /help" in capsys.readouterr().out
 
 
+def test_session_banner_layout(tmp_path, capsys):
+    """Startup gets a distinct header block (rules + labeled fields) instead
+    of four same-weight lines; plain-mode output keeps the key content."""
+    reader = _ScriptedReader(["/quit"])
+    code = run_session(_session_args(tmp_path), overrides={"reader": reader})
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "harness session" in out
+    assert "h1 (named)" in out                 # target field
+    assert "stub" in out                       # llm field
+    assert "Type /help for commands, or describe a symptom. /quit exits." in out
+
+
 def test_agent_runs_in_background_and_announces_launch(tmp_path, capsys):
     """A slow conversation LLM must NOT freeze the REPL: the operator keeps
     typing (lines queue up), a status tick shows the agent working in the
@@ -1124,4 +1137,5 @@ def test_session_message_unknown_target_shows_error_not_crash(tmp_path, capsys):
     assert "x target:" in out
     assert "console_defaults" in out
     # the active target was NOT switched: the default named host stays active
-    assert "active target: h1 (named)" in out
+    # (startup banner labels it `target`; _set_target echoes `active target:`)
+    assert "h1 (named)" in out

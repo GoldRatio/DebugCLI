@@ -156,6 +156,33 @@ the next run keeps it. Precedence: `--llm-model` > `--llm` > remembered >
 inventory `llm` block > default `openai/harness-diag`. Calibration is keyed per
 model ident, so a swap never inherits another model's calibration.
 
+### Locally hosted model (vLLM on a lab server)
+
+The `local` provider talks to any OpenAI-compatible endpoint (vLLM, llama.cpp,
+Ollama `/v1`). Two transport cases:
+
+```powershell
+# A) Endpoint directly reachable (e.g. your workstation's own GPU box)
+harness llm check --url http://10.0.0.42:8000/v1 --model Qwen2.5-7B-Instruct
+harness diagnose --inventory src/harness/config/inventory.yaml `
+  --rack Q61 --cable 8 --symptom "uncorrectable ECC" `
+  --llm local --llm-model local/Qwen2.5-7B-Instruct `
+  --llm-url http://10.0.0.42:8000/v1
+
+# B) Model served on a node only reachable via the rack-manager console hop:
+#    the harness forwards HTTP through the rackmgr SSH connection for the run
+#    (same pinned host keys + vault identity as the serial-console path).
+harness llm check --tunnel 10.0.0.42:8000 --inventory src/harness/config/inventory.yaml
+harness diagnose ... --llm local --llm-model local/Qwen2.5-7B-Instruct `
+  --llm-tunnel 10.0.0.42:8000
+```
+
+`harness llm check` stages each leg (`ssh` -> `forward` -> `http`) and prints a
+reverse-tunnel fallback recipe when the rack manager refuses forwarding.
+Calibration idents stay per model (`local/Qwen2.5-7B-Instruct`), so temporary
+debug models never pollute another backend's bins; remove the flags to return
+to the previous model.
+
 ## Documentation
 
 | Document | Contents |

@@ -385,7 +385,11 @@ def test_diagnose_console_path_runs_pipeline(tmp_path):
     assert diag.confidence_breakdown.evidence_fit == 1.0
 
 
-def test_diagnose_console_generic_plan_dedupes_bmc_probes(tmp_path):
+def test_diagnose_console_generic_plan_dedupes_bmc_probes(tmp_path,
+                                                          monkeypatch):
+    # Isolate from any harness_docs/ at the invocation cwd: _build_docs_retriever
+    # auto-discovers it and its doc-named probes would break the exact-call list.
+    monkeypatch.chdir(tmp_path)
     console_runner = _FakeConsoleRunner()
     args = build_parser().parse_args([
         "diagnose", "--inventory", _console_defaults_inventory(tmp_path),
@@ -913,3 +917,205 @@ def test_targets_add_requires_rack_cable_or_address(tmp_path, capsys):
         ["targets", "--targets-file", str(tmp_path / "t.yaml"), "add", "d1"])
     assert cli_mod.run_targets(args) == 2
     assert "needs --rack/--cable" in capsys.readouterr().err
+
+
+# ---- local LLM endpoint: flags, resolution, preflight, llm check ----
+# (reuses the pre-existing _console_defaults_inventory helper for tunnel tests)
+
+def test_parsers_accept_llm_url_and_tunnel(tmp_path):
+    inv = _inventory(tmp_path)
+    args = build_parser().parse_args([
+        "diagnose", "--inventory", inv, "--host", "h1", "--symptom", "x",
+        "--llm", "local", "--llm-model", "local/Qwen2.5-7B-Instruct",
+        "--llm-url", "http://10.0.0.42:8000/v1"])
+    assert args.llm == "local"
+    assert args.llm_url == "http://10.0.0.42:8000/v1"
+    assert args.llm_tunnel is None
+    args = build_parser().parse_args([
+        "session", "--inventory", inv,
+        "--llm-tunnel", "10.0.0.42:8000"])
+    assert args.llm_tunnel == "10.0.0.42:8000"
+    args = build_parser().parse_args(["menu", "--inventory", inv,
+                                      "--llm-tunnel", "h.lab:8000"])
+    assert args.llm_tunnel == "h.lab:8000"
+
+
+def test_eval_parser_accepts_local_backend(tmp_path):
+    args = build_parser().parse_args([
+        "eval", "--cases", str(tmp_path / "cases"),
+        "--lib", str(tmp_path / "docs"),
+        "--llm", "local", "--llm-url", "http://127.0.0.1:9/v1"])
+    llm, ident = cli_mod._eval_llm(args)
+    from harness.diagnosis.llm import LocalLLM
+    assert isinstance(llm, LocalLLM)
+    assert llm.url == "http://127.0.0.1:9/v1"
+    assert ident == "local/harness-diag"       # env HARNESS_LLM_MODEL absent
+
+
+def test_eval_llm_local_ident_uses_env_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARNESS_LLM_MODEL", "Qwen2.5-7B-Instruct")
+    args = SimpleNamespace(llm="local", llm_url=None)
+    _, ident = cli_mod._eval_llm(args)
+    assert ident == "local/Qwen2.5-7B-Instruct"   # calibration key per model
+
+
+def test_resolve_llm_honors_llm_url_override(tmp_path):
+    """--llm-url pins the endpoint of the resolved profile (catalog default)."""
+    inv = load_inventory(_inventory(tmp_path))
+    store = MemorySecretStore()
+    llm = _resolve_llm(SimpleNamespace(llm=None,
+                                       llm_url="http://10.0.0.42:8000/v1"),
+                       inv, store)
+    assert llm.url == "http://10.0.0.42:8000/v1"
+    local = _resolve_llm(SimpleNamespace(llm="local",
+                                         llm_model="local/Qwen2.5-7B-Instruct",
+                                         llm_url=None),
+                         inv, store)
+    from harness.diagnosis.llm import LocalLLM
+    assert isinstance(local, LocalLLM)
+
+
+def test_diagnose_preflight_fails_fast_on_dead_llm_url(tmp_path, monkeypatch):
+    """An explicit --llm-url that fails reachability aborts BEFORE target
+    resolution / collection starts."""
+    from harness.diagnosis.llm import LLMError
+
+    def dead_probe(url, timeout=10.0):
+        raise LLMError("LLM unreachable: connection refused")
+
+    monkeypatch.setattr(cli_mod, "list_models", dead_probe)
+    args = build_parser().parse_args([
+        "diagnose", "--inventory", _inventory(tmp_path), "--host", "h1",
+        "--symptom", "x",
+        "--llm-url", "http://10.0.0.99:8000/v1"])
+    with pytest.raises(RuntimeError, match="llm check"):
+        run_diagnose(args, overrides={"session": FakeSession()})
+
+
+def test_diagnose_tunnel_opens_per_run_and_rewrites_url(tmp_path, monkeypatch):
+    """``--llm-tunnel`` opens a forward through console_defaults for the run
+    and binds adapters to its local URL; teardown runs after the diagnosis."""
+    recorded = {}
+
+    class _StubForward:
+        def __init__(self, host, port, domain, store, timeout=30.0):
+            recorded["target"] = (host, port)
+            recorded["domain"] = domain
+
+        def start(self):
+            return "http://127.0.0.1:28100/v1"
+
+        def close(self):
+            recorded["closed"] = True
+
+    monkeypatch.setattr(cli_mod, "LLMForward", _StubForward)
+    monkeypatch.chdir(tmp_path)                # isolate config/models.yaml
+    args = build_parser().parse_args([
+        "diagnose", "--inventory", _console_defaults_inventory(tmp_path),
+        "--rack", "Q61", "--cable", "8", "--symptom", "x",
+        "--llm", "local", "--llm-tunnel", "10.0.0.42:8000",
+        "--out-dir", str(tmp_path / "runs"), "--approve-all"])
+    diag = run_diagnose(args, overrides={"console_runner": _FakeConsoleRunner(),
+                                         "llm": _fake_llm})
+    assert "Memory ECC errors" in diag.diagnosis
+    assert recorded["target"] == ("10.0.0.42", 8000)
+    assert recorded["domain"].address == "192.168.202.51"
+    assert args.llm_url == "http://127.0.0.1:28100/v1"  # adapters bound here
+    assert recorded.get("closed") is True               # torn down post-run
+
+
+def test_llm_check_direct_url_reports_models(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(cli_mod, "list_models",
+                        lambda url, api_key=None, timeout=10.0:
+                        ["Qwen/Qwen2.5-7B-Instruct"])
+    args = SimpleNamespace(url="http://127.0.0.1:9/v1", tunnel=None,
+                           model="Qwen2.5-7B-Instruct", timeout=5.0,
+                           inventory=None, secret_dir=str(tmp_path))
+    assert cli_mod.run_llm_check(args) == 0
+    out = capsys.readouterr().out
+    assert "[ok ] http" in out
+    assert "Qwen/Qwen2.5-7B-Instruct" in out
+
+
+def test_llm_check_warns_when_requested_model_absent(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(cli_mod, "list_models",
+                        lambda url, api_key=None, timeout=10.0: ["other-model"])
+    args = SimpleNamespace(url="http://127.0.0.1:9/v1", tunnel=None,
+                           model="Qwen2.5-7B-Instruct", timeout=5.0,
+                           inventory=None, secret_dir=str(tmp_path))
+    assert cli_mod.run_llm_check(args) == 1
+    assert "not in the served list" in capsys.readouterr().err
+
+
+def test_llm_check_unreachable_fails_http_stage(tmp_path, capsys, monkeypatch):
+    from harness.diagnosis.llm import LLMError
+
+    def dead(url, api_key=None, timeout=10.0):
+        raise LLMError("LLM unreachable: no route")
+
+    monkeypatch.setattr(cli_mod, "list_models", dead)
+    args = SimpleNamespace(url="http://10.0.6.6:8000/v1", tunnel=None,
+                           model=None, timeout=5.0,
+                           inventory=None, secret_dir=str(tmp_path))
+    assert cli_mod.run_llm_check(args) == 1
+    assert "[FAIL] http" in capsys.readouterr().out
+
+
+def test_llm_check_tunnel_without_inventory_is_usage_error(tmp_path, capsys):
+    args = SimpleNamespace(url=None, tunnel="10.0.0.42:8000", model=None,
+                           timeout=5.0, inventory=None,
+                           secret_dir=str(tmp_path))
+    assert cli_mod.run_llm_check(args) == 2
+    assert "--tunnel needs --inventory" in capsys.readouterr().err
+
+
+def test_llm_check_tunnel_reports_stages_and_closes(tmp_path, capsys, monkeypatch):
+    recorded = {}
+
+    class _StubForward:
+        def __init__(self, host, port, domain, store, timeout=30.0):
+            recorded["target"] = (host, port)
+
+        def start(self):
+            return "http://127.0.0.1:28200/v1"
+
+        def close(self):
+            recorded["closed"] = True
+
+    monkeypatch.setattr(cli_mod, "LLMForward", _StubForward)
+    monkeypatch.setattr(cli_mod, "list_models",
+                        lambda url, api_key=None, timeout=10.0: ["m1"])
+    args = build_parser().parse_args([
+        "llm", "check", "--tunnel", "10.0.0.42:8000",
+        "--inventory", _console_defaults_inventory(tmp_path),
+        "--secret-dir", str(tmp_path)])
+    assert cli_mod.run_llm_check(args) == 0
+    out = capsys.readouterr().out
+    assert "[ok ] ssh" in out and "[ok ] forward" in out and "[ok ] http" in out
+    assert recorded["target"] == ("10.0.0.42", 8000)
+    assert recorded["closed"] is True          # probe never leaks the hop
+
+
+def test_llm_check_forward_refusal_prints_reverse_recipe(tmp_path, capsys,
+                                                         monkeypatch):
+    from harness.engine.tunnel import TunnelError
+
+    class _RefusingForward:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            raise TunnelError("forward", "channel open refused")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(cli_mod, "LLMForward", _RefusingForward)
+    args = build_parser().parse_args([
+        "llm", "check", "--tunnel", "10.0.0.42:8000",
+        "--inventory", _console_defaults_inventory(tmp_path),
+        "--secret-dir", str(tmp_path)])
+    assert cli_mod.run_llm_check(args) == 1
+    captured = capsys.readouterr()
+    assert "[FAIL] forward" in captured.out
+    assert "reverse tunnel" in captured.err    # fallback recipe surfaced

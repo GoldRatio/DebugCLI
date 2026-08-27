@@ -49,6 +49,7 @@ from ..diagnosis.schema import Diagnosis
 from ..inspect.base import RegisterDump
 from ..operator.supervisor import Escalation
 from ..targets import TargetError, TargetSpec, resolve_target
+from . import ui
 from .chat_agent import ChatTurn, build_evidence, build_messages, decide, fallback_turn
 from .credential_gate import apply_ssh_context
 from .menu import LineReader as _LineReader
@@ -74,6 +75,8 @@ class Session:
     max_turns: int
     server_number: int | None = None
     llm_ident: str = ""
+    llm_url: str | None = None
+    llm_tunnel: str | None = None
     ask_parts: bool = False
     overrides: dict = field(default_factory=dict)
     target: TargetSpec = field(default_factory=TargetSpec)
@@ -246,13 +249,13 @@ def _set_target(session: Session, spec: TargetSpec) -> bool:
             known_hosts_path=session.known_hosts_path,
         )
     except TargetError as exc:
-        _print_line(session, f"  x target: {exc}")
+        _print_line(session, ui.bad(f"  x target: {exc}"))
         return False
     apply_ssh_context(session.store, target, ssh_user=session.ssh_user)
     session.host = target.host
     session.target = spec
     session.target_label = target.label
-    _print_line(session, f"  active target: {target.label} ({target.kind})")
+    _print_line(session, ui.good(f"  active target: {target.label} ({target.kind})"))
     return True
 
 
@@ -265,6 +268,12 @@ def _diagnose_argv(session: Session, symptom: str, host_name: str | None) -> lis
             "--max-turns", str(session.max_turns)]
     if session.llm_ident:
         argv += ["--llm-model", session.llm_ident]
+    if session.llm_url:
+        argv += ["--llm-url", session.llm_url]
+    if session.llm_tunnel:
+        # The spawned run owns its own short-lived forward (a paramiko
+        # transport cannot cross the process boundary).
+        argv += ["--llm-tunnel", session.llm_tunnel]
     argv += _target_argv(session)
     if session.secret_dir:
         argv += ["--secret-dir", session.secret_dir]
@@ -617,12 +626,30 @@ def _run_probes(session: Session, subsystems: list[str], doc_topics: list[str],
 
 # ---- rendering ----
 
+_ERROR_PREFIXES = ("x ", "no such file", "unknown command", "unknown host",
+                   "bad arguments")
+
+
+def _auto_style(text: str) -> str:
+    """Give unstyled REPL feedback a consistent look by convention: `x ...`
+    errors go red, usage/help hints go dim. Already-styled lines (they carry
+    an ESC sequence) pass through untouched -- never double-wrap."""
+    if "\x1b[" in text:
+        return text
+    stripped = text.strip()
+    if any(stripped.startswith(p) for p in _ERROR_PREFIXES):
+        return ui.bad(text)
+    if stripped.startswith(("usage:", "(")):
+        return ui.dim(text)
+    return text
+
+
 def _print_line(session: Session, text: str) -> None:
     reader = session.reader
     clear = getattr(reader, "clear_line", None)
     if clear is not None:
         clear()
-    print(text, flush=True)
+    print(_auto_style(text), flush=True)
     refresh = getattr(reader, "refresh_line", None)
     if refresh is None:
         refresh = getattr(reader, "redraw", None)
@@ -631,14 +658,27 @@ def _print_line(session: Session, text: str) -> None:
 
 
 def _render_event(session: Session, kind: str, payload: object) -> None:
+    """Render one worker event, styled by KIND so the stream reads at a
+    glance: accent = the agent speaking / launching, dim bullet = progress
+    ticks, red = stderr and failures, plain = captured tool output."""
     if kind == "progress":
-        _print_line(session, f"  {payload}")
+        text = str(payload)
+        if text.startswith("agent: "):
+            _print_line(session, ui.accent(text))
+        elif text.startswith("thinking:"):
+            _print_line(session, ui.dim(text))
+        elif "failed" in text:
+            _print_line(session, ui.bad(f"  {text}"))
+        elif text.startswith("started in the background:"):
+            _print_line(session, ui.accent(f"  {text}"))
+        else:
+            _print_line(session, ui.dim(f"  {ui.GLYPH_BULLET} {text}"))
     elif kind == "out":
         for line in str(payload).splitlines():
             _print_line(session, line)
     elif kind == "err":
         for line in str(payload).splitlines():
-            _print_line(session, f"  [stderr] {line}")
+            _print_line(session, ui.bad(f"  [stderr] {line}"))
 
 
 def _drain_events(session: Session) -> tuple[object | None, str | None]:
@@ -710,11 +750,11 @@ def _finish_task(session: Session, result: object | None,
     task = session.task
     session.task = None
     if error:
-        _print_line(session, f"  x {task.label}: {error}")
+        _print_line(session, ui.bad(f"  x {task.label}: {error}"))
         session.transcript.append({"role": "tool", "kind": "error", "content": error})
         return
     if result is not None:
-        _print_line(session, f"  done: {result}")
+        _print_line(session, ui.good(f"  + done: {result}"))
         # The final say / tool result was already recorded in the transcript
         # when it was produced; only record genuinely new content.
         last = session.transcript[-1] if session.transcript else {}
@@ -730,14 +770,15 @@ def _finish_task(session: Session, result: object | None,
 
 def _status_line(session: Session) -> str:
     if session.task is not None and session.task.alive:
-        return (f"  running in the background: {session.task.label} "
-                f"({session.task.elapsed():.0f}s) -- you can keep typing; "
-                f"/stop cancels")
+        return ui.accent(
+            f"  running in the background: {session.task.label} "
+            f"({session.task.elapsed():.0f}s) -- you can keep typing; "
+            f"/stop cancels")
     if session.pending:
-        return f"  idle; {len(session.pending)} queued message(s) for the next run"
+        return ui.dim(f"  idle; {len(session.pending)} queued message(s) for the next run")
     if session.last_run is not None:
-        return f"  idle; last run: {session.last_run}"
-    return "  idle"
+        return ui.dim(f"  idle; last run: {session.last_run}")
+    return ui.dim("  idle")
 
 
 # ---- the conversation agent ----
@@ -926,11 +967,11 @@ def _handle_busy_line(session: Session, line: str) -> None:
         session.answer_ready.set()
         session.answered = True
         session.transcript.append({"role": "user", "kind": "answer", "content": line})
-        _print_line(session, "  (answer sent to agent)")
+        _print_line(session, ui.good("  (answer sent to agent)"))
         return
     session.pending.append(line)
     session.transcript.append({"role": "user", "kind": "message", "content": line})
-    _print_line(session, "  (queued; the agent sees this after the current run)")
+    _print_line(session, ui.dim("  (queued; the agent sees this after the current run)"))
 
 
 def _parse_use_arg(session: Session, arg: str) -> TargetSpec | None:
@@ -1059,14 +1100,22 @@ def _slash_lint(session: Session) -> None:
 
 def _set_session_model(session: Session, catalog, profile) -> None:
     """Switch the session's reasoning + routing adapters to ``profile`` and
-    remember it in ``config/models.yaml`` for the next run."""
-    session.llm = profile.build(session.store)
-    session.router_llm = profile.build(session.store)
+    remember it in ``config/models.yaml`` for the next run. The profile's own
+    endpoint wins; otherwise a session-pinned ``--llm-url``/tunnel is kept."""
+    from dataclasses import replace as _dc_replace
+
+    effective = (_dc_replace(profile, url=session.llm_url)
+                 if not profile.url and session.llm_url else profile)
+    session.llm = effective.build(session.store)
+    session.router_llm = effective.build(session.store)
     session.llm_ident = profile.ident
     session.llm_mode = "stub" if profile.ident == "stub" else profile.ident.split("/")[0]
+    if profile.url:
+        session.llm_url = profile.url
     catalog.choose(profile)
     catalog.save()
-    _print_line(session, f"  model: {profile.ident} (active for the next run; saved)")
+    _print_line(session, ui.good(
+        f"  model: {profile.ident} (active for the next run; saved)"))
     _save_session(session)
 
 
@@ -1078,13 +1127,13 @@ def _slash_model(session: Session, arg: str) -> None:
     from .menu import ask_model_profile, select
 
     if session.task is not None and session.task.alive:
-        _print_line(session, "  model switching is disabled while a run is active "
-                             "(wait or /stop)")
+        _print_line(session, ui.warn("  model switching is disabled while a run is "
+                                     "active (wait or /stop)"))
         return
     catalog = ModelCatalog.load(inv=session.inv)
     arg = arg.strip()
     if arg:
-        profile = catalog.resolve(model_id=arg)
+        profile = catalog.resolve(model_id=arg, url=session.llm_url)
         _set_session_model(session, catalog, profile)
         return
     labels, profiles, add_idx = picker_rows(catalog)
@@ -1150,10 +1199,13 @@ def _handle_slash(session: Session, line: str) -> None:
         _print_help()
     elif cmd == "/hosts":
         for host in sorted(session.inv.hosts, key=lambda h: h.name):
-            mark = " (active)" if host.name == session.target_label else ""
-            _print_line(session, f"  {host.name}  {host.trust_level}  {host.model}{mark}")
+            is_active = host.name == session.target_label
+            mark = ui.accent("  <- active") if is_active else ""
+            name = ui.good(host.name) if is_active else host.name
+            _print_line(session, f"  {name}  {host.trust_level}  {host.model}{mark}")
         if session.target_label and session.target_label not in session.inv.host_names:
-            _print_line(session, f"  {session.target_label}  (dynamic target, no YAML)")
+            _print_line(session,
+                        f"  {session.target_label}  (dynamic target, no YAML)")
     elif cmd == "/use":
         if not arg:
             _print_line(session, "  usage: /use <host> | <rack> cable <n> | <ip> | <alias>")
@@ -1281,7 +1333,7 @@ def _load_session(session: Session, path: Path) -> None:
         from ..config.model_catalog import ModelCatalog
 
         profile = ModelCatalog.load(inv=session.inv).resolve(
-            model_id=session.llm_ident)
+            model_id=session.llm_ident, url=session.llm_url)
         session.llm = profile.build(session.store)
         session.router_llm = profile.build(session.store)
     host = payload.get("host")
@@ -1301,10 +1353,11 @@ def _load_session(session: Session, path: Path) -> None:
         except TargetError as exc:
             session.target_label = payload.get("target_label") or "(target)"
             _print_line(session, f"  x target no longer resolvable: {exc}")
-    _print_line(session, f"  resumed: target={session.target_label}, "
-                         f"{len(session.transcript)} transcript entr(ies)")
+    _print_line(session, ui.good(f"  resumed: target={session.target_label}, "
+                                 f"{len(session.transcript)} transcript entr(ies)"))
     for entry in session.transcript[-3:]:
-        _print_line(session, f"    [{entry.get('role')}] {str(entry.get('content', ''))[:120]}")
+        _print_line(session, ui.dim(
+            f"    [{entry.get('role')}] {str(entry.get('content', ''))[:120]}"))
 
 
 def _list_sessions(session: Session) -> None:
@@ -1342,9 +1395,19 @@ def run_session(args, overrides: dict | None = None) -> int:
         return 2
     hosts = sorted(inv.hosts, key=lambda h: h.name)
 
-    from ..operator.cli import _llm_ident_for, _make_store, _resolve_llm
+    from ..operator.cli import (
+        _llm_ident_for,
+        _make_store,
+        _prepare_llm_endpoint,
+        _resolve_llm,
+    )
 
     store = overrides.get("store") or _make_store(args)
+    # Tunnel / preflight before any adapter is built (same contract as
+    # diagnose): a dead --llm-url must fail here, not mid-conversation.
+    forward = overrides.get("llm_forward")
+    if forward is None:
+        forward = _prepare_llm_endpoint(args, inv, store)
     llm = overrides.get("llm") or _resolve_llm(args, inv, store)
     router_llm = overrides.get("router_llm") or _resolve_llm(args, inv, store)
     llm_ident = _llm_ident_for(args, inv)
@@ -1395,6 +1458,8 @@ def run_session(args, overrides: dict | None = None) -> int:
         router_llm=router_llm,
         llm_mode=llm_mode,
         llm_ident=llm_ident,
+        llm_url=getattr(args, "llm_url", None),
+        llm_tunnel=getattr(args, "llm_tunnel", None),
         docs_lib=getattr(args, "docs_lib", None),
         docs_dir=getattr(args, "docs_dir", None),
         parts_csv=getattr(args, "parts_csv", None),
@@ -1424,12 +1489,24 @@ def run_session(args, overrides: dict | None = None) -> int:
     if prompter is not None:
         prompter.set_bridge(_credential_bridge(session))
 
-    print(f"harness session | inventory: {args.inventory}")
-    print(f"hosts: {', '.join(f'{h.name}({h.trust_level})' for h in hosts)}")
-    active = (f"active target: {session.target_label} ({target.kind})"
-              if target is not None else "active target: (none yet - name a rack/cable/IP)")
-    print(f"{active} | llm: {session.llm_ident or session.llm_mode}")
-    print("Type /help for commands, or describe a symptom. /quit exits.")
+    ui.enable_vt()
+    width = max(44, min(ui.terminal_width(), 78))
+    print()
+    print(ui.rule(width))
+    print(f"  {ui.title('harness session')}   "
+          f"{ui.dim(f'inventory: {args.inventory}')}")
+    print(ui.rule(width))
+    if target is not None:
+        active = ui.good(session.target_label) + " " + ui.dim(f"({target.kind})")
+    else:
+        active = ui.dim("(none yet - name a rack/cable/IP)")
+    print(ui.kv("target", active))
+    print(ui.kv("llm", session.llm_ident or session.llm_mode))
+    if hosts:
+        print(ui.kv("hosts", ", ".join(
+            f"{h.name}{ui.dim(f'({h.trust_level})')}" for h in hosts)))
+    print()
+    print(ui.dim("  Type /help for commands, or describe a symptom. /quit exits."))
     _save_session(session)
 
     try:
@@ -1479,4 +1556,6 @@ def run_session(args, overrides: dict | None = None) -> int:
     finally:
         reader.close()
         _save_session(session)
+        if forward is not None:
+            forward.close()
     return 0

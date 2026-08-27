@@ -138,8 +138,10 @@ Vendor PDFs are git-ignored; they live on your machine only.
 harness            # or: harness menu
 ```
 
-Auto-discovers the inventory, then menus: pick target → pick action
-(chat / diagnose / verify / console / docs / targets / secrets / lint).
+Auto-discovers the inventory, then menus. The top level keeps the daily
+flows only: **Chat session**, **Debug a target** (one-shot diagnosis),
+**Inspect past runs**, and **Advanced...** -- which holds verify, serial
+console, model, docs, targets, secrets, setup and lint.
 Esc cancels; typing filters; non-tty stdin falls back to numbered prompts.
 
 ### Chat session
@@ -267,6 +269,39 @@ Under `harness_runs/<run-id>/`:
 - `trace.json` — what was planned, collected, decoded, and concluded.
 - `audit.jsonl` — append-only audit chain (redacted).
 - `dumps/*.txt` — raw collector output for manual cross-checking.
+
+## 9. Locally hosted model (temporary debug agent)
+
+You can serve the reasoning model on a lab box (vLLM is natively
+OpenAI-compatible) and point the harness at it for a few runs:
+
+```powershell
+# 1. Preflight: reachability + served model list (staged report)
+harness llm check --url http://10.0.0.42:8000/v1 --model Qwen2.5-7B-Instruct
+
+# 2a. Directly reachable endpoint:
+harness diagnose --inventory inventory.yaml --rack Q61 --cable 8 `
+  --symptom "uncorrectable ECC" `
+  --llm local --llm-model local/Qwen2.5-7B-Instruct `
+  --llm-url http://10.0.0.42:8000/v1
+
+# 2b. Endpoint on a node behind the rack-manager console hop -- the harness
+#     forwards HTTP through the rackmgr SSH connection for this run only:
+harness llm check --tunnel 10.0.0.42:8000 --inventory inventory.yaml
+harness diagnose --inventory inventory.yaml --rack Q61 --cable 8 ... `
+  --llm-tunnel 10.0.0.42:8000
+```
+
+Notes:
+
+- `--llm-tunnel` implies provider `local`; it reuses `console_defaults`
+  credentials + pinned host keys, opens at run start, closes at run end.
+- If the rack manager refuses forwarding (`[FAIL] forward`), the output prints
+  the reverse-tunnel recipe to run from the node console; then pass
+  `--llm-url http://127.0.0.1:18000/v1` instead.
+- Calibration is keyed per ident (`local/Qwen2.5-7B-Instruct`); a temporary
+  model starts conservative until it accumulates verified outcomes, and
+  rolling back is just dropping the flags.
 
 ## Troubleshooting
 

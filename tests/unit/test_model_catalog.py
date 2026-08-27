@@ -8,7 +8,7 @@ import pytest
 from harness.config.model_catalog import ModelCatalog, ModelProfile, picker_rows
 from harness.config.models import Inventory, LLMConfig
 from harness.config.vault import MemorySecretStore
-from harness.diagnosis.llm import GeminiLLM, OpenAICompatLLM, StubLLM
+from harness.diagnosis.llm import GeminiLLM, LocalLLM, OpenAICompatLLM, StubLLM
 
 # ---- ModelProfile ----
 
@@ -48,7 +48,8 @@ def test_profile_from_dict_rejects_bad_entries():
 def test_catalog_defaults_with_no_file(tmp_path):
     catalog = ModelCatalog.load(tmp_path / "nope.yaml")
     assert [p.ident for p in catalog.available] == [
-        "openai/harness-diag", "gemini/gemini-2.5-flash", "stub"]
+        "openai/harness-diag", "gemini/gemini-2.5-flash",
+        "local/harness-diag", "stub"]
     assert catalog.current.ident == "openai/harness-diag"
     assert catalog.resolve().ident == "openai/harness-diag"
 
@@ -191,3 +192,36 @@ def test_picker_rows_marks_current_and_add_row(tmp_path):
     assert "[current]" in labels[1]          # gemini-2.5-flash marked
     assert "[current]" not in labels[0]      # openai default not marked
     assert labels[add_idx].startswith("+ add a custom model")
+
+
+# ---- local provider ----
+
+def test_local_provider_profile_and_ident():
+    p = ModelProfile.from_dict({"provider": "local", "model": "Qwen2.5-7B-Instruct",
+                                "url": "http://10.0.0.42:8000/v1"})
+    assert p.ident == "local/Qwen2.5-7B-Instruct"
+    assert ModelProfile(provider="local").ident == "local/harness-diag"
+
+
+def test_resolve_url_override_wins_over_catalog_entry(tmp_path):
+    """``--llm-url`` rewrites the endpoint of whichever profile resolves --
+    a catalog hit, an ad-hoc provider/model pair, or the remembered current."""
+    catalog = ModelCatalog.load(tmp_path / "nope.yaml")
+    pinned = "http://10.0.0.42:8000/v1"
+    hit = catalog.resolve(model_id="gemini/gemini-2.5-flash", url=pinned)
+    assert hit.url == pinned and hit.provider == "gemini"
+    adhoc = catalog.resolve(provider="openai", model_id="gpt-4o", url=pinned)
+    assert adhoc.url == pinned and adhoc.model == "gpt-4o"
+    current = catalog.resolve(url=pinned)
+    assert current.url == pinned
+    # absent url -> profile untouched (catalog/env defaults apply)
+    assert catalog.resolve().url is None
+
+
+def test_build_local_llm_instance():
+    store = MemorySecretStore()
+    llm = ModelProfile(provider="local", model="Qwen2.5-7B-Instruct",
+                       url="http://127.0.0.1:9/v1").build(store)
+    assert isinstance(llm, LocalLLM)
+    assert llm.model == "Qwen2.5-7B-Instruct"
+    assert llm.json_mode is True              # vLLM supports response_format

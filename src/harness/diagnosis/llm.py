@@ -119,6 +119,51 @@ def _coerce_json_text(text: str) -> str | None:
     return None
 
 
+class LocalLLM(OpenAICompatLLM):
+    """Locally hosted OpenAI-compatible endpoint (vLLM, llama.cpp, Ollama ``/v1``).
+
+    Same wire protocol as ``OpenAICompatLLM`` -- vLLM serves chat-completions
+    natively and honors ``response_format: json_object``. Typically no API key;
+    set ``HARNESS_LLM_API_KEY`` when a gateway fronts the server. When the
+    server sits behind the rack-manager hop, pair with
+    ``engine.tunnel.LLMForward`` (``--llm-tunnel HOST:PORT``) and pass the
+    forward's local URL here. Env config: ``HARNESS_LLM_URL`` (default
+    http://127.0.0.1:8000/v1), ``HARNESS_LLM_MODEL``.
+    """
+
+    def __init__(self, url: str | None = None, api_key: str | None = None,
+                 model: str | None = None, timeout: float = 120.0) -> None:
+        super().__init__(url=url, api_key=api_key, model=model, timeout=timeout)
+        self.json_mode = True  # vLLM supports structured JSON responses
+
+
+def list_models(url: str | None = None, api_key: str | None = None,
+                timeout: float = 10.0) -> list[str]:
+    """Preflight: GET ``{url}/models`` and return the served model ids.
+
+    Raises :class:`LLMError` when unreachable or the reply is malformed --
+    used by ``harness llm check`` to stage transport vs HTTP failures.
+    """
+    base = (url or os.environ.get("HARNESS_LLM_URL", "http://127.0.0.1:8000/v1")).rstrip("/")
+    request = urllib.request.Request(f"{base}/models", method="GET")
+    if api_key:
+        request.add_header("Authorization", f"Bearer {api_key}")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:300]
+        raise LLMError(f"LLM HTTP {exc.code}: {detail!r}") from exc
+    except urllib_error.URLError as exc:
+        raise LLMError(f"LLM unreachable: {exc.reason}") from exc
+    except json.JSONDecodeError as exc:
+        raise LLMError("LLM /models returned non-JSON") from exc
+    try:
+        return [str(m["id"]) for m in data["data"]]
+    except (KeyError, TypeError) as exc:
+        raise LLMError(f"LLM /models reply missing model ids: {exc}") from exc
+
+
 class GeminiLLM(OpenAICompatLLM):
     """Gemini via its OpenAI-compatible endpoint.
 

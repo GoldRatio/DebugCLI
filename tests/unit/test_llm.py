@@ -2,7 +2,14 @@
 
 import pytest
 
-from harness.diagnosis.llm import GeminiLLM, LLMError, OpenAICompatLLM, StubLLM
+from harness.diagnosis.llm import (
+    GeminiLLM,
+    LLMError,
+    LocalLLM,
+    OpenAICompatLLM,
+    StubLLM,
+    list_models,
+)
 from harness.diagnosis.schema import Diagnosis, Risk
 
 
@@ -188,3 +195,85 @@ def test_single_shot_retries_with_schema_on_validation_failure(monkeypatch):
     fix = calls[1][-1]["content"]
     assert "exact schema" in fix
     assert "confidence" in fix  # schema embedded in the correction turn
+
+
+# ---- local provider (vLLM / llama.cpp / Ollama) ----
+
+def test_local_llm_defaults(monkeypatch):
+    monkeypatch.delenv("HARNESS_LLM_URL", raising=False)
+    monkeypatch.delenv("HARNESS_LLM_MODEL", raising=False)
+    llm = LocalLLM()
+    assert llm.url == "http://127.0.0.1:8000/v1"
+    assert llm.model == "harness-diag"
+    assert llm.api_key is None
+    assert llm.json_mode is True  # vLLM honors response_format json_object
+
+
+def test_local_llm_env_and_explicit_overrides(monkeypatch):
+    monkeypatch.setenv("HARNESS_LLM_URL", "http://10.0.0.42:8000/v1")
+    monkeypatch.setenv("HARNESS_LLM_MODEL", "Qwen2.5-7B-Instruct")
+    monkeypatch.setenv("HARNESS_LLM_API_KEY", "tok")
+    llm = LocalLLM()
+    assert llm.url == "http://10.0.0.42:8000/v1"
+    assert llm.model == "Qwen2.5-7B-Instruct"
+    assert llm.api_key == "tok"
+    explicit = LocalLLM(url="http://127.0.0.1:9/v1", model="m")
+    assert explicit.url == "http://127.0.0.1:9/v1"
+    assert explicit.api_key == "tok"   # None falls back to env (shared adapter contract)
+    assert LocalLLM(api_key=None).api_key == "tok"
+    assert LocalLLM(api_key="direct").api_key == "direct"
+
+
+def test_list_models_parses_served_ids(monkeypatch):
+    import json
+
+    import harness.diagnosis.llm as llm_mod
+
+    class _FakeResp:
+        def __init__(self, data: bytes):
+            self._data = data
+
+        def read(self):
+            return self._data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    seen = {}
+
+    def fake_urlopen(request, timeout):
+        seen["url"] = request.full_url
+        return _FakeResp(json.dumps(
+            {"data": [{"id": "Qwen/Qwen2.5-7B-Instruct"}, {"id": "m2"}]}).encode())
+
+    monkeypatch.setattr(llm_mod.urllib.request, "urlopen", fake_urlopen)
+    ids = list_models("http://127.0.0.1:9/v1/", timeout=5.0)
+    assert ids == ["Qwen/Qwen2.5-7B-Instruct", "m2"]
+    assert seen["url"].endswith("/models")  # trailing slash stripped
+
+
+def test_list_models_unreachable_raises_llm_error():
+    with pytest.raises(LLMError):
+        list_models("http://127.0.0.1:1/v1", timeout=1.0)
+
+
+def test_list_models_malformed_reply_raises(monkeypatch):
+    import harness.diagnosis.llm as llm_mod
+
+    class _FakeResp:
+        def read(self):
+            return b'{"unexpected": true}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(llm_mod.urllib.request, "urlopen",
+                        lambda request, timeout: _FakeResp())
+    with pytest.raises(LLMError):
+        list_models("http://127.0.0.1:9/v1")
