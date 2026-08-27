@@ -1,10 +1,14 @@
-"""Case store: append-only, hash-linked home of verified diagnosis outcomes.
+"""Case store: hash-linked home of verified diagnosis outcomes.
 
 Every recorded run becomes a ``CaseOutcome`` JSON file under ``<root>/<run_id>.json``
-written atomically; an existing file is NEVER overwritten (WORM invariant -- the
-outcome is stored once). ``index.json`` is a rebuildable manifest (mtime-ordered,
-tolerates missing/stale index by rescanning). ``save`` refuses any record whose
-fields reference the secret store or key material (defense in depth).
+written atomically. By default the store is append-only -- an existing file is
+NEVER overwritten (WORM invariant -- the outcome is stored once). An operator
+correction (a mislabeled fix/outcome) may explicitly replace the record via
+``save(overwrite=True)`` / ``record(revise=True)``, which also appends a
+``case_revised`` audit event carrying the previous outcome so the change is
+traceable. ``index.json`` is a rebuildable manifest (mtime-ordered, tolerates
+missing/stale index by rescanning). ``save`` refuses any record whose fields
+reference the secret store or key material (defense in depth).
 """
 
 from __future__ import annotations
@@ -53,11 +57,12 @@ class CaseStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.index_path = self.root / "index.json"
 
-    def save(self, record: CaseOutcome) -> Path:
-        """Persist an outcome record once (append-only).
+    def save(self, record: CaseOutcome, *, overwrite: bool = False) -> Path:
+        """Persist an outcome record (append-only unless ``overwrite=True``).
 
-        Refuses to overwrite an existing ``{run_id}.json`` and rejects records
-        carrying secret references. Audit-hash linkage is the caller's job
+        Refuses to overwrite an existing ``{run_id}.json`` unless the caller
+        explicitly opts in (label correction), and rejects records carrying
+        secret references. Audit-hash linkage is the caller's job
         (``CaseStore.record``); ``save`` itself never mutates old bytes.
         """
         if _secret_refs(record):
@@ -65,7 +70,7 @@ class CaseStore:
                 f"case record {record.run_id!r} contains a secret/key reference; "
                 "rejected")
         target = self.root / f"{record.run_id}.json"
-        if target.exists():
+        if target.exists() and not overwrite:
             raise FileExistsError(
                 f"case {record.run_id!r} already recorded (append-only: an outcome "
                 "is stored once)")
@@ -78,20 +83,41 @@ class CaseStore:
         return target
 
     def record(self, record: CaseOutcome, *, audit: AuditLog | None = None,
-               session_id: str | None = None) -> Path:
+               session_id: str | None = None, revise: bool = False) -> Path:
         """Persist AND audit-link a case (hash covers the record's own bytes).
 
         The audit entry carries the record's ``evidence_hash`` + outcome so the
         WORM chain and the case store are independently verifiable; a mismatch
         between stored bytes and the audit hash surfaces as a chain error.
+        ``revise=True`` replaces an existing record (operator correction) and
+        audits a ``case_revised`` event with the previous outcome; when nothing
+        exists yet it behaves like a plain first record.
         """
-        path = self.save(record)
+        previous: CaseOutcome | None = None
+        target = self.root / f"{record.run_id}.json"
+        if revise and target.exists():
+            try:
+                previous = CaseOutcome.model_validate_json(
+                    target.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001 - unreadable old record: still revise
+                previous = None
+        path = self.save(record, overwrite=revise)
         if audit is not None:
-            audit.append(
-                session_id or record.run_id, "case_record",
-                {"run_id": record.run_id, "evidence_hash": record.evidence_hash,
-                 "outcome": record.outcome, "case_file": str(path.name)},
-            )
+            if previous is not None:
+                audit.append(
+                    session_id or record.run_id, "case_revised",
+                    {"run_id": record.run_id, "prev_outcome": previous.outcome,
+                     "prev_actions_taken": previous.actions_taken,
+                     "outcome": record.outcome,
+                     "evidence_hash": record.evidence_hash,
+                     "case_file": str(path.name)},
+                )
+            else:
+                audit.append(
+                    session_id or record.run_id, "case_record",
+                    {"run_id": record.run_id, "evidence_hash": record.evidence_hash,
+                     "outcome": record.outcome, "case_file": str(path.name)},
+                )
         return path
 
     def get(self, run_id: str) -> CaseOutcome | None:

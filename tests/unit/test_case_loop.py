@@ -56,6 +56,35 @@ def test_verifier_record_refuses_overwrite(tmp_path):
     assert store.get("run-1").outcome == "fixed"
 
 
+def test_case_store_revise_replaces_and_audits(tmp_path):
+    from harness.audit.auditlog import AuditLog
+    from harness.audit.redact import Redactor
+    log = AuditLog(tmp_path / "audit.jsonl", Redactor([]))
+    store = CaseStore(tmp_path / "cases")
+    store.record(_case("run-1"), audit=log, session_id="run-1")
+    store.record(_case("run-1", outcome="not_fixed",
+                       actions_taken=["replaced DIMM A2"]),
+                 audit=log, session_id="run-1", revise=True)
+    stored = store.get("run-1")
+    assert stored.outcome == "not_fixed"
+    assert stored.actions_taken == ["replaced DIMM A2"]
+    events = log.read()
+    assert [e.kind for e in events] == ["case_record", "case_revised"]
+    revised = events[-1].payload
+    assert revised["prev_outcome"] == "fixed"
+    assert revised["outcome"] == "not_fixed"
+    assert log.verify() == []
+
+
+def test_case_store_revise_without_existing_is_plain_record(tmp_path):
+    from harness.audit.auditlog import AuditLog
+    from harness.audit.redact import Redactor
+    log = AuditLog(tmp_path / "audit.jsonl", Redactor([]))
+    store = CaseStore(tmp_path / "cases")
+    store.record(_case("run-9"), audit=log, session_id="run-9", revise=True)
+    assert [e.kind for e in log.read()] == ["case_record"]
+
+
 def test_verifier_record_audit_links(tmp_path):
     from harness.audit.auditlog import AuditLog
     from harness.audit.redact import Redactor

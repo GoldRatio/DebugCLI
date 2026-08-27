@@ -1,6 +1,7 @@
 """Interactive menu: key translation, selection logic, inventory discovery,
 wizard dispatch, and the bare-`harness` default."""
 
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -73,6 +74,144 @@ class _KeyReader:
         return self.keys.pop(0)
 
 
+# ---- line editor (cursor movement, history, paste, widths) ----
+
+def _editor(keys):
+    reader = LineReader()
+    reader._raw = True
+    reader.read_key = _KeyReader(list(keys)).read_key
+    return reader
+
+
+def test_poll_cursor_left_inserts_middle(capsys):
+    reader = _editor(["a", "b", "left", "X", "enter"])
+    assert reader.poll(None) == "aXb"
+
+
+def test_poll_home_end(capsys):
+    reader = _editor(["a", "b", "c", "home", "Z", "end", "Y", "enter"])
+    assert reader.poll(None) == "ZabcY"
+
+
+def test_poll_forward_delete(capsys):
+    reader = _editor(["a", "b", "c", "home", "delete", "enter"])
+    assert reader.poll(None) == "bc"
+
+
+def test_poll_backspace_midline_keeps_tail(capsys):
+    reader = _editor(["a", "b", "c", "left", "backspace", "enter"])
+    assert reader.poll(None) == "ac"
+
+
+def test_poll_ctrl_u_clears_line(capsys):
+    reader = _editor(["a", "b", "c", "ctrl_u", "d", "enter"])
+    assert reader.poll(None) == "d"
+
+
+def test_poll_ctrl_k_kills_to_end(capsys):
+    reader = _editor(["a", "b", "c", "home", "ctrl_k", "z", "enter"])
+    assert reader.poll(None) == "z"
+
+
+def test_poll_ctrl_w_deletes_word_back(capsys):
+    reader = _editor(list("foo bar") + ["ctrl_w", "enter"])
+    assert reader.poll(None) == "foo"
+
+
+def test_poll_history_recall(tmp_path, capsys):
+    reader = LineReader()
+    reader._raw = True
+    script = _KeyReader(["h", "i", "enter"])
+    reader.read_key = script.read_key
+    assert reader.poll(None) == "hi"
+    script.keys += ["up", "enter"]
+    assert reader.poll(None) == "hi"          # up recalls the last line
+    script.keys += ["down", "enter"]
+    assert reader.poll(None) == ""            # down past newest -> empty draft
+
+
+def test_poll_history_nav_skips_empty_lines():
+    reader = LineReader()
+    reader._raw = True
+    script = _KeyReader(["enter"])            # empty line: NOT recorded
+    reader.read_key = script.read_key
+    assert reader.poll(None) == ""
+    script.keys += ["x", "enter"]
+    assert reader.poll(None) == "x"
+    script.keys += ["up", "up", "enter"]      # only one entry -> stays on it
+    assert reader.poll(None) == "x"
+
+
+def test_editor_utf8_multibyte_decoded(monkeypatch):
+    """POSIX path must assemble continuation bytes instead of per-byte
+    errors="replace" (which degraded every non-ASCII keystroke)."""
+    reader = LineReader()
+    reader._raw = True
+    data = "\u00e9".encode("utf-8")  # b"\xc3\xa9"
+    rest = iter([data[1:]])
+    monkeypatch.setattr(reader, "_read_bytes_posix",
+                        lambda count, timeout: next(rest))
+    assert reader._decode_utf8(data[:1]) == "\u00e9"
+
+
+def test_read_key_nt_joins_surrogate_pairs(monkeypatch):
+    """Astral chars arrive as UTF-16 surrogate pairs from getwch; joining
+    them keeps emoji from landing in the buffer as lone surrogates."""
+    import msvcrt
+
+    seq = iter(["\ud83d", "\ude00"])
+    monkeypatch.setattr(msvcrt, "kbhit", lambda: True)
+    monkeypatch.setattr(msvcrt, "getwch", lambda: next(seq))
+    reader = LineReader()
+    assert reader.read_key(None) == "\U0001f600"
+
+
+def test_read_key_nt_drops_stray_surrogates(monkeypatch):
+    import msvcrt
+
+    monkeypatch.setattr(msvcrt, "kbhit", lambda: True)
+    monkeypatch.setattr(msvcrt, "getwch", lambda: "\udc00")
+    reader = LineReader()
+    assert reader.read_key(None) == ""
+
+
+def test_poll_bracketed_paste_flattens_newlines(capsys):
+    """Pasted text arrives wrapped in paste_start/paste_end; embedded
+    newlines become spaces and submit as ONE line."""
+    reader = _editor(["paste_start", "l", "i", "enter", "n", "e",
+                      "paste_end", "enter"])
+    assert reader.poll(None) == "li ne"
+
+
+def test_poll_paste_inserts_at_cursor_midline(capsys):
+    reader = _editor(["a", "c", "left", "paste_start", "b", "paste_end", "enter"])
+    assert reader.poll(None) == "abc"
+
+
+def test_poll_wide_chars_track_display_columns(capsys, monkeypatch):
+    """Wrap math counts COLUMNS: two wide chars fill a 6-col terminal exactly;
+    the deferred-wrap cursor means NO climb is emitted there (the old code
+    climbed a row too far and drifted upward at exact boundaries)."""
+    monkeypatch.setattr("harness.operator.menu._terminal_width", lambda: 6)
+    reader = _editor(["\u65e5", "\u672c", "backspace", "\u672c", "backspace",
+                      "enter"])
+    line = reader.poll(None, prompt="> ")
+    out = capsys.readouterr().out
+    assert line == "\u65e5"                    # 日本 -> 日 -> 日本 -> 日
+    assert "\x1b[1A" not in out                # never climbs past row 0 at this width
+    assert "\x1b[2A" not in out
+
+
+def test_poll_wrapped_line_climbs_across_rows(capsys, monkeypatch):
+    monkeypatch.setattr("harness.operator.menu._terminal_width", lambda: 6)
+    reader = _editor(["a", "b", "c", "d", "\u65e5", "backspace", "backspace",
+                      "backspace", "enter"])
+    line = reader.poll(None, prompt="> ")
+    out = capsys.readouterr().out
+    assert line == "ab"                        # cols: 2+4=6 wide char wraps once
+    assert "\x1b[1A" in out
+
+
 # ---- key decoding ----
 
 def test_decode_escape():
@@ -80,10 +219,16 @@ def test_decode_escape():
     assert decode_escape(b"[B") == "down"
     assert decode_escape(b"[C") == "right"
     assert decode_escape(b"[D") == "left"
-    assert decode_escape(b"[H") == "up"      # home key
-    assert decode_escape(b"[F") == "down"    # end key
+    assert decode_escape(b"[H") == "home"
+    assert decode_escape(b"[F") == "end"
+    assert decode_escape(b"[3~") == "delete"
+    assert decode_escape(b"[200~") == "paste_start"   # bracketed paste
+    assert decode_escape(b"[201~") == "paste_end"
+    assert decode_escape(b"OA") == "up"               # SS3 application mode
     assert decode_escape(b"") is None
+    assert decode_escape(b"x") is None
     assert decode_escape(b"[Z") is None      # unknown sequence -> lone ESC
+    assert decode_escape(b"[99~") is None
 
 
 def test_line_reader_token_mapping():
@@ -135,16 +280,17 @@ def test_select_raw_no_matches_blocks_enter(capsys):
 
 
 def test_select_raw_backspace_redraw_stays_anchored(capsys):
-    # Heights: initial=4 ("cat","dog","cog"), "c"=4 (2 matches+footer),
-    # "ca"=3 ([cat]+footer), backspace -> "c"=4. The backspace redraw must move
-    # up the PREVIOUS block height (3), not the new one (4), or the menu drifts
-    # upward one row per keystroke.
+    # Heights (title + options + status footer): initial=5 ("cat","dog","cog"),
+    # "c"=4 (2 matches+footer), "ca"=3 ([cat]+footer), backspace -> "c"=4. The
+    # backspace redraw must move up the PREVIOUS block height (3), not the new
+    # one (4), or the menu drifts upward one row per keystroke.
     idx = select("Pick", ["cat", "dog", "cog"],
                  reader=_KeyReader(["c", "a", "backspace", "enter"]))
     assert idx == 0  # "cat" selected
     out = capsys.readouterr().out
     assert out.count("\x1b[3A") == 1  # only the backspace redraw moves up 3
-    assert out.count("\x1b[4A") == 3  # "c", "ca" redraws + enter clear
+    assert out.count("\x1b[4A") == 2  # "ca" redraw + enter clear
+    assert out.count("\x1b[5A") == 1  # first "c" redraw climbs the initial 5
 
 
 def test_select_raw_esc_cancels(capsys):
@@ -160,6 +306,39 @@ def test_select_numbered_fallback(monkeypatch, capsys):
 def test_select_numbered_cancel(monkeypatch):
     monkeypatch.setattr("builtins.input", lambda _prompt: "q")
     assert select("Pick", ["a", "b"]) is None
+
+
+# ---- viewport: long lists scroll instead of overflowing the screen ----
+
+def test_select_raw_scrolls_long_lists(monkeypatch, capsys):
+    from harness.operator import menu as menu_mod
+
+    monkeypatch.setattr(menu_mod, "_view_limit", lambda total: 3)
+    idx = select("Pick", ["alpha", "bravo", "charlie", "delta", "echo"],
+                 reader=_KeyReader(["down", "down", "down", "enter"]))
+    assert idx == 3                            # delta selected
+    out = capsys.readouterr().out
+    assert "delta" in out
+    assert "^2 more" in out                    # scrolled: items above the window
+    # the redraw block never grows past title+viewport+footer rows
+    assert "\x1b[6A" not in out and "\x1b[7A" not in out
+
+
+def test_select_raw_clamps_long_options_to_width(monkeypatch, capsys):
+    import re
+
+    from harness.operator import menu as menu_mod
+
+    monkeypatch.setattr(menu_mod, "_terminal_width", lambda: 40)
+    long = "x" * 200
+    idx = select("Pick some extremely long titled thing that also wraps",
+                 [long], reader=_KeyReader(["enter"]))
+    assert idx == 0
+    raw_lines = capsys.readouterr().out.splitlines()
+    assert any("\u2026" in ln for ln in raw_lines)       # ellipsis marker shown
+    # measure VISIBLE width: clear sequences share a line with the next frame
+    visible = [re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", ln) for ln in raw_lines]
+    assert max(len(ln) for ln in visible) <= 42          # no physical wrapping
 
 
 # ---- inventory discovery ----
@@ -311,16 +490,53 @@ def test_run_menu_lint_then_quit(tmp_path, monkeypatch, capsys):
     _write_inventory(tmp_path)
     monkeypatch.chdir(tmp_path)
     from harness.operator import menu as menu_mod
-    # main menu: pick lint, then quit (indices resolved by action key so menu
-    # reordering never breaks this test)
-    keys = [k for k, _ in cli_mod._MAIN_ACTIONS]
-    monkeypatch.setattr(menu_mod, "select",
-                        _scripted_select([keys.index("lint"), keys.index("quit")]))
+    # lint lives in the ADVANCED submenu now: main -> advanced -> lint ->
+    # back -> quit (indices resolved by action key so reordering never
+    # breaks this test)
+    main_keys = [k for k, _ in cli_mod._MAIN_ACTIONS]
+    adv_keys = [k for k, _ in cli_mod._ADVANCED_ACTIONS]
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([
+        main_keys.index("advanced"),
+        adv_keys.index("lint"),
+        adv_keys.index(cli_mod._BACK),
+        main_keys.index("quit"),
+    ]))
 
     assert run_menu(_menu_args()) == 0
     out = capsys.readouterr().out
     assert "harness menu" in out
     assert "OK: 1 host(s): h1" in out
+
+
+def test_main_and_advanced_menu_shapes():
+    """The simplified top level is exactly the daily flows + Advanced;
+    every demoted tool stays reachable in the submenu."""
+    assert [k for k, _ in cli_mod._MAIN_ACTIONS] == [
+        "chat", "diagnose", "runs", "advanced", "quit"]
+    adv_keys = [k for k, _ in cli_mod._ADVANCED_ACTIONS]
+    assert adv_keys == ["verify", "console", "model", "docs", "targets",
+                        "secrets", "setup", "lint", cli_mod._BACK]
+    # labels are user-facing copy: no raw command names as the whole label
+    assert "Debug a target" in dict(cli_mod._MAIN_ACTIONS)["diagnose"]
+
+
+def test_run_menu_advanced_round_trip(tmp_path, monkeypatch, capsys):
+    """Advanced opens, Back returns to the main menu, then Quit exits."""
+    _write_inventory(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    from harness.operator import menu as menu_mod
+
+    main_keys = [k for k, _ in cli_mod._MAIN_ACTIONS]
+    adv_keys = [k for k, _ in cli_mod._ADVANCED_ACTIONS]
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([
+        main_keys.index("advanced"),
+        adv_keys.index(cli_mod._BACK),
+        main_keys.index("quit"),
+    ]))
+
+    assert run_menu(_menu_args()) == 0
+    out = capsys.readouterr().out
+    assert "harness menu" in out
 
 
 def test_run_menu_diagnose_builds_argv(tmp_path, monkeypatch, capsys):
@@ -333,7 +549,11 @@ def test_run_menu_diagnose_builds_argv(tmp_path, monkeypatch, capsys):
         built.append(argv)
         return 0
 
-    monkeypatch.setattr(menu_mod, "select", _scripted_select([1, 0, 9]))
+    # diagnose -> pick h1 (target list index 0) -> quit
+    main_keys = [k for k, _ in cli_mod._MAIN_ACTIONS]
+    monkeypatch.setattr(menu_mod, "select",
+                        _scripted_select([main_keys.index("diagnose"), 0,
+                                          main_keys.index("quit")]))
     # The symptom prompt is optional: an empty answer falls back to the
     # default evidence-driven symptom.
     monkeypatch.setattr(menu_mod, "ask_text", lambda prompt, **kw: "")
@@ -358,7 +578,10 @@ def test_run_menu_diagnose_uses_typed_symptom(tmp_path, monkeypatch):
         built.append(argv)
         return 0
 
-    monkeypatch.setattr(menu_mod, "select", _scripted_select([1, 0, 9]))
+    main_keys = [k for k, _ in cli_mod._MAIN_ACTIONS]
+    monkeypatch.setattr(menu_mod, "select",
+                        _scripted_select([main_keys.index("diagnose"), 0,
+                                          main_keys.index("quit")]))
     monkeypatch.setattr(menu_mod, "ask_text",
                         lambda prompt, **kw: ("amber light on power rail"
                                               if "Symptom" in prompt else ""))
@@ -386,8 +609,8 @@ def test_menu_runs_verdict_view(tmp_path, monkeypatch, capsys):
     base = _fake_run_dir(tmp_path, "abc123", {
         "diagnosis.json": '{"state": "healthy", "confidence": 0.8}'})
     args = SimpleNamespace(out_dir=str(base / "harness_runs"))
-    # 0 = run, 0 = verdict, 4 = back
-    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 0, 4]))
+    # 0 = run, 0 = verdict, 6 = back
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 0, 6]))
     assert _menu_runs(args) == 0
     out = capsys.readouterr().out
     assert "healthy" in out
@@ -399,8 +622,8 @@ def test_menu_runs_prompt_turns_view(tmp_path, monkeypatch, capsys):
         "prompt_turns.jsonl": '{"turn": 1, "messages": [{"role": "user", '
                               '"content": "evidence block"}]}\n'})
     args = SimpleNamespace(out_dir=str(base / "harness_runs"))
-    # 0 = run, 2 = prompt, 0 = turn 1, 4 = back
-    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 2, 0, 4]))
+    # 0 = run, 2 = prompt, 0 = turn 1, 6 = back
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 2, 0, 6]))
     assert _menu_runs(args) == 0
     assert "evidence block" in capsys.readouterr().out
 
@@ -410,8 +633,8 @@ def test_menu_runs_dumps_view(tmp_path, monkeypatch, capsys):
     base = _fake_run_dir(tmp_path, "ghi789", {
         "dumps/ipmi_0.txt": "sensor data here"})
     args = SimpleNamespace(out_dir=str(base / "harness_runs"))
-    # 0 = run, 3 = dumps, 0 = first dump file, 4 = back
-    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 3, 0, 4]))
+    # 0 = run, 3 = dumps, 0 = first dump file, 6 = back
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 3, 0, 6]))
     assert _menu_runs(args) == 0
     assert "sensor data here" in capsys.readouterr().out
 
@@ -426,12 +649,272 @@ def test_menu_runs_empty(tmp_path, monkeypatch, capsys):
 
 def test_menu_runs_missing_artifact(tmp_path, monkeypatch, capsys):
     from harness.operator import menu as menu_mod
-    base = _fake_run_dir(tmp_path, "jkl012", {})
+    base = _fake_run_dir(tmp_path, "jkl012", {
+        "pending_case.json": '{"run_id": "jkl012", "target_id": "x", '
+                             '"symptom": "?"}'})
     args = SimpleNamespace(out_dir=str(base / "harness_runs"))
-    # 0 = run, 2 = prompt (missing artifact), 4 = back
-    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 2, 4]))
+    # 0 = run, 2 = prompt (missing artifact), 4 = fix, 6 = back
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 2, 4, 6]))
     assert _menu_runs(args) == 0
     assert "no prompt artifact" in capsys.readouterr().out
+
+
+# ---- run listing labels / run metadata ----
+
+def test_is_run_dir_filters_reserved_and_requires_artifacts(tmp_path):
+    base = tmp_path / "harness_runs"
+    for name in ("sessions", "cases", "secrets", "calibration"):
+        (base / name).mkdir(parents=True)
+        (base / name / "audit.jsonl").write_text("{}\n", encoding="utf-8")
+    (base / "abc").mkdir()
+    (base / "abc" / "audit.jsonl").write_text("{}\n", encoding="utf-8")
+    (base / "dumps_only").mkdir()
+    (base / "dumps_only" / "dumps").mkdir()
+    (base / "empty").mkdir()
+    assert cli_mod._is_run_dir(base / "abc")
+    assert cli_mod._is_run_dir(base / "dumps_only")
+    for name in ("sessions", "cases", "secrets", "calibration"):
+        assert not cli_mod._is_run_dir(base / name), name
+    assert not cli_mod._is_run_dir(base / "empty")
+
+
+def test_summarize_run_full_metadata_and_fallback(tmp_path):
+    base = tmp_path / "harness_runs"
+    run = base / "abc"
+    run.mkdir(parents=True)
+    (run / "audit.jsonl").write_text(json.dumps({
+        "kind": "run_start", "ts": "2026-08-11T21:08:41+00:00",
+        "payload": {"host": "Q63-cable2", "rack": "Q63", "cable": "2",
+                    "symptom": "no post"}}) + "\n", encoding="utf-8")
+    (run / "diagnosis.json").write_text(
+        '{"state": "fault", "confidence": 0.92}', encoding="utf-8")
+    (run / "run_meta.json").write_text('{"serial": "4CX1234"}',
+                                       encoding="utf-8")
+    cases = base / "cases"
+    cases.mkdir()
+    (cases / "abc.json").write_text(json.dumps({
+        "outcome": "fixed", "actions_taken": ["reseated CPU B"]}),
+        encoding="utf-8")
+
+    label = cli_mod._summarize_run(run, cases)
+    assert "2026-08-11 21:08" in label
+    assert "Q63-cable2 (rack Q63 cable 2)" in label
+    assert "SN:4CX1234" in label
+    assert "FAULT 92%" in label
+    assert "fixed: reseated CPU B" in label
+
+    bare = base / "xyz"
+    bare.mkdir()
+    assert cli_mod._summarize_run(bare, cases) == "xyz"
+
+
+def test_summarize_run_serial_falls_back_to_fru_dump(tmp_path):
+    base = tmp_path / "harness_runs"
+    run = base / "abc"
+    (run / "dumps").mkdir(parents=True)
+    (run / "dumps" / "ipmi_0.txt").write_text(
+        "Product Name: PowerEdge R650\nProduct Serial :  4CX9ZZ7\n",
+        encoding="utf-8")
+    assert "SN:4CX9ZZ7" in cli_mod._summarize_run(run, base / "cases")
+
+
+def test_write_run_meta_captures_target_and_serial(tmp_path):
+    out = tmp_path / "run1"
+    (out / "dumps").mkdir(parents=True)
+    (out / "dumps" / "ipmi_0.txt").write_text("Product Serial : 4CX1234\n",
+                                              encoding="utf-8")
+    target = SimpleNamespace(
+        label="Q63-cable2", console=SimpleNamespace(rack="Q63", cable="2"))
+    cli_mod._write_run_meta(out, target, SimpleNamespace(model="r650"), "sess1")
+    meta = json.loads((out / "run_meta.json").read_text(encoding="utf-8"))
+    assert meta["serial"] == "4CX1234"
+    assert meta["host"] == "Q63-cable2"
+    assert meta["rack"] == "Q63" and meta["cable"] == "2"
+    assert meta["model"] == "r650"
+    assert meta["session_id"] == "sess1"
+
+
+def test_synthesize_case_from_diagnosis_and_audit(tmp_path):
+    run = tmp_path / "abc"
+    run.mkdir()
+    (run / "audit.jsonl").write_text(json.dumps({
+        "kind": "run_start", "ts": "2026-08-11T21:08:41+00:00",
+        "payload": {"host": "Q63-cable2", "symptom": "no post"}}) + "\n",
+        encoding="utf-8")
+    (run / "diagnosis.json").write_text(json.dumps({
+        "state": "fault", "confidence": 0.9,
+        "subsystems_considered": ["cpu"],
+        "actions": [{"step": 1, "action": "Reseat CPU"}],
+        "evidence": [{"mnemonic": "MSR_0", "raw_hex": "0x0"}],
+    }), encoding="utf-8")
+
+    case = cli_mod._synthesize_case(run)
+    assert case is not None
+    assert case.run_id == "abc"
+    assert case.symptom == "no post"
+    assert case.actions_recommended == ["1. Reseat CPU"]
+    assert case.subsystem_primary == "cpu"
+    assert case.outcome == "unknown"
+    assert cli_mod._synthesize_case(tmp_path / "nothing-here") is None
+
+
+def test_print_run_fix_recommended_vs_labeled(tmp_path, capsys):
+    run = tmp_path / "abc"
+    run.mkdir()
+    (run / "pending_case.json").write_text(json.dumps({
+        "actions_recommended": ["1. Reseat CPU B"]}), encoding="utf-8")
+    cases = tmp_path / "cases"
+    cases.mkdir()
+    (cases / "abc.json").write_text(json.dumps({
+        "outcome": "fixed",
+        "actions_taken": ["replaced CPU B", "updated BIOS"]}),
+        encoding="utf-8")
+
+    cli_mod._print_run_fix(run, cases)
+    out = capsys.readouterr().out
+    assert "1. Reseat CPU B" in out
+    assert "replaced CPU B" in out
+    assert "updated BIOS" in out
+    assert "outcome: fixed" in out
+
+    bare = tmp_path / "xyz"
+    bare.mkdir()
+    cli_mod._print_run_fix(bare, cases)
+    assert "not labeled yet" in capsys.readouterr().out
+
+
+# ---- labeling (learning-loop ground truth) ----
+
+def _seed_run(base, run_id):
+    from harness.audit.auditlog import AuditLog
+    run = base / run_id
+    run.mkdir(parents=True)
+    (run / "pending_case.json").write_text(json.dumps({
+        "run_id": run_id, "target_id": "Q63-cable2", "symptom": "no post",
+        "actions_recommended": ["1. Reseat CPU B"], "llm_ident": "stub",
+        "outcome": "unknown"}), encoding="utf-8")
+    AuditLog(run / "audit.jsonl").append(
+        run_id, "run_start", {"host": "Q63-cable2", "symptom": "no post",
+                              "rack": "Q63", "cable": "2"})
+    return run
+
+
+def test_label_run_records_outcome_and_fix(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    run = _seed_run(tmp_path / "runs", "abc")
+    cases = tmp_path / "cases"
+
+    assert cli_mod._label_run(run, cases, outcome="fixed",
+                              taken=["replaced CPU B"]) == 0
+    case = json.loads((cases / "abc.json").read_text(encoding="utf-8"))
+    assert case["outcome"] == "fixed"
+    assert case["actions_taken"] == ["replaced CPU B"]
+    assert case["symptom"] == "no post"
+
+
+def test_label_run_refuses_second_record_without_revise(tmp_path, monkeypatch,
+                                                        capsys):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    run = _seed_run(tmp_path / "runs", "abc")
+    cases = tmp_path / "cases"
+    assert cli_mod._label_run(run, cases, outcome="fixed",
+                              taken=["replaced CPU B"]) == 0
+    rc = cli_mod._label_run(run, cases, outcome="partial", taken=["x"])
+    assert rc == 1
+    assert "already recorded" in capsys.readouterr().err
+    case = json.loads((cases / "abc.json").read_text(encoding="utf-8"))
+    assert case["outcome"] == "fixed"  # unchanged
+
+
+def test_label_run_revise_replaces_and_audits(tmp_path, monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    run = _seed_run(tmp_path / "runs", "abc")
+    cases = tmp_path / "cases"
+    assert cli_mod._label_run(run, cases, outcome="fixed",
+                              taken=["replaced CPU B"]) == 0
+    assert cli_mod._label_run(run, cases, outcome="partial",
+                              taken=["reseated CPU B"], revise=True) == 0
+    case = json.loads((cases / "abc.json").read_text(encoding="utf-8"))
+    assert case["outcome"] == "partial"
+    kinds = [json.loads(line)["kind"]
+             for line in (run / "audit.jsonl").read_text(encoding="utf-8")
+             .splitlines() if line.strip()]
+    assert kinds == ["run_start", "case_record", "case_revised"]
+
+
+def test_label_run_synthesizes_for_old_runs(tmp_path, monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    run = tmp_path / "runs" / "old1"
+    run.mkdir(parents=True)
+    from harness.audit.auditlog import AuditLog
+    AuditLog(run / "audit.jsonl").append(
+        "old1", "run_start", {"host": "Q63-cable2", "symptom": "no post"})
+    (run / "diagnosis.json").write_text(json.dumps({
+        "state": "fault", "confidence": 0.9,
+        "subsystems_considered": ["cpu"],
+        "actions": [{"step": 1, "action": "Reseat CPU"}]}),
+        encoding="utf-8")
+    cases = tmp_path / "cases"
+    assert cli_mod._label_run(run, cases, outcome="fixed",
+                              taken=["replaced CPU"]) == 0
+    case = json.loads((cases / "old1.json").read_text(encoding="utf-8"))
+    assert case["actions_recommended"] == ["1. Reseat CPU"]
+    assert case["outcome"] == "fixed"
+
+
+def test_label_run_defers_on_blank_outcome(tmp_path, monkeypatch, capsys):
+    from harness.operator import menu as menu_mod
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    # the picker offers the four outcomes + a defer row; pick the defer row
+    monkeypatch.setattr(menu_mod, "select",
+                        lambda title, options, **kw: len(options) - 1)
+    run = _seed_run(tmp_path / "runs", "abc")
+    cases = tmp_path / "cases"
+    assert cli_mod._label_run(run, cases, allow_defer=True) == 0
+    assert "deferred" in capsys.readouterr().out
+    assert not (cases / "abc.json").exists()
+
+
+def test_should_prompt_label_gating(monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    assert cli_mod._should_prompt_label(
+        SimpleNamespace(label_prompt=True, interactive=False))
+    assert cli_mod._should_prompt_label(
+        SimpleNamespace(label_prompt=False, interactive=True))
+    assert not cli_mod._should_prompt_label(
+        SimpleNamespace(label_prompt=False, interactive=False))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    assert not cli_mod._should_prompt_label(
+        SimpleNamespace(label_prompt=True, interactive=False))
+
+
+def test_prompt_label_after_run_defers_on_blank(tmp_path, monkeypatch, capsys):
+    from harness.operator import menu as menu_mod
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr(menu_mod, "ask_text", lambda prompt, **kw: "")
+    run = _seed_run(tmp_path / "runs", "abc")
+    cli_mod._prompt_label_after_run(run, tmp_path / "cases")
+    assert "deferred" in capsys.readouterr().out
+    assert not (tmp_path / "cases" / "abc.json").exists()
+
+
+def test_run_label_cli_status_and_non_interactive(tmp_path, capsys):
+    base = tmp_path / "harness_runs"
+    _seed_run(base, "abc")
+    cases = str(tmp_path / "cases")
+    parser = cli_mod.build_parser()
+
+    argv = ["label", "--run", "abc", "--out-dir", str(base), "--cases", cases]
+    assert cli_mod.run_label(parser.parse_args(argv + ["--status"])) == 1
+
+    assert cli_mod.run_label(parser.parse_args(
+        argv + ["--outcome", "fixed", "--taken", "replaced CPU B"])) == 0
+    case = json.loads((tmp_path / "cases" / "abc.json").read_text(encoding="utf-8"))
+    assert case["outcome"] == "fixed"
+
+    capsys.readouterr()
+    assert cli_mod.run_label(parser.parse_args(argv + ["--status"])) == 0
+    assert '"outcome": "fixed"' in capsys.readouterr().out
 
 
 def test_pick_target_named_host(tmp_path, monkeypatch, capsys):
@@ -544,7 +1027,7 @@ def test_poll_backspace_redraws_with_active_prompt(capsys):
     out = capsys.readouterr().out
     assert line == "Q"
     assert "? Rack id (e.g. Q61) " in out
-    assert "\x1b[K? Rack id (e.g. Q61) " in out  # redraw clears with active prompt
+    assert "\x1b[J? Rack id (e.g. Q61) " in out  # redraw clears with active prompt
     assert "\rharness> " not in out
 
 
@@ -558,7 +1041,7 @@ def test_ask_text_backspace_fix_keeps_prompt(capsys, monkeypatch):
     result = ask_text("Rack id (e.g. Q61)")
     out = capsys.readouterr().out
     assert result == "Q1"
-    assert "\x1b[K? Rack id (e.g. Q61) " in out
+    assert "\x1b[J? Rack id (e.g. Q61) " in out
     assert "\rharness> " not in out
 
 

@@ -155,7 +155,8 @@ class CaseOutcome(BaseModel):
     ``outcome`` in ("fixed", "partial", "not_fixed") count as verified
     (``inconclusive``/``unknown`` are unverified). ``llm_ident`` records WHICH
     model produced the diagnosis so calibration stays per-model (swap-safe).
-    Written once via ``CaseStore``; nothing here is ever overwritten.
+    Written via ``CaseStore`` (append-only; an operator correction may replace
+    a record with an audited ``case_revised`` event).
     """
 
     schema_version: int = 1

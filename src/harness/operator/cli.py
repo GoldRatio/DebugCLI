@@ -52,6 +52,7 @@ hash-chained log, secrets redacted).
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
 import json
 import os
@@ -60,6 +61,7 @@ import shlex
 import sys
 from collections.abc import Callable
 from dataclasses import asdict, replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
@@ -71,7 +73,14 @@ from ..config.inventory_lint import load_inventory
 from ..config.models import ConsoleDomain, Host, Inventory
 from ..config.vault import DirSecretStore, MemorySecretStore, SecretStore
 from ..diagnosis.engine import DiagnosticEngine, EngineContext
-from ..diagnosis.llm import GeminiLLM, OpenAICompatLLM, StubLLM
+from ..diagnosis.llm import (
+    GeminiLLM,
+    LLMError,
+    LocalLLM,
+    OpenAICompatLLM,
+    StubLLM,
+    list_models,
+)
 from ..diagnosis.parts_validate import PartsValidator
 from ..diagnosis.schema import Diagnosis
 from ..diagnosis.scorer import evidence_fit_from_dumps, score_diagnosis
@@ -90,6 +99,7 @@ from ..engine.sol import (
     _absolutize_bmc_i2c_tools,
     validate_serial_probe,
 )
+from ..engine.tunnel import LLMForward, TunnelError, parse_tunnel_spec
 from ..inspect.base import RegisterDump
 from ..inspect.collectors.bmc_console import BmcConsoleCollector
 from ..inspect.collectors.ipmi import IpmiCollector
@@ -101,6 +111,7 @@ from ..plan.profile import plan_collection
 from ..platforms import family_for
 from ..targets import TargetError, TargetSpec, resolve_target
 from ..targets.aliases import AliasError, TargetAlias, load_targets, save_targets
+from . import ui
 from .credential_gate import apply_ssh_context
 
 # ---- helpers ----
@@ -163,15 +174,19 @@ def _resolve_profile(args, inv: Inventory) -> object:
     """Resolve the effective LLM profile under the shared precedence.
 
     ``--llm-model <ident>`` > ``--llm <provider>`` > persisted current model
-    (``config/models.yaml``) > inventory ``llm`` block > default. Both
-    ``_resolve_llm`` and ``_llm_ident_for`` go through here so the live adapter
-    and its calibration ident can never drift apart.
+    (``config/models.yaml``) > inventory ``llm`` block > default. An explicit
+    ``--llm-url`` overrides the endpoint of whichever profile resolves (and
+    ``--llm-tunnel`` rewrites ``args.llm_url`` to the forward's local URL in
+    ``_prepare_llm_endpoint``). Both ``_resolve_llm`` and ``_llm_ident_for``
+    go through here so the live adapter and its calibration ident can never
+    drift apart.
     """
     from ..config.model_catalog import ModelCatalog
 
     catalog = ModelCatalog.load(inv=inv)
     return catalog.resolve(provider=getattr(args, "llm", None),
-                           model_id=getattr(args, "llm_model", None))
+                           model_id=getattr(args, "llm_model", None),
+                           url=getattr(args, "llm_url", None))
 
 
 def _resolve_llm(args, inv: Inventory, store: SecretStore) -> object:
@@ -185,11 +200,92 @@ def _llm_ident_for(args, inv: Inventory) -> str:
     """Stable identity of the resolved LLM backend (calibration key).
 
     Matches ``_resolve_llm`` resolution order; e.g. ``stub``,
-    ``openai/gpt-4o`` or ``gemini/gemini-2.5-flash``. The ident is what the
-    per-model calibration store is keyed on -- it must not change for the same
-    configured model, or calibration silently goes inactive (0.5).
+    ``openai/gpt-4o``, ``local/Qwen2.5-7B-Instruct`` or
+    ``gemini/gemini-2.5-flash``. The ident is what the per-model calibration
+    store is keyed on -- it must not change for the same configured model, or
+    calibration silently goes inactive (0.5).
     """
     return _resolve_profile(args, inv).ident
+
+
+def _preflight_llm_url(url: str) -> None:
+    """Fast reachability probe for an explicit ``--llm-url`` before any
+    collecting starts: a diagnosis costs register dumps; a dead endpoint must
+    fail in milliseconds, not after the pipeline is up."""
+    try:
+        list_models(url, timeout=10.0)
+    except LLMError as exc:
+        raise RuntimeError(
+            f"LLM endpoint {url} unreachable ({exc}). Run "
+            f"`harness llm check --url {url}` for staged diagnostics.") from exc
+
+
+def _prepare_llm_endpoint(args, inv: Inventory, store: SecretStore):
+    """Per-run LLM endpoint setup (``--llm-tunnel`` / ``--llm-url``).
+
+    Tunnel mode opens an ``LLMForward`` through the inventory's rack manager
+    and rewrites ``args.llm_url`` to the forward's local URL so every adapter
+    resolution binds to it. Direct URLs get a reachability preflight. Returns
+    the open forward (or None); it is tracked in ``_ACTIVE_LLM_FORWARDS`` so
+    ``_close_llm_forwards`` can tear it down deterministically at run end, and
+    an atexit hook guarantees no hop outlives the process.
+    """
+    tunnel_spec = getattr(args, "llm_tunnel", None)
+    if not tunnel_spec:
+        url = getattr(args, "llm_url", None)
+        if url:
+            _preflight_llm_url(url)
+        return None
+    target_host, target_port = parse_tunnel_spec(tunnel_spec)
+    domain = inv.console_defaults
+    if domain is None:
+        raise RuntimeError(
+            "--llm-tunnel requires a fleet console_defaults block in the "
+            "inventory (the rack-manager SSH hop is the only path to nodes)")
+    forward = LLMForward(target_host, target_port, domain, store,
+                         timeout=float(getattr(args, "llm_timeout", 30.0)))
+    try:
+        args.llm_url = forward.start()
+    except TunnelError as exc:
+        forward.close()
+        raise _tunnel_failure(exc, f"{target_host}:{target_port}") from exc
+    _ACTIVE_LLM_FORWARDS.append(forward)
+    return forward
+
+
+_ACTIVE_LLM_FORWARDS: list = []
+
+
+def _close_llm_forwards() -> None:
+    """Tear down every open rack-manager forward (idempotent per instance)."""
+    while _ACTIVE_LLM_FORWARDS:
+        try:
+            _ACTIVE_LLM_FORWARDS.pop().close()
+        except Exception:  # noqa: BLE001, S110 - shutdown must never raise
+            pass
+
+
+atexit.register(_close_llm_forwards)
+
+
+def _tunnel_failure(exc: TunnelError, target: str) -> RuntimeError:
+    """Stage-specific operator guidance for a failed rack-manager forward."""
+    if exc.stage == "auth":
+        return RuntimeError(
+            f"rack-manager SSH hop failed: {exc} (check console_defaults "
+            "identity / known_hosts; `harness llm check --tunnel ...` "
+            "re-tests each stage)")
+    if exc.stage == "forward":
+        relay_port = 18000
+        return RuntimeError(
+            f"rack manager refused or could not route a channel to {target} "
+            f"(sshd forwarding disabled, or no route to the node): {exc}. "
+            "Fallback (reverse tunnel from the node): console onto the node "
+            "and run `ssh -fN -R 127.0.0.1:"
+            f"{relay_port}:127.0.0.1:<node-port> <relay-reachable-from-node>`, "
+            f"then pass --llm-url http://127.0.0.1:{relay_port}/v1 instead of "
+            "--llm-tunnel")
+    return RuntimeError(str(exc))
 
 
 def _console_overrides(domain: ConsoleDomain, args) -> ConsoleDomain:
@@ -557,11 +653,23 @@ def _audit_commands(log: AuditLog, trace: SessionTrace, runner) -> None:
         })
 
 
+def _confidence_bar(value: float) -> str:
+    """Tiny ASCII confidence meter, e.g. ``[#######---]``."""
+    filled = max(0, min(10, round(float(value) * 10)))
+    return "[" + "#" * filled + "-" * (10 - filled) + "]"
+
+
 def _print_diagnosis(diagnosis: Diagnosis, out: Path, session_id: str) -> None:
-    print(f"\n==== Diagnosis [{session_id}] ====")
-    print(f"state: {diagnosis.state.value}")
+    """Human verdict block. Styling is value-driven (green healthy / red
+    fault, risk-colored action tags); asserted substrings stay contiguous."""
+    state_value = diagnosis.state.value
+    state_style = (ui.good if state_value == "healthy"
+                   else ui.warn if state_value == "degraded" else ui.bad)
+    print(ui.heading(f"\n==== Diagnosis [{session_id}] ===="))
+    print(state_style(f"state: {state_value}"))
     print(diagnosis.diagnosis)
-    print(f"confidence: {diagnosis.confidence}")
+    bar = ui.dim(_confidence_bar(diagnosis.confidence))
+    print(f"{ui.bold(f'confidence: {diagnosis.confidence}')}  {bar}")
     if diagnosis.confidence_breakdown is not None:
         b = diagnosis.confidence_breakdown
         parts = [f"retrieval_citation_support={b.retrieval_citation_support}",
@@ -570,26 +678,31 @@ def _print_diagnosis(diagnosis: Diagnosis, out: Path, session_id: str) -> None:
         if b.root_cause_certainty is not None:
             parts.append(f"root_cause_certainty={b.root_cause_certainty}")
         parts.append(f"penalty={b.penalty}")
-        print("  " + " ".join(parts))
+        print(ui.dim("  " + " ".join(parts)))
     if diagnosis.failure_point is not None:
         fp = diagnosis.failure_point
         suspects = ", ".join(fp.suspects) if fp.suspects else "(no documented suspect set)"
         probe_note = ("isolation probes ran" if fp.isolation_ran
                       else "no isolation evidence collected")
-        print(f"failure point (NOT a root cause yet): rail '{fp.rail_tokens}' "
-              f"suspects: {suspects}; {probe_note}")
+        print(ui.warn(f"failure point (NOT a root cause yet): rail '{fp.rail_tokens}' "
+                      f"suspects: {suspects}; {probe_note}"))
     if diagnosis.unknown_registers:
-        print(f"unknown registers (manual lookup): {', '.join(diagnosis.unknown_registers)}")
+        print(ui.dim(
+            f"unknown registers (manual lookup): {', '.join(diagnosis.unknown_registers)}"))
     if diagnosis.parts_discrepancies:
-        print("parts discrepancies:")
+        print(ui.bold("parts discrepancies:"))
         for d in diagnosis.parts_discrepancies:
             print(f"  - {d}")
-    print("repair action list (recommendations only; no raw writes are ever made):")
+    risk_style = {"none": lambda s: s, "low": ui.good,
+                  "medium": ui.warn, "high": ui.bad}
+    print(ui.bold("repair action list (recommendations only; no raw writes "
+                  "are ever made):"))
     for action in diagnosis.actions:
-        print(f"  {action.step}. [{action.risk.value}] {action.action} "
+        tag = risk_style.get(action.risk.value, lambda s: s)(action.risk.value)
+        print(f"  {action.step}. [{tag}] {action.action} "
               f"(tool: {action.required_tool}, impact: {action.impact})")
-        print(f"     {action.rationale}")
-    print(f"\noutputs: {out}")
+        print(ui.dim(f"     {action.rationale}"))
+    print(f"\n{ui.dim(f'outputs: {out}')}")
 
 
 # ---- subcommands ----
@@ -699,6 +812,11 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
     overrides = overrides or {}
     inv = load_inventory(args.inventory)
     store = overrides.get("store") or _make_store(args)
+    # LLM endpoint setup (tunnel / preflight) before anything expensive: a bad
+    # --llm-url / --llm-tunnel must fail in milliseconds, not after collection.
+    llm_forward = None
+    if overrides.get("llm_forward") is None:
+        llm_forward = _prepare_llm_endpoint(args, inv, store)
     target = _resolve_target_from_args(args, inv, store)
     apply_ssh_context(store, target, ssh_user=getattr(args, "ssh_user", "diagbot"))
     host: Host = target.host
@@ -1009,12 +1127,18 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
     _seat_pending_case(out, diagnosis, target.label, ident, symptom,
                        trace.session_id,
                        test_log_failures=(test_log_case_terms or []))
+    _write_run_meta(out, target, host, trace.session_id)
     print(f"\npending case: {out / 'pending_case.json'}")
     print("close the learning loop after the repair with:")
-    print(f"  harness report --run {trace.session_id} --outcome fixed "
-          f"[--taken \"...\"]")
+    print(f"  harness label --run {trace.session_id}")
+    print(f"  (or: harness report --run {trace.session_id} --outcome fixed "
+          f"[--taken \"...\"])")
 
     _print_diagnosis(diagnosis, out, trace.session_id)
+    if _should_prompt_label(args):
+        _prompt_label_after_run(out, out.parent / "cases")
+    if llm_forward is not None:
+        llm_forward.close()          # the hop lives exactly as long as the run
     return diagnosis
 
 
@@ -1241,8 +1365,12 @@ def run_report(args) -> int:
     inconclusive} [--taken ...] [--cases <dir>]`` fills the run's
     ``pending_case.json`` (seeded at the end of every diagnosis) with the
     operator-reported outcome and the actions that were actually taken, then
-    persists it via the ``CaseStore`` (append-only: a second report for the same
-    run is rejected). ``--status`` prints any existing record for the run.
+    persists it via the ``CaseStore``. A second report for the same run is
+    rejected unless ``--revise`` is passed (operator correction: the record
+    is replaced and the change is audited as ``case_revised``).
+    ``--status`` prints any existing record for the run.
+    For the interactive version (prefilled fix, runs menu integration) use
+    ``harness label`` instead.
     """
     from ..diagnosis.case_store import CaseStore
     from ..diagnosis.schema import CaseOutcome
@@ -1277,7 +1405,8 @@ def run_report(args) -> int:
            "created_at": "",  # CaseStore stamps it
         })
     try:
-        path = store.record(record, audit=AuditLog(run_dir / "audit.jsonl"))
+        path = store.record(record, audit=AuditLog(run_dir / "audit.jsonl"),
+                            revise=bool(getattr(args, "revise", False)))
     except (FileExistsError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -1285,6 +1414,36 @@ def run_report(args) -> int:
           f"llm={record.llm_ident} evidence_hash={record.evidence_hash[:12]}")
     print(f"  {path}")
     return 0
+
+
+def run_label(args) -> int:
+    """Label a run with the verified outcome + the correct fix (learning-loop
+    ground truth).
+
+    ``harness label --run <run_id|path> [--outcome ...] [--taken ...]
+    [--revise]`` -- with no outcome/fix flags it prompts interactively,
+    prefilling the fix with the run's top recommendation (Enter accepts it,
+    type over it when the recommendation was wrong). Old runs without
+    ``pending_case.json`` are synthesized from diagnosis.json + audit.
+    ``--status`` prints any existing record for the run.
+    """
+    from ..diagnosis.case_store import CaseStore
+
+    run_arg = Path(args.run)
+    run_dir = run_arg if run_arg.is_dir() else Path(args.out_dir) / args.run
+    if not run_dir.is_dir():
+        print(f"no such run directory: {run_dir}", file=sys.stderr)
+        return 1
+    if args.status:
+        record = CaseStore(args.cases).get(run_dir.name)
+        if record is None:
+            print(f"no case record for run {run_dir.name!r}", file=sys.stderr)
+            return 1
+        print(record.model_dump_json(indent=2))
+        return 0
+    return _label_run(run_dir, Path(args.cases), outcome=args.outcome,
+                      taken=list(args.taken) or None, verdict=args.verdict,
+                      revise=args.revise)
 
 
 def _model_from_audit(audit_path: Path) -> tuple[str | None, str | None]:
@@ -1360,19 +1519,26 @@ def run_priors_update(args) -> int:
 
 
 def _eval_llm(args) -> tuple:
-    """LLM backend for eval replay: ``--llm {stub,openai,gemini}`` only.
+    """LLM backend for eval replay: ``--llm {stub,openai,local,gemini}``.
 
     Eval needs no inventory; the adapter is constructed directly so a
     misconfigured pipeline reports a hard error instead of a silent pass.
+    ``--llm-url`` (or ``HARNESS_LLM_URL``) pins the endpoint; the ident keys
+    the replay into per-model calibration (e.g. ``local/Qwen2.5-7B-Instruct``).
     """
     provider = getattr(args, "llm", None) or "stub"
+    url = getattr(args, "llm_url", None)
     if provider == "stub":
         return StubLLM(), "stub"
+    model = os.environ.get("HARNESS_LLM_MODEL")
     if provider == "gemini":
-        model = os.environ.get("HARNESS_LLM_MODEL") or "gemini-2.5-flash"
+        model = model or "gemini-2.5-flash"
         return GeminiLLM(model=model), f"gemini/{model}"
-    model = os.environ.get("HARNESS_LLM_MODEL") or "harness-diag"
-    return OpenAICompatLLM(model=model), f"openai/{model}"
+    if provider == "local":
+        model = model or "harness-diag"
+        return LocalLLM(model=model, url=url), f"local/{model}"
+    model = model or "harness-diag"
+    return OpenAICompatLLM(model=model, url=url), f"openai/{model}"
 
 
 def run_eval(args) -> int:
@@ -1495,19 +1661,27 @@ _IP4_RE = re.compile(
 
 _BACK = "back"
 
+# Top-level menu: the two daily flows plus runs, everything else one hop down.
+# Action KEYS are stable (tests and argv building depend on them); only the
+# display labels are user-facing copy.
 _MAIN_ACTIONS: list[tuple[str, str]] = [
-    ("chat", "chat session  - natural language: describe symptoms, agent diagnoses"),
-    ("diagnose", "diagnose      - one-shot read-only diagnosis of a target"),
-    ("verify", "verify        - compare a run against a baseline"),
-    ("runs", "runs          - inspect a previous run (verdict, commands, prompt, dumps)"),
-    ("console", "console       - read-only probes over the serial console (lab/qa)"),
-    ("model", "model         - pick the LLM model for reasoning (remembered)"),
-    ("docs", "docs          - manage the RAG document library"),
-    ("targets", "targets       - manage short target aliases"),
-    ("secrets", "secrets       - register credentials (non-agent, never in prompts)"),
-    ("setup", "setup         - one-time wizard: API key, SSH key, inventory (first machine setup)"),
-    ("lint", "lint          - validate this inventory"),
-    ("quit", "quit"),
+    ("chat", "Chat session        describe symptoms in plain English; the agent debugs"),
+    ("diagnose", "Debug a target       one-shot read-only diagnosis of one machine"),
+    ("runs", "Inspect past runs    verdicts, commands, evidence from earlier diagnoses"),
+    ("advanced", "Advanced             verify - console - model - docs - targets - secrets - setup - lint"),
+    ("quit", "Quit"),
+]
+
+_ADVANCED_ACTIONS: list[tuple[str, str]] = [
+    ("verify", "verify         compare a run against a baseline (post-repair check)"),
+    ("console", "console        read-only probes over the serial console (lab/qa)"),
+    ("model", "model          pick the LLM model for reasoning (remembered)"),
+    ("docs", "docs           manage the RAG document library"),
+    ("targets", "targets        manage short target aliases"),
+    ("secrets", "secrets        register credentials (non-agent, never in prompts)"),
+    ("setup", "setup          one-time wizard: API key, SSH key, inventory (first machine setup)"),
+    ("lint", "lint           validate this inventory"),
+    (_BACK, "Back to main menu"),
 ]
 
 _WIZARD_FLAGS: dict[str, str] = {
@@ -1591,7 +1765,7 @@ def _pick_inventory(args) -> Path | None:
                   file=sys.stderr)
             return None
     if len(found) == 1:
-        print(f"  inventory: {found[0]}")
+        print(ui.accent(f"  inventory: {found[0]}"))
         return found[0]
     idx = select("Inventory", [str(p) for p in found])
     return found[idx] if idx is not None else None
@@ -1880,6 +2054,228 @@ def _menu_secrets(args) -> int:
     return 0
 
 
+# ---- past-run inspection (runs menu) ----
+
+#: A directory must contain at least one of these to be a diagnosable run
+#: (``dumps/`` alone also qualifies). Reserved harness_runs subdirectories are
+#: never runs regardless of contents.
+_RUN_ARTIFACTS = ("audit.jsonl", "diagnosis.json", "trace.json",
+                  "pending_case.json", "run_meta.json", "prompt.txt",
+                  "prompt_turns.jsonl", "dumps.json")
+_RUN_RESERVED_DIRS = frozenset({"sessions", "cases", "secrets", "calibration"})
+
+#: ``Product Serial : 4CX1234`` from ``ipmitool fru print`` collector output.
+_FRU_SERIAL_RE = re.compile(r"Product Serial\s*:\s*(\S+)")
+
+
+def _is_run_dir(path: Path) -> bool:
+    if path.name in _RUN_RESERVED_DIRS or not path.is_dir():
+        return False
+    return any((path / m).exists() for m in _RUN_ARTIFACTS) \
+        or (path / "dumps").is_dir()
+
+
+def _run_start_event(run_dir: Path) -> tuple[dict, str | None]:
+    """(payload, ts) of the run's first audit event (run_start/console_start).
+
+    Tolerates missing/corrupt logs: returns ({}, None) instead of raising.
+    """
+    path = run_dir / "audit.jsonl"
+    if not path.exists():
+        return {}, None
+    try:
+        with path.open(encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                event = json.loads(line)
+                payload = event.get("payload")
+                return (payload if isinstance(payload, dict) else {},
+                        event.get("ts"))
+    except (json.JSONDecodeError, OSError):
+        return {}, None
+    return {}, None
+
+
+def _read_run_meta(run_dir: Path) -> dict:
+    """The small display-metadata file written at run end (may not exist)."""
+    path = run_dir / "run_meta.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _run_verdict(run_dir: Path) -> tuple[str | None, float | None]:
+    """(state, confidence) from the run's diagnosis.json, when readable."""
+    path = run_dir / "diagnosis.json"
+    if not path.exists():
+        return None, None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None, None
+    state = data.get("state")
+    conf = data.get("confidence")
+    return (state if isinstance(state, str) else None,
+            float(conf) if isinstance(conf, (int, float)) else None)
+
+
+#: BMCs report these placeholders when no serial is programmed: not a serial.
+_FRU_SERIAL_PLACEHOLDERS = frozenset({"n/a", "na", "none", "unknown", "0123456789"})
+
+
+def _clean_serial(value: str | None) -> str | None:
+    """The FRU serial, or None when it is a BMC placeholder."""
+    if not value:
+        return None
+    return None if value.strip().lower() in _FRU_SERIAL_PLACEHOLDERS \
+        else value.strip()
+
+
+def _serial_from_dumps(run_dir: Path) -> str | None:
+    """Machine serial from the FRU dump (fallback for runs written before
+    ``run_meta.json`` existed); scans ipmi dumps first, then the rest."""
+    dumps_dir = run_dir / "dumps"
+    if not dumps_dir.is_dir():
+        return None
+    files = sorted(dumps_dir.glob("ipmi*.txt")) + sorted(
+        p for p in dumps_dir.glob("*.txt") if not p.name.startswith("ipmi"))
+    for path in files:
+        try:
+            match = _FRU_SERIAL_RE.search(
+                path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        if match:
+            serial = _clean_serial(match.group(1))
+            if serial:
+                return serial
+    return None
+
+
+def _case_summary(run_dir: Path, cases_dir: Path) -> tuple[str | None, str | None]:
+    """(outcome, first action taken) from the run's labeled case record."""
+    path = cases_dir / f"{run_dir.name}.json"
+    if not path.exists():
+        return None, None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None, None
+    outcome = data.get("outcome")
+    taken = data.get("actions_taken") or []
+    first = str(taken[0]) if taken else None
+    return (outcome if isinstance(outcome, str) else None, first)
+
+
+def _summarize_run(run_dir: Path, cases_dir: Path | None = None) -> str:
+    """Compact identifying one-liner for the runs picker, e.g.::
+
+        2026-08-11 21:08 | Q63-cable2 (rack Q63 cable 2) | SN:4CX1234 | FAULT 92% | fixed: reseated CPU B
+
+    Fields drop out when unknown; a run with no metadata at all degenerates
+    to its directory name. The picker's type-to-filter matches any substring,
+    so rack/cable/serial/date tokens are all searchable.
+    """
+    if cases_dir is None:
+        cases_dir = run_dir.parent / "cases"
+    start, ts = _run_start_event(run_dir)
+    meta = _read_run_meta(run_dir)
+    when = str(ts or meta.get("ts") or "")[:16].replace("T", " ")
+    host = meta.get("host") or start.get("host")
+    rack = meta.get("rack") or start.get("rack")
+    cable = meta.get("cable") or start.get("cable")
+    where = host or None
+    if where and rack is not None and cable is not None:
+        where = f"{where} (rack {rack} cable {cable})"
+    serial = _clean_serial(meta.get("serial")) or _serial_from_dumps(run_dir)
+    state, confidence = _run_verdict(run_dir)
+    verdict = None
+    if state:
+        verdict = state.upper()
+        if confidence is not None:
+            verdict = f"{verdict} {round(confidence * 100)}%"
+    outcome, fix = _case_summary(run_dir, cases_dir)
+    fix_bit = (f"{outcome}: {fix}" if fix
+               else f"outcome: {outcome}" if outcome else None)
+    bits = [b for b in (when, where,
+                        f"SN:{serial}" if serial else None,
+                        verdict, fix_bit) if b]
+    return " | ".join(bits) if bits else run_dir.name
+
+
+def _print_run_header(run_dir: Path, cases_dir: Path) -> None:
+    """Context block shown after picking a run in the inspector."""
+    start, ts = _run_start_event(run_dir)
+    meta = _read_run_meta(run_dir)
+    state, confidence = _run_verdict(run_dir)
+    outcome, fix = _case_summary(run_dir, cases_dir)
+    serial = _clean_serial(meta.get("serial")) or _serial_from_dumps(run_dir)
+    rack = meta.get("rack") or start.get("rack")
+    cable = meta.get("cable") or start.get("cable")
+    verdict = None
+    if state:
+        verdict = state.upper()
+        if confidence is not None:
+            verdict = f"{verdict} {round(confidence * 100)}%"
+    print(f"---- run {run_dir.name} ----")
+    rows = [
+        ("dir", str(run_dir)),
+        ("date", ts or meta.get("ts")),
+        ("host", meta.get("host") or start.get("host")),
+        ("rack/cable", f"{rack} / {cable}"
+         if rack is not None and cable is not None else None),
+        ("serial", serial),
+        ("model", meta.get("model") or start.get("model")),
+        ("symptom", start.get("symptom")),
+        ("verdict", verdict),
+        ("fix", fix),
+        ("outcome", outcome),
+    ]
+    for label, value in rows:
+        if value:
+            print(f"  {label:<9} {value}")
+
+
+def _write_run_meta(out: Path, target, host, session_id: str) -> None:
+    """Write ``run_meta.json`` (display metadata) into a finished run dir.
+
+    Captures the machine serial parsed from the FRU collector output so the
+    runs menu never has to re-parse the full dumps just to show one label.
+    """
+    serial: str | None = None
+    dumps_dir = out / "dumps"
+    if dumps_dir.is_dir():
+        for path in sorted(dumps_dir.glob("*.txt")):
+            try:
+                match = _FRU_SERIAL_RE.search(
+                    path.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+            if match:
+                serial = _clean_serial(match.group(1))
+                if serial:
+                    break
+    meta: dict = {
+        "session_id": session_id,
+        "host": target.label,
+        "model": getattr(host, "model", None),
+        "ts": datetime.now(UTC).isoformat(),
+    }
+    console = getattr(target, "console", None)
+    if console is not None:
+        meta["rack"] = console.rack
+        meta["cable"] = console.cable
+    if serial:
+        meta["serial"] = serial
+    (out / "run_meta.json").write_text(json.dumps(meta, indent=2),
+                                       encoding="utf-8")
+
+
 def _print_artifact(path: Path) -> None:
     if not path.exists():
         print(f"  (missing: {path})")
@@ -1890,41 +2286,57 @@ def _print_artifact(path: Path) -> None:
 
 def _menu_runs(args) -> int:
     """Inspect a previous run end to end: verdict, command pathway, the exact
-    prompt(s) sent to the LLM, and the raw collector evidence."""
+    prompt(s) sent to the LLM, the raw collector evidence -- and label the
+    correct fix so the learning loop can consume the run.
+
+    Runs are listed with identifying one-liners (date, host, rack/cable,
+    serial, verdict, fix) instead of raw hash paths; type-to-filter matches
+    any substring of those.
+    """
     from .menu import select
 
     out_dir = Path(getattr(args, "out_dir", "harness_runs"))
-    runs = sorted((p for p in out_dir.glob("*") if p.is_dir()),
+    cases_dir = out_dir / "cases"
+    runs = sorted((p for p in out_dir.glob("*") if _is_run_dir(p)),
                   key=lambda p: p.stat().st_mtime, reverse=True)
     if not runs:
         print(f"  no runs yet under {out_dir}")
         return 0
-    pick = select("Run (most recent first)", [str(p) for p in runs])
-    if pick is None:
-        return 0
-    run_dir = runs[pick]
-    views = [
-        ("verdict", "verdict  - diagnosis.json (state, text, confidence, actions)"),
-        ("commands", "commands - trace.json (every command run, in order)"),
-        ("prompt", "prompt   - the exact prompt(s) sent to the LLM"),
-        ("dumps", "dumps    - raw collector evidence files"),
-        (_BACK, _BACK),
-    ]
     while True:
-        idx = select("Inspect", [label for _, label in views])
-        if idx is None:
+        pick = select("Run (most recent first)",
+                      [_summarize_run(p, cases_dir) for p in runs])
+        if pick is None:
             return 0
-        key = views[idx][0]
-        if key == _BACK:
-            return 0
-        if key == "verdict":
-            _print_artifact(run_dir / "diagnosis.json")
-        elif key == "commands":
-            _print_artifact(run_dir / "trace.json")
-        elif key == "prompt":
-            _print_run_prompt(run_dir)
-        elif key == "dumps":
-            _print_run_dumps(run_dir)
+        run_dir = runs[pick]
+        _print_run_header(run_dir, cases_dir)
+        views = [
+            ("verdict", "verdict  - diagnosis.json (state, text, confidence, actions)"),
+            ("commands", "commands - trace.json (every command run, in order)"),
+            ("prompt", "prompt   - the exact prompt(s) sent to the LLM"),
+            ("dumps", "dumps    - raw collector evidence files"),
+            ("fix", "fix      - recommended vs. labeled correct fix (learning loop)"),
+            ("label", "label    - record/revise the correct fix + outcome"),
+            (_BACK, _BACK),
+        ]
+        while True:
+            idx = select("Inspect", [label for _, label in views])
+            if idx is None:
+                return 0
+            key = views[idx][0]
+            if key == _BACK:
+                return 0
+            if key == "verdict":
+                _print_artifact(run_dir / "diagnosis.json")
+            elif key == "commands":
+                _print_artifact(run_dir / "trace.json")
+            elif key == "prompt":
+                _print_run_prompt(run_dir)
+            elif key == "dumps":
+                _print_run_dumps(run_dir)
+            elif key == "fix":
+                _print_run_fix(run_dir, cases_dir)
+            elif key == "label":
+                _label_run(run_dir, cases_dir)
 
 
 def _print_run_prompt(run_dir: Path) -> None:
@@ -1966,6 +2378,265 @@ def _print_run_dumps(run_dir: Path) -> None:
     _print_artifact(files[pick])
 
 
+def _print_run_fix(run_dir: Path, cases_dir: Path) -> None:
+    """Learning-loop view: what the LLM recommended vs. what actually fixed it."""
+    recommended: list[str] = []
+    pending = run_dir / "pending_case.json"
+    if pending.exists():
+        try:
+            data = json.loads(pending.read_text(encoding="utf-8"))
+            recommended = [str(a) for a in data.get("actions_recommended") or []]
+        except (json.JSONDecodeError, OSError):
+            recommended = []
+    if not recommended:
+        diag = run_dir / "diagnosis.json"
+        if diag.exists():
+            try:
+                data = json.loads(diag.read_text(encoding="utf-8"))
+                recommended = [
+                    f"{a.get('step', '?')}. {a.get('action', '')}"
+                    for a in data.get("actions", []) if isinstance(a, dict)]
+            except (json.JSONDecodeError, OSError):
+                recommended = []
+    print("---- recommended (what the LLM said) ----")
+    if not recommended:
+        print("  (no recommended actions recorded in this run)")
+    for line in recommended:
+        print(f"  {line}")
+    print("---- labeled (what actually fixed it) ----")
+    outcome, fix = _case_summary(run_dir, cases_dir)
+    if not outcome and not fix:
+        print("  (not labeled yet: use the 'label' view to record the correct fix)")
+        return
+    if fix:
+        print(f"  {fix}")
+    if outcome:
+        print(f"  outcome: {outcome}")
+    case_path = cases_dir / f"{run_dir.name}.json"
+    if case_path.exists():
+        try:
+            case = json.loads(case_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            case = None
+        if case:
+            for line in (case.get("actions_taken") or [])[1:]:
+                print(f"  {line}")
+            if case.get("verification_verdict"):
+                print(f"  verification: {case['verification_verdict']}")
+
+
+def _synthesize_case(run_dir: Path):
+    """Minimal ``CaseOutcome`` for old runs without ``pending_case.json``.
+
+    Rebuilds the deterministic pieces from the run's own artifacts
+    (diagnosis.json + audit run_start); returns None when there is nothing
+    to synthesize from.
+    """
+    from ..diagnosis.schema import CaseOutcome
+
+    start, _ts = _run_start_event(run_dir)
+    diag: dict = {}
+    diag_path = run_dir / "diagnosis.json"
+    if diag_path.exists():
+        try:
+            loaded = json.loads(diag_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                diag = loaded
+        except (json.JSONDecodeError, OSError):
+            diag = {}
+    if not diag and not start:
+        return None
+    model_key, model_source = _model_from_audit(run_dir / "audit.jsonl")
+    subsystems = diag.get("subsystems_considered") or []
+    evidence_hash = ""
+    if (run_dir / "dumps.json").exists():
+        try:
+            evidence_hash = _evidence_hash(run_dir / "dumps.json")
+        except OSError:
+            evidence_hash = ""
+    breakdown = diag.get("confidence_breakdown") or {}
+    return CaseOutcome(
+        run_id=run_dir.name,
+        target_id=str(start.get("host") or run_dir.name),
+        model_key=model_key,
+        model_source=model_source,
+        symptom=str(start.get("symptom") or "(unknown)"),
+        subsystem_primary=(subsystems[0] if subsystems else None),
+        actions_recommended=[
+            f"{a.get('step', '?')}. {a.get('action', '')}"
+            for a in diag.get("actions", []) if isinstance(a, dict)],
+        llm_ident="unknown",
+        evidence_hash=evidence_hash,
+        evidence_summary=[
+            f"- {d.get('mnemonic', '?')} = {d.get('raw_hex', '?')}"
+            for d in diag.get("evidence", []) if isinstance(d, dict)],
+        confidence=(diag.get("confidence")
+                    if isinstance(diag.get("confidence"), (int, float)) else None),
+        self_reported_confidence=(
+            breakdown.get("self_reported_confidence")
+            if isinstance(breakdown.get("self_reported_confidence"),
+                          (int, float)) else None),
+    )
+
+
+#: Verified outcomes an operator can label a run with (unknown = not labeled).
+_LABEL_OUTCOMES = ("fixed", "partial", "not_fixed", "inconclusive")
+
+_DEFER_HINT = "(defer - label it later from Inspect past runs)"
+
+
+def _label_run(run_dir: Path, cases_dir: Path, *, outcome: str | None = None,
+               taken: list[str] | None = None, verdict: str | None = None,
+               revise: bool = False, allow_defer: bool = False) -> int:
+    """Record the verified outcome + correct fix for a run: the learning
+    loop's ground truth (feeds case retrieval, priors and calibration).
+
+    Shared by the runs menu, the post-diagnosis prompt and ``harness label``.
+    Interactive prompts fill whatever the caller left None; a blank outcome
+    with ``allow_defer=True`` defers labeling (the run keeps its seeded
+    ``pending_case.json`` and can be labeled any time from the runs menu).
+    Returns a CLI-style exit code.
+    """
+    from ..diagnosis.case_store import CaseStore
+    from ..diagnosis.schema import CaseOutcome
+    from .menu import ask_text, confirm, select
+
+    pending = run_dir / "pending_case.json"
+    base: CaseOutcome | None = None
+    if pending.exists():
+        try:
+            base = CaseOutcome.model_validate_json(
+                pending.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - corrupt seed: synthesize instead
+            base = None
+    if base is None:
+        base = _synthesize_case(run_dir)
+    if base is None:
+        print(f"  cannot label {run_dir.name}: no pending_case.json, "
+              "diagnosis.json or audit.jsonl to seed the record from")
+        return 1
+
+    interactive = sys.stdin.isatty() and os.environ.get("HARNESS_NO_PROMPT") != "1"
+    store = CaseStore(cases_dir)
+    existing = store.get(run_dir.name)
+    if existing is not None and existing.outcome != "unknown" and not revise:
+        if not interactive:
+            print(f"error: case {run_dir.name!r} already recorded "
+                  f"(outcome={existing.outcome}); pass --revise to correct it",
+                  file=sys.stderr)
+            return 1
+        print(f"  already labeled: outcome={existing.outcome} "
+              f"fix={'; '.join(existing.actions_taken) or '(none)'}")
+        if not confirm("Revise this label? (overwrites the record)"):
+            print("  kept the existing label")
+            return 0
+        revise = True
+
+    if outcome is None:
+        if not interactive:
+            print("error: --outcome is required (fixed | partial | not_fixed | "
+                  "inconclusive)", file=sys.stderr)
+            return 1
+        options = list(_LABEL_OUTCOMES) + ([_DEFER_HINT] if allow_defer else [])
+        pick = select("Outcome", options)
+        if pick is None:
+            if allow_defer:
+                return 0
+            return 0
+        if allow_defer and pick == len(_LABEL_OUTCOMES):
+            print("  deferred: label later via 'Inspect past runs' > label")
+            return 0
+        outcome = _LABEL_OUTCOMES[pick] if pick < len(_LABEL_OUTCOMES) else None
+        if outcome is None:
+            print(f"  unknown outcome; pick one of {', '.join(_LABEL_OUTCOMES)}")
+            return _label_run(run_dir, cases_dir, outcome=None, taken=taken,
+                              verdict=verdict, revise=revise,
+                              allow_defer=allow_defer)
+    elif outcome not in _LABEL_OUTCOMES:
+        if interactive:
+            print(f"  unknown outcome {outcome!r}; pick one")
+            return _label_run(run_dir, cases_dir, outcome=None, taken=taken,
+                              verdict=verdict, revise=revise,
+                              allow_defer=allow_defer)
+        print(f"error: unknown outcome {outcome!r} "
+              f"(fixed | partial | not_fixed | inconclusive)", file=sys.stderr)
+        return 1
+
+    if taken is None:
+        taken = []
+        if interactive:
+            prefill = ""
+            for action in base.actions_recommended:
+                prefill = action
+                break
+            fix = ask_text("Correct fix (Enter = top recommendation was right)",
+                           default=prefill).strip()
+            if fix:
+                taken.append(fix)
+            while confirm("Add another fix line?"):
+                extra = ask_text("Fix detail").strip()
+                if not extra:
+                    break
+                taken.append(extra)
+    if not taken:
+        print("  (no fix text recorded: the case will carry the outcome only)")
+
+    record = CaseOutcome(
+        **{**base.model_dump(),
+           "run_id": run_dir.name,
+           "outcome": outcome,
+           "actions_taken": list(taken),
+           "verification_verdict": verdict,
+           "created_at": "",  # CaseStore stamps it
+           })
+    try:
+        audit_log = AuditLog(run_dir / "audit.jsonl")
+    except (json.JSONDecodeError, KeyError, OSError):
+        # corrupt/truncated audit chain on an old run: label without the
+        # audit linkage rather than refusing the ground-truth record
+        audit_log = None
+        print("  [label] warning: audit.jsonl unreadable; recording the case "
+              "without audit linkage")
+    try:
+        path = store.record(record, audit=audit_log,
+                            session_id=record.run_id, revise=revise)
+    except (FileExistsError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"recorded case {record.run_id}: outcome={record.outcome} "
+          f"fix={'; '.join(record.actions_taken) or '(none)'}")
+    print(f"  {path}")
+    print("rebuild the learned priors from labeled cases with: "
+          "harness priors update")
+    return 0
+
+
+def _should_prompt_label(args) -> bool:
+    """The post-diagnosis labeling prompt is opt-in so background chat runs
+    (REPL worker threads) never block on stdin: the interactive menu passes
+    ``--label-prompt`` and direct ``--interactive`` runs imply it."""
+    if not sys.stdin.isatty() or os.environ.get("HARNESS_NO_PROMPT") == "1":
+        return False
+    return bool(getattr(args, "label_prompt", False)
+                or getattr(args, "interactive", False))
+
+
+def _prompt_label_after_run(run_dir: Path, cases_dir: Path) -> None:
+    """Offer to label the fix right after a diagnosis completes; blank defers
+    (the seeded pending_case.json stays, the run shows as un-labeled in the
+    runs menu and can be labeled any time)."""
+    from .menu import ask_text
+
+    print()
+    answer = ask_text(
+        "Label the correct fix now? fixed/partial/not_fixed/inconclusive "
+        "(Enter = defer)").strip().lower()
+    if not answer:
+        print("  deferred: label later via 'Inspect past runs' > label")
+        return
+    _label_run(run_dir, cases_dir, outcome=answer)
+
+
 def run_menu(args) -> int:
     """Interactive launcher: pick the inventory, then drive every subcommand
     from one prompt. This is the default command when ``harness`` is run
@@ -1983,8 +2654,72 @@ def run_menu(args) -> int:
               "agent will ask you for each credential the moment it needs it "
               "(never through the model)", file=sys.stderr)
     console_default = bool(getattr(args, "console", False))
-    print(f"harness menu | inventory: {inv_path} | {len(inv.hosts)} host(s)"
-          + (" | console" if console_default else ""))
+    ui.enable_vt()
+    width = max(44, min(ui.terminal_width(), 78))
+    print(ui.rule(width))
+    console_tag = ui.dim("  console mode") if console_default else ""
+    print(f"  {ui.title('harness menu')}   "
+          f"{ui.dim(f'inventory: {inv_path} - {len(inv.hosts)} host(s)')}{console_tag}")
+    print(ui.rule(width))
+    print(ui.dim("  most days: Chat or Debug - everything else lives under Advanced"))
+
+    def _run_advanced() -> None:
+        """The housekeeping submenu; returns to the main menu on Back/Esc."""
+        while True:
+            choice = select("Advanced", [label for _, label in _ADVANCED_ACTIONS])
+            if choice is None:
+                return
+            key = _ADVANCED_ACTIONS[choice][0]
+            if key == _BACK:
+                return
+            try:
+                if key == "verify":
+                    spec = _pick_target(inv, store, args, console=console_default)
+                    if spec is None:
+                        continue
+                    baselines = _baselines(getattr(args, "out_dir", "harness_runs"))
+                    if not baselines:
+                        print("  no baseline yet: run a diagnosis first")
+                        continue
+                    pick = select("Baseline (most recent first)",
+                                  [str(p) for p in baselines])
+                    if pick is None:
+                        continue
+                    argv = ["verify", "--inventory", str(inv_path),
+                            "--symptom", "(menu verify)",
+                            "--baseline", str(baselines[pick])]
+                    argv += _target_argv(spec)
+                    argv += _wizard_flags(args, "verify")
+                    _run_wizard_sub(argv)
+                elif key == "console":
+                    spec = _pick_target(inv, store, args, console=True)
+                    if spec is None:
+                        continue
+                    probe = ask_text("Probe command (read-only)").strip()
+                    if not probe:
+                        print("  cancelled: no probe command")
+                        continue
+                    argv = ["console", "--inventory", str(inv_path),
+                            "--probe", probe]
+                    argv += _target_argv(spec)
+                    argv += _wizard_flags(args, "console")
+                    _run_wizard_sub(argv)
+                elif key == "model":
+                    _menu_model(inv)
+                elif key == "docs":
+                    _menu_docs(args)
+                elif key == "targets":
+                    _menu_targets(args)
+                elif key == "secrets":
+                    _menu_secrets(args)
+                elif key == "setup":
+                    _run_wizard_sub(["setup", "--inventory", str(inv_path)]
+                                    + _wizard_flags(args, "setup"))
+                elif key == "lint":
+                    _run_wizard_sub(["lint", "--inventory", str(inv_path)])
+            except KeyboardInterrupt:
+                print("  (interrupted)")
+
     while True:
         choice = select("What do you want to do?",
                         [label for _, label in _MAIN_ACTIONS])
@@ -1994,7 +2729,9 @@ def run_menu(args) -> int:
         if key == "quit":
             return 0
         try:
-            if key == "chat":
+            if key == "advanced":
+                _run_advanced()
+            elif key == "chat":
                 spec = _pick_target(inv, store, args, console=console_default)
                 argv = ["session", "--inventory", str(inv_path)]
                 if spec is not None:
@@ -2031,56 +2768,93 @@ def run_menu(args) -> int:
                     argv += ["--test-log", test_log]
                 argv += _target_argv(spec)
                 argv += _wizard_flags(args, "diagnose")
-                _run_wizard_sub(argv)
-            elif key == "verify":
-                spec = _pick_target(inv, store, args, console=console_default)
-                if spec is None:
-                    continue
-                baselines = _baselines(getattr(args, "out_dir", "harness_runs"))
-                if not baselines:
-                    print("  no baseline yet: run a diagnosis first")
-                    continue
-                pick = select("Baseline (most recent first)",
-                              [str(p) for p in baselines])
-                if pick is None:
-                    continue
-                argv = ["verify", "--inventory", str(inv_path),
-                        "--symptom", "(menu verify)",
-                        "--baseline", str(baselines[pick])]
-                argv += _target_argv(spec)
-                argv += _wizard_flags(args, "verify")
+                argv.append("--label-prompt")
                 _run_wizard_sub(argv)
             elif key == "runs":
                 _menu_runs(args)
-            elif key == "console":
-                spec = _pick_target(inv, store, args, console=True)
-                if spec is None:
-                    continue
-                probe = ask_text("Probe command (read-only)").strip()
-                if not probe:
-                    print("  cancelled: no probe command")
-                    continue
-                argv = ["console", "--inventory", str(inv_path),
-                        "--probe", probe]
-                argv += _target_argv(spec)
-                argv += _wizard_flags(args, "console")
-                _run_wizard_sub(argv)
-            elif key == "model":
-                _menu_model(inv)
-            elif key == "docs":
-                _menu_docs(args)
-            elif key == "targets":
-                _menu_targets(args)
-            elif key == "secrets":
-                _menu_secrets(args)
-            elif key == "setup":
-                _run_wizard_sub(["setup", "--inventory", str(inv_path)]
-                                + _wizard_flags(args, "setup"))
-            elif key == "lint":
-                _run_wizard_sub(["lint", "--inventory", str(inv_path)])
         except KeyboardInterrupt:
             print("  (interrupted)")
     return 0
+
+
+# ---- LLM endpoint preflight ----
+
+def _print_stages(stages: list[tuple[str, bool, str]]) -> None:
+    for name, ok, detail in stages:
+        print(f"  [{'ok ' if ok else 'FAIL'}] {name:<8} {detail}")
+
+
+def run_llm_check(args) -> int:
+    """Staged connectivity probe for an OpenAI-compatible LLM endpoint.
+
+    ``harness llm check [--url URL | --tunnel HOST:PORT --inventory PATH]
+    [--model ID] [--timeout S]``
+
+    Tunnel mode exercises each leg of the rack-manager hop (ssh auth ->
+    direct-tcpip forward -> HTTP) and, when forwarding is refused, prints the
+    reverse-tunnel fallback recipe. Direct mode probes reachability and lists
+    served models. Exit 0 = usable; 1 = failed stage; 2 = usage/config error.
+    """
+    url = getattr(args, "url", None)
+    tunnel_spec = getattr(args, "tunnel", None)
+    timeout = float(getattr(args, "timeout", 10.0))
+    want_model = getattr(args, "model", None)
+    forward = None
+    stages: list[tuple[str, bool, str]] = []
+    try:
+        if tunnel_spec:
+            target_host, target_port = parse_tunnel_spec(tunnel_spec)
+            inv_path = getattr(args, "inventory", None)
+            if not inv_path:
+                print("llm check: --tunnel needs --inventory (the rack-manager "
+                      "hop comes from its console_defaults block)", file=sys.stderr)
+                return 2
+            inv = load_inventory(inv_path)
+            if inv.console_defaults is None:
+                print("llm check: inventory has no console_defaults block "
+                      "(nothing to tunnel through)", file=sys.stderr)
+                return 2
+            store = _make_store(args)
+            print(f"rack manager: {inv.console_defaults.address}; "
+                  f"target: {target_host}:{target_port}")
+            forward = LLMForward(target_host, target_port,
+                                 inv.console_defaults, store, timeout=timeout)
+            try:
+                url = forward.start()
+                stages.append(("ssh", True,
+                               f"authenticated to {inv.console_defaults.address}"))
+                stages.append(("forward", True,
+                               f"{target_host}:{target_port} via {url}"))
+            except TunnelError as exc:
+                stages.append((exc.stage if exc.stage != "bind" else "local",
+                               False, str(exc)))
+                _print_stages(stages)
+                print(_tunnel_failure(exc, f"{target_host}:{target_port}"),
+                      file=sys.stderr)
+                return 1
+        elif not url:
+            url = os.environ.get("HARNESS_LLM_URL") or "http://127.0.0.1:8000/v1"
+        try:
+            ids = list_models(url, timeout=timeout)
+        except LLMError as exc:
+            stages.append(("http", False, str(exc)))
+            _print_stages(stages)
+            return 1
+        stages.append(("http", True, f"{len(ids)} model(s) served at {url}"))
+        _print_stages(stages)
+        for model_id in ids:
+            print(f"  - {model_id}")
+        if want_model:
+            served = any(m == want_model or m.endswith("/" + want_model)
+                         for m in ids)
+            if not served:
+                print(f"warning: requested model {want_model!r} is not in the "
+                      "served list", file=sys.stderr)
+                return 1
+        return 0
+    finally:
+        if forward is not None:
+            forward.close()
 
 
 # ---- argparse ----
@@ -2109,6 +2883,25 @@ def _add_target_args(p: argparse.ArgumentParser, *, ssh: bool) -> None:
                             "secret/harness/diagbot/id_ed25519)")
         p.add_argument("--known-hosts-path", default="config/known_hosts",
                        help="known_hosts file for --address targeting")
+
+
+def _add_llm_args(p: argparse.ArgumentParser, *, tunnel: bool = True) -> None:
+    """LLM endpoint flags shared by menu/diagnose/session (eval: no tunnel --
+    it has no inventory to hop through)."""
+    p.add_argument("--llm", choices=("openai", "gemini", "local", "stub"),
+                   default=None,
+                   help="LLM backend: openai-compatible endpoint (default) | "
+                        "gemini | local (vLLM/Ollama on a lab server) | stub "
+                        "(no reasoning); defaults to the inventory 'llm' block")
+    p.add_argument("--llm-url", default=None,
+                   help="OpenAI-compatible base URL, e.g. http://10.0.0.42:8000/v1; "
+                        "overrides inventory / catalog / HARNESS_LLM_URL")
+    if tunnel:
+        p.add_argument("--llm-tunnel", default=None, metavar="HOST:PORT",
+                       help="serve the LLM behind the rack-manager hop: forward "
+                            "HOST:PORT over the console_defaults ssh connection "
+                            "for this run (implies provider 'local'); falls back "
+                            "with a reverse-tunnel recipe when refused")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2142,8 +2935,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="prefer the serial console for targets (lab/qa only)")
     p.add_argument("--out-dir", default="harness_runs")
     p.add_argument("--session-dir", default="harness_runs/sessions")
-    p.add_argument("--llm", choices=("openai", "gemini", "stub"), default=None,
-                   help="LLM backend (defaults to the inventory 'llm' block)")
+    _add_llm_args(p)
     p.add_argument("--targets-file", default="config/targets.yaml",
                    help="target aliases file (default: config/targets.yaml)")
     p.set_defaults(func=run_menu)
@@ -2194,6 +2986,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="multi-turn session: the agent may ask questions (e.g. previous "
                         "repair actions) and request further read-only probes before "
                         "diagnosing")
+    p.add_argument("--label-prompt", action="store_true",
+                   help="after the diagnosis, prompt to label the correct fix "
+                        "(Enter defers; the interactive menu passes this)")
     p.add_argument("--context", action="append", default=None,
                    help="extra human-supplied context, e.g. 'DIMM was reseated, no "
                         "change' (repeatable; implies session mode)")
@@ -2215,13 +3010,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sudo-vault-path", default=None,
                    help="override the vault path of the BMC sudo password")
     p.add_argument("--out-dir", default="harness_runs")
-    p.add_argument("--llm", choices=("openai", "gemini", "stub"), default=None,
-                   help="LLM backend: openai-compatible endpoint (default) | gemini | "
-                        "stub (no reasoning); defaults to the inventory 'llm' block")
+    _add_llm_args(p)
     p.add_argument("--llm-model", default=None,
-                   help="specific LLM model, e.g. gemini/gemini-2.5-pro or gpt-4o; "
-                        "overrides --llm / inventory / the remembered model "
-                        "(config/models.yaml)")
+                   help="specific LLM model, e.g. gemini/gemini-2.5-pro, "
+                        "local/Qwen2.5-7B-Instruct or gpt-4o; overrides --llm / "
+                        "inventory / the remembered model (config/models.yaml)")
     p.add_argument("--approval", action="store_true", help="prompt y/N for each action")
     p.add_argument("--approve-all", action="store_true", help="record every action approved")
     p.add_argument("--wall-s", type=float, default=900.0, help="supervisor wall-clock budget")
@@ -2288,14 +3081,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--server-number", type=int, default=None,
                    help="server number for the vendor FAT single-test menu "
                         "(GB targets, SSH targets only)")
-    p.add_argument("--llm", choices=("openai", "gemini", "stub"), default=None,
-                   help="LLM backend for conversation + reasoning: openai-compatible "
-                        "endpoint (default) | gemini | stub (no reasoning); defaults "
-                        "to the inventory 'llm' block")
+    _add_llm_args(p)
     p.add_argument("--llm-model", default=None,
                    help="specific LLM model for conversation + reasoning, e.g. "
-                        "gemini/gemini-2.5-pro or gpt-4o; overrides --llm / "
-                        "inventory / the remembered model (config/models.yaml)")
+                        "gemini/gemini-2.5-pro, local/Qwen2.5-7B-Instruct or "
+                        "gpt-4o; overrides --llm / inventory / the remembered "
+                        "model (config/models.yaml)")
     p.set_defaults(func=run_session)
 
     p = sub.add_parser("secrets",
@@ -2343,6 +3134,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=run_calibrate)
 
     p = sub.add_parser(
+        "llm", help="LLM endpoint utilities: preflight reachability / tunnel probe")
+    llm_sub = p.add_subparsers(dest="llm_action", required=True)
+    c = llm_sub.add_parser(
+        "check",
+        help="staged connectivity probe: ssh -> forward -> GET /models")
+    c.add_argument("--url", default=None,
+                   help="OpenAI-compatible base URL (default: HARNESS_LLM_URL "
+                        "or http://127.0.0.1:8000/v1)")
+    c.add_argument("--tunnel", default=None, metavar="HOST:PORT",
+                   help="probe a forward through the inventory's rack manager "
+                        "(needs --inventory); reports which stage fails and "
+                        "the fallback when forwarding is refused")
+    c.add_argument("--inventory", default=None,
+                   help="inventory whose console_defaults supplies the tunnel hop")
+    c.add_argument("--model", default=None,
+                   help="expected model id; warns when not served")
+    c.add_argument("--timeout", type=float, default=10.0)
+    c.add_argument("--secret-dir", default=None,
+                   help="local dir mapping vault paths to files (lab use)")
+    c.set_defaults(func=run_llm_check)
+
+    p = sub.add_parser(
         "report",
         help="record a diagnosis run's verified outcome (learning-loop ground truth)")
     p.add_argument("--run", required=True, help="harness run directory id")
@@ -2359,7 +3172,35 @@ def build_parser() -> argparse.ArgumentParser:
                    help="run directory root (default: harness_runs)")
     p.add_argument("--status", action="store_true",
                    help="print the recorded case for the run, if any")
+    p.add_argument("--revise", action="store_true",
+                   help="replace an existing record (operator correction; "
+                        "audited as case_revised)")
     p.set_defaults(func=run_report)
+
+    p = sub.add_parser(
+        "label",
+        help="label a run with the correct fix + outcome (interactive; "
+             "learning-loop ground truth)")
+    p.add_argument("--run", required=True,
+                   help="harness run directory id (or a path to the run dir)")
+    p.add_argument("--outcome",
+                   choices=("fixed", "partial", "not_fixed", "inconclusive"),
+                   help="verified outcome (omit to prompt interactively)")
+    p.add_argument("--taken", action="append", default=[],
+                   help="the correct fix / action actually taken (repeatable; "
+                        "omit to prompt with the top recommendation prefilled)")
+    p.add_argument("--verdict", default=None,
+                   help="verification verdict, e.g. resolved / no_change")
+    p.add_argument("--cases", default="harness_runs/cases",
+                   help="case store directory (default: harness_runs/cases)")
+    p.add_argument("--out-dir", default="harness_runs",
+                   help="run directory root (default: harness_runs)")
+    p.add_argument("--revise", action="store_true",
+                   help="replace an existing record (operator correction; "
+                        "audited as case_revised)")
+    p.add_argument("--status", action="store_true",
+                   help="print the recorded case for the run, if any")
+    p.set_defaults(func=run_label)
 
     p = sub.add_parser(
         "priors",
@@ -2382,8 +3223,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="case store directory (default: harness_runs/cases)")
     p.add_argument("--lib", default=None,
                    help="doc library directory (default: harness_docs when present)")
-    p.add_argument("--llm", choices=("stub", "openai", "gemini"), default="stub",
+    p.add_argument("--llm", choices=("stub", "openai", "local", "gemini"), default="stub",
                    help="LLM backend for the replay (default: stub)")
+    p.add_argument("--llm-url", default=None,
+                   help="OpenAI-compatible base URL for openai/local replay "
+                        "(default: HARNESS_LLM_URL)")
     p.add_argument("--holdout-frac", type=float, default=0.25,
                    help="deterministic holdout fraction (default: 0.25)")
     p.add_argument("--out", default="eval_report.json",
