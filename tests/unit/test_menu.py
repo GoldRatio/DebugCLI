@@ -1077,3 +1077,599 @@ def test_poll_busy_timeouts_do_not_reprint_prompt(capsys):
     assert reader.poll(0.1) is None
     out = capsys.readouterr().out
     assert out.count("harness> ") == 1
+
+
+# ---- guided model setup (wizard + post-pick probe) ----
+
+def test_ask_model_profile_discovers_served_model(monkeypatch):
+    """Direct endpoint, reachable: the wizard lists the served model ids and
+    the operator picks one -- no typing model names."""
+    import harness.diagnosis.llm as llm_mod
+    from harness.operator import menu as menu_mod
+    from harness.operator.menu import ask_model_profile
+
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([
+        2,   # provider: local
+        0,   # transport: direct
+        0,   # served model id: the only one listed
+    ]))
+    monkeypatch.setattr(menu_mod, "ask_text", lambda prompt, **kw: "")
+    monkeypatch.setattr(llm_mod, "list_models",
+                        lambda url, api_key=None, timeout=10.0:
+                        ["Qwen2.5-7B-Instruct"])
+
+    profile = ask_model_profile()
+    assert profile.provider == "local"
+    assert profile.model == "Qwen2.5-7B-Instruct"
+    assert profile.url == "http://127.0.0.1:8000/v1"   # Enter took the default
+    assert profile.tunnel is None
+
+
+def test_ask_model_profile_unreachable_saves_anyway(monkeypatch, capsys):
+    """Probe failure is a warning, not a wall: the profile is saved with a
+    manually typed model id."""
+    import harness.diagnosis.llm as llm_mod
+    from harness.operator import menu as menu_mod
+    from harness.operator.menu import ask_model_profile
+
+    def dead(url, api_key=None, timeout=10.0):
+        raise llm_mod.LLMError("LLM unreachable: connection refused")
+
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([
+        0,   # provider: openai
+        0,   # transport: direct
+    ]))
+    answers = iter(["http://10.0.0.42:8000/v1", "my-model", ""])
+    monkeypatch.setattr(menu_mod, "ask_text", lambda prompt, **kw: next(answers))
+    monkeypatch.setattr(llm_mod, "list_models", dead)
+
+    profile = ask_model_profile()
+    assert profile.provider == "openai"
+    assert profile.model == "my-model"
+    assert profile.url == "http://10.0.0.42:8000/v1"
+    assert profile.api_key_vault_path is None           # Enter = env fallback
+    captured = capsys.readouterr()
+    assert "endpoint unreachable" in captured.err + captured.out
+
+
+def test_ask_model_profile_tunnel_saved_unprobed(monkeypatch, capsys):
+    """Golden server, no inventory in reach: the wizard asks rack/cable, then
+    falls back to manual port/HOST entry; the spec is saved unprobed."""
+    from harness.operator import menu as menu_mod
+    from harness.operator.menu import ask_model_profile
+
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([
+        2,   # provider: local
+        1,   # transport: tunnel (model on the golden server)
+    ]))
+    answers = iter(["",              # endpoint URL: Enter = default
+                    "Q61", "8",      # rack/cable of the golden server
+                    "",              # vLLM port: Enter = 8000
+                    "10.0.0.42",     # node HOST as the rackmgr addresses it
+                    "Qwen2.5-7B-Instruct"])
+    monkeypatch.setattr(menu_mod, "ask_text", lambda prompt, **kw: next(answers))
+
+    profile = ask_model_profile()
+    assert profile.tunnel == "10.0.0.42:8000"     # port default applied
+    assert profile.url is None                    # tunnel profiles carry no URL
+    assert profile.model == "Qwen2.5-7B-Instruct"
+    captured = capsys.readouterr()
+    assert "unprobed" in captured.err + captured.out
+
+
+def test_ask_model_profile_label_prefills_rack_cable(monkeypatch):
+    """A console session target label (Q61-cable8) prefills the rack/cable
+    asks -- Enter twice and the wizard moves on to port/HOST."""
+    from harness.operator import menu as menu_mod
+    from harness.operator.menu import ask_model_profile
+
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([1]))  # tunnel
+    asked = []
+    answers = iter(["",              # endpoint URL: Enter = default
+                    "",              # rack: Enter = prefilled Q61
+                    "",              # cable: Enter = prefilled 8
+                    "",              # vLLM port: Enter = 8000
+                    "10.0.0.42",     # node HOST
+                    "Qwen2.5-7B-Instruct"])
+
+    def record_ask(prompt, **kw):
+        asked.append(prompt)
+        return next(answers)
+
+    monkeypatch.setattr(menu_mod, "ask_text", record_ask)
+
+    profile = ask_model_profile(provider="local", target_label="Q61-cable8")
+    assert profile.tunnel == "10.0.0.42:8000"     # completed via prefills
+    prompts = " | ".join(asked)
+    assert "Enter = Q61" in prompts and "Enter = 8" in prompts
+
+
+def test_ask_model_profile_transport_labels_pin_golden_server_copy(monkeypatch):
+    """The tunnel option is framed as 'model runs on the golden server
+    (rack/cable debug target)' -- regression guard against reusing
+    rack/cable for anything but debug-target addressing."""
+    from harness.operator import menu as menu_mod
+    from harness.operator.menu import ask_model_profile
+
+    seen = {}
+
+    def capturing_select(title, options, **kw):
+        seen[title] = list(options)  # cancel implicitly (None)
+
+    monkeypatch.setattr(menu_mod, "select", capturing_select)
+    monkeypatch.setattr(menu_mod, "ask_text", lambda prompt, **kw: "")
+    ask_model_profile(provider="local")
+    transport = seen["Transport"]
+    assert transport[0] == "direct -- endpoint reachable from this workstation"
+    assert transport[1].startswith(
+        "tunnel -- model runs on the golden server (the rack/cable debug target)")
+
+
+def test_ask_model_profile_discovery_fills_port_and_host(
+        tmp_path, monkeypatch, capsys):
+    """With inv+store the wizard probes the golden server over the console
+    and the operator picks the discovered candidates from arrow-key lists."""
+    import harness.diagnosis.llm as llm_mod
+    import harness.engine.tunnel as tunnel_mod
+    from harness.operator import menu as menu_mod
+    from harness.operator.llm_discover import DiscoveryResult
+    from harness.operator.menu import ask_model_profile
+
+    monkeypatch.setattr("harness.operator.llm_discover.discover",
+                        lambda *a, **kw: DiscoveryResult(
+                            addresses=["10.0.0.42"],
+                            ports=[8000],
+                            containers={"vllm-qwen": 8000}))
+
+    class _WorkingForward:
+        def __init__(self, host, port, console, store, bastion=None):
+            pass
+
+        def start(self):
+            return "http://127.0.0.1:28400/v1"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tunnel_mod, "LLMForward", _WorkingForward)
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([
+        2,   # provider: local
+        1,   # transport: tunnel
+        0,   # vLLM port: the discovered one
+        0,   # node HOST: the discovered one
+        0,   # served model id
+    ]))
+    answers = iter(["", "Q61", "8", "yemankyaw"])
+    monkeypatch.setattr(menu_mod, "ask_text", lambda prompt, **kw: next(answers))
+    _patch_node_capture(monkeypatch)
+    monkeypatch.setattr(llm_mod, "list_models",
+                        lambda url, api_key=None, timeout=10.0:
+                        ["Qwen2.5-7B-Instruct"])
+
+    inv = load_inventory(_write_inventory(
+        tmp_path, "inv_cd.yaml", body=_CONSOLE_DEFAULTS_INVENTORY))
+    profile = ask_model_profile(inv=inv, store=MemorySecretStore())
+    assert profile.tunnel == "10.0.0.42:8000"
+    assert profile.model == "Qwen2.5-7B-Instruct"
+    captured = capsys.readouterr()
+    assert "hop: rack manager 192.168.202.51" in captured.err + captured.out
+
+
+def test_ask_model_profile_discovery_failure_falls_back_manual(
+        tmp_path, monkeypatch, capsys):
+    """Console discovery failure is a warning: the wizard continues with
+    manual port/HOST entry."""
+    import harness.engine.tunnel as tunnel_mod
+    from harness.operator import menu as menu_mod
+    from harness.operator.menu import ask_model_profile
+    from harness.targets.resolver import TargetError
+
+    def boom(*a, **kw):
+        raise TargetError("console targeting blocked")
+
+    monkeypatch.setattr("harness.operator.llm_discover.discover", boom)
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([2, 1, 0]))
+    answers = iter(["", "Q61", "8", "yemankyaw", "", "10.0.0.42"])
+    monkeypatch.setattr(menu_mod, "ask_text", lambda prompt, **kw: next(answers))
+    _patch_node_capture(monkeypatch)
+    monkeypatch.setattr("harness.diagnosis.llm.list_models",
+                        lambda url, api_key=None, timeout=10.0:
+                        ["Qwen2.5-7B-Instruct"])
+
+    class _WorkingForward:
+        def __init__(self, host, port, console, store, bastion=None):
+            pass
+
+        def start(self):
+            return "http://127.0.0.1:28401/v1"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tunnel_mod, "LLMForward", _WorkingForward)
+
+    inv = load_inventory(_write_inventory(
+        tmp_path, "inv_cd.yaml", body=_CONSOLE_DEFAULTS_INVENTORY))
+    profile = ask_model_profile(inv=inv, store=MemorySecretStore())
+    assert profile.tunnel == "10.0.0.42:8000"
+    assert profile.model == "Qwen2.5-7B-Instruct"
+    captured = capsys.readouterr()
+    assert "discovery failed" in captured.err + captured.out
+
+
+def _patch_node_capture(monkeypatch, password=b"pw\n"):
+    """The wizard prompts for the node user + sudo password at EVERY setup;
+    tests stub the getpass capture (the flow still runs unconditionally)."""
+    monkeypatch.setattr(
+        "harness.operator.credential_gate.CredentialPrompter.prompt_now",
+        lambda self, path: password)
+
+
+def test_ask_model_profile_node_capture_prompt_and_persist(tmp_path, monkeypatch,
+                                                           capsys):
+    """Node user + sudo password are prompted at EVERY model setup (never
+    silently reused); the captured password lands at the per-rack node-sudo
+    vault path and feeds the docker probe's sudo handshake."""
+    import harness.engine.tunnel as tunnel_mod
+    from harness.config.vault import MemorySecretStore
+    from harness.operator import menu as menu_mod
+    from harness.operator.llm_discover import DiscoveryResult
+    from harness.operator.menu import ask_model_profile
+
+    inv = load_inventory(_write_inventory(tmp_path, "inv_cd.yaml", body=(
+        "trust_level: lab\n"
+        "llm_console: {address: 192.168.202.51, user: log, "
+        "identity_vault_path: secret/harness/rackmgr/id_ed25519, "
+        "known_hosts_path: config/rackmgr_known_hosts, "
+        "tool: jumpin, trust_level: lab, port: 22, "
+        "prompts: [RScmCli#, '~$']}\n"
+        "hosts: []\n")))
+
+    monkeypatch.setattr("harness.operator.llm_discover.discover",
+                        lambda *a, **kw: DiscoveryResult(
+                            addresses=["10.0.0.42"], ports=[8000],
+                            containers={"vllm": 8000}))
+
+    class _WorkingForward:
+        def __init__(self, host, port, console, store, bastion=None):
+            pass
+
+        def start(self):
+            return "http://127.0.0.1:28410/v1"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tunnel_mod, "LLMForward", _WorkingForward)
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([
+        2,   # provider: local
+        1,   # transport: tunnel
+        0,   # vLLM port: discovered
+        0,   # node HOST: discovered
+        0,   # served model id
+    ]))
+    answers = iter(["", "Q71", "8", "yemankyaw"])
+    monkeypatch.setattr(menu_mod, "ask_text", lambda prompt, **kw: next(answers))
+    monkeypatch.setattr("harness.diagnosis.llm.list_models",
+                        lambda url, api_key=None, timeout=10.0:
+                        ["Qwen2.5-7B-Instruct"])
+    captures = []
+    monkeypatch.setattr(
+        "harness.operator.credential_gate.CredentialPrompter.prompt_now",
+        lambda self, path: (captures.append(path), b"s3cret\n")[1])
+
+    store = MemorySecretStore()
+    profile = ask_model_profile(inv=inv, store=store)
+    assert profile.tunnel == "10.0.0.42:8000"
+    assert captures == ["secret/harness/llm/node-sudo-71"]
+    assert store.get("secret/harness/llm/node-sudo-71") == b"s3cret\n"
+    out = capsys.readouterr().out
+    assert "probing Q71-cable8 over the console..." in out
+
+
+def test_ask_model_profile_node_capture_decline_aborts(tmp_path, monkeypatch,
+                                                       capsys):
+    """A declined sudo capture aborts the wizard up front with the vault
+    path named -- no mid-hop surprises."""
+    from harness.config.vault import MemorySecretStore
+    from harness.operator import menu as menu_mod
+    from harness.operator.menu import ask_model_profile
+
+    inv = load_inventory(_write_inventory(tmp_path, "inv_cd.yaml", body=(
+        "trust_level: lab\n"
+        "llm_console: {address: 192.168.202.51, user: log, "
+        "identity_vault_path: secret/harness/rackmgr/id_ed25519, "
+        "known_hosts_path: config/rackmgr_known_hosts, "
+        "tool: jumpin, trust_level: lab, port: 22, "
+        "prompts: [RScmCli#, '~$']}\n"
+        "hosts: []\n")))
+
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([2, 1]))
+    answers = iter(["", "Q71", "8", "yemankyaw"])
+    monkeypatch.setattr(menu_mod, "ask_text", lambda prompt, **kw: next(answers))
+
+    class _DeclinePrompter:
+        def __init__(self, store):
+            pass
+
+        def prompt_now(self, path):
+            raise KeyError(path)
+
+    monkeypatch.setattr(
+        "harness.operator.credential_gate.CredentialPrompter",
+        _DeclinePrompter)
+
+    assert ask_model_profile(inv=inv, store=MemorySecretStore()) is None
+    captured = capsys.readouterr()
+    assert "node sudo password skipped" in captured.err
+    assert "secret/harness/llm/node-sudo-71" in captured.err
+
+
+def test_ask_model_profile_relay_fallback_on_forward_refusal(
+        tmp_path, monkeypatch, capsys):
+    """Golden server behind a jumpin-only rackmgr: a forward-stage refusal
+    prints the reverse-tunnel relay recipe and offers to save the relay URL
+    as the endpoint (no tunnel in the saved profile)."""
+    import harness.diagnosis.llm as llm_mod
+    import harness.engine.tunnel as tunnel_mod
+    from harness.operator import menu as menu_mod
+    from harness.operator.llm_discover import DiscoveryResult
+    from harness.operator.menu import ask_model_profile
+
+    class _RefusedForward:
+        def __init__(self, host, port, console, store, bastion=None):
+            pass
+
+        def start(self):
+            raise tunnel_mod.TunnelError("forward", "channel open failed")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tunnel_mod, "LLMForward", _RefusedForward)
+    monkeypatch.setattr("harness.operator.llm_discover.discover",
+                        lambda *a, **kw: DiscoveryResult(
+                            addresses=["10.0.0.42"], ports=[8000],
+                            containers={"vllm": 8000}))
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([
+        2,   # provider: local
+        1,   # transport: tunnel
+        0,   # vLLM port: discovered
+        0,   # node HOST: discovered
+        0,   # served model id (from the relay endpoint)
+    ]))
+    answers = iter(["", "Q61", "8", "yemankyaw", "y"])
+    monkeypatch.setattr(menu_mod, "ask_text", lambda prompt, **kw: next(answers))
+    _patch_node_capture(monkeypatch)
+    monkeypatch.setattr(llm_mod, "list_models",
+                        lambda url, api_key=None, timeout=10.0:
+                        ["Qwen2.5-7B-Instruct"])
+
+    inv = load_inventory(_write_inventory(
+        tmp_path, "inv_cd.yaml", body=_CONSOLE_DEFAULTS_INVENTORY))
+    profile = ask_model_profile(inv=inv, store=MemorySecretStore())
+
+    assert profile.url == "http://127.0.0.1:18000/v1"   # relay, not a tunnel
+    assert profile.tunnel is None
+    assert profile.model == "Qwen2.5-7B-Instruct"       # picked from the list
+    captured = capsys.readouterr()
+    assert "ssh -fN -R 127.0.0.1:18000:127.0.0.1:8000" in captured.err + captured.out
+    assert "tunnel hop failed (forward)" in captured.err + captured.out
+
+
+def test_ask_model_profile_auth_failure_keeps_tunnel(tmp_path, monkeypatch,
+                                                     capsys):
+    """A rackmgr SSH auth failure is staged (no relay offer): the tunnel spec
+    is kept and the model id typed manually."""
+    import harness.engine.tunnel as tunnel_mod
+    from harness.operator import menu as menu_mod
+    from harness.operator.llm_discover import DiscoveryResult
+    from harness.operator.menu import ask_model_profile
+
+    class _AuthFailedForward:
+        def __init__(self, host, port, console, store, bastion=None):
+            pass
+
+        def start(self):
+            raise tunnel_mod.TunnelError("auth", "ssh to rack manager failed")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tunnel_mod, "LLMForward", _AuthFailedForward)
+    monkeypatch.setattr("harness.operator.llm_discover.discover",
+                        lambda *a, **kw: DiscoveryResult(
+                            addresses=["10.0.0.42"], ports=[8000]))
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([2, 1, 0, 0]))
+    answers = iter(["", "Q61", "8", "yemankyaw", "Qwen2.5-7B-Instruct"])
+    monkeypatch.setattr(menu_mod, "ask_text", lambda prompt, **kw: next(answers))
+    _patch_node_capture(monkeypatch)
+
+    inv = load_inventory(_write_inventory(
+        tmp_path, "inv_cd.yaml", body=_CONSOLE_DEFAULTS_INVENTORY))
+    profile = ask_model_profile(inv=inv, store=MemorySecretStore())
+
+    assert profile.tunnel == "10.0.0.42:8000"          # kept, not swapped
+    assert profile.model == "Qwen2.5-7B-Instruct"
+    captured = capsys.readouterr()
+    assert "tunnel hop failed (auth)" in captured.err + captured.out
+    assert "relay" not in (captured.err + captured.out).lower()
+
+
+def test_ask_model_profile_invalid_tunnel_cancels(monkeypatch, capsys):
+    from harness.operator import menu as menu_mod
+    from harness.operator.menu import ask_model_profile
+
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([2, 1]))
+    answers = iter(["", "Q61", "8", "", "bad host"])   # HOST with a space
+    monkeypatch.setattr(menu_mod, "ask_text", lambda prompt, **kw: next(answers))
+
+    assert ask_model_profile() is None
+    assert "invalid tunnel target" in capsys.readouterr().err
+
+
+def test_ask_model_profile_warns_manager_address_as_host(tmp_path, monkeypatch,
+                                                         capsys):
+    """A HOST that is actually the rack manager's address gets called out --
+    the tunnel must target the golden server's own address."""
+    import harness.engine.tunnel as tunnel_mod
+    from harness.config.vault import MemorySecretStore
+    from harness.operator import menu as menu_mod
+    from harness.operator.llm_discover import DiscoveryResult
+    from harness.operator.menu import ask_model_profile
+
+    class _WorkingForward:
+        def __init__(self, host, port, console, store, bastion=None):
+            pass
+
+        def start(self):
+            return "http://127.0.0.1:28420/v1"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tunnel_mod, "LLMForward", _WorkingForward)
+    monkeypatch.setattr("harness.operator.llm_discover.discover",
+                        lambda *a, **kw: DiscoveryResult(ports=[8000]))
+    _patch_node_capture(monkeypatch)
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([
+        2,   # provider: local
+        1,   # transport: tunnel
+        0,   # vLLM port: discovered
+        0,   # served model id
+    ]))
+    answers = iter(["", "Q61", "8", "yemankyaw", "192.168.202.51"])
+    monkeypatch.setattr(menu_mod, "ask_text", lambda prompt, **kw: next(answers))
+    monkeypatch.setattr("harness.diagnosis.llm.list_models",
+                        lambda url, api_key=None, timeout=10.0:
+                        ["Qwen2.5-7B-Instruct"])
+
+    inv = load_inventory(_write_inventory(
+        tmp_path, "inv_cd.yaml", body=_CONSOLE_DEFAULTS_INVENTORY))
+    profile = ask_model_profile(inv=inv, store=MemorySecretStore())
+    assert profile.tunnel == "192.168.202.51:8000"   # saved anyway (warn only)
+    captured = capsys.readouterr()
+    assert "rack manager's address" in captured.err + captured.out
+
+
+def test_ask_model_profile_surfaces_forward_refusal(tmp_path, monkeypatch,
+                                                    capsys):
+    """A refused tunnel target (e.g. the manager's IP entered as HOST) is
+    reported with the recorded channel error -- no traceback, no silent
+    'unreachable'."""
+    import harness.diagnosis.llm as llm_mod
+    import harness.engine.tunnel as tunnel_mod
+    from harness.config.vault import MemorySecretStore
+    from harness.operator import menu as menu_mod
+    from harness.operator.llm_discover import DiscoveryResult
+    from harness.operator.menu import ask_model_profile
+
+    class _RefusedTargetForward:
+        def __init__(self, host, port, console, store, bastion=None):
+            self.forward_error = "Connection refused: Connect failed"
+
+        def start(self):
+            return "http://127.0.0.1:28420/v1"   # listener binds; channel fails
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tunnel_mod, "LLMForward", _RefusedTargetForward)
+    monkeypatch.setattr("harness.operator.llm_discover.discover",
+                        lambda *a, **kw: DiscoveryResult(
+                            addresses=["10.0.0.42"], ports=[8000]))
+    _patch_node_capture(monkeypatch)
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([
+        2,   # provider: local
+        1,   # transport: tunnel
+        0,   # vLLM port: discovered
+        0,   # node HOST: discovered
+        0,   # served model id
+    ]))
+    answers = iter(["", "Q61", "8", "yemankyaw", "Qwen2.5-7B-Instruct"])
+    monkeypatch.setattr(menu_mod, "ask_text", lambda prompt, **kw: next(answers))
+    monkeypatch.setattr(llm_mod, "list_models",
+                        lambda url, api_key=None, timeout=10.0:
+                        (_ for _ in ()).throw(
+                            llm_mod.LLMError("LLM connection failed: reset")))
+
+    inv = load_inventory(_write_inventory(
+        tmp_path, "inv_cd.yaml", body=_CONSOLE_DEFAULTS_INVENTORY))
+    profile = ask_model_profile(inv=inv, store=MemorySecretStore())
+    assert profile.tunnel == "10.0.0.42:8000"   # saved with the warning
+    assert profile.model == "Qwen2.5-7B-Instruct"
+    captured = capsys.readouterr()
+    assert "tunnel target refused: Connection refused" in captured.err + captured.out
+
+
+def test_menu_model_guided_setup_on_unconfigured_builtin(tmp_path, monkeypatch,
+                                                         capsys):
+    """Selecting the silent-default ``local/harness-diag`` row launches the
+    guided setup and saves the configured profile as the current model."""
+    monkeypatch.chdir(tmp_path)
+    from harness.config.model_catalog import ModelCatalog, ModelProfile
+    from harness.operator import menu as menu_mod
+
+    # no inventory llm block: the picker shows exactly the well-known defaults
+    plain = _INVENTORY.replace("llm:\n  provider: stub\n", "")
+    inv = load_inventory(_write_inventory(tmp_path, body=plain))
+
+    def fake_wizard(*, provider=None, **kw):
+        assert provider == "local"
+        return ModelProfile(provider="local", model="Qwen2.5-7B-Instruct",
+                            tunnel="10.0.0.42:8000")
+
+    monkeypatch.setattr(menu_mod, "ask_model_profile", fake_wizard)
+    monkeypatch.setattr(menu_mod, "check_profile", lambda *a, **kw: None)
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([2]))  # local row
+
+    assert cli_mod._menu_model(inv, MemorySecretStore()) == 0
+    out = capsys.readouterr().out
+    assert "model: local/Qwen2.5-7B-Instruct" in out
+    saved = json.loads((tmp_path / "config" / "models.yaml").read_text(
+        encoding="utf-8"))
+    assert saved["current"]["tunnel"] == "10.0.0.42:8000"
+    assert ModelCatalog.load(tmp_path / "config" / "models.yaml").current.tunnel
+
+
+def test_check_profile_offers_switch_on_model_mismatch(monkeypatch, capsys):
+    """The probe catches a model id the endpoint does not serve (vLLM would
+    404 every request) and offers the served ids as a one-key switch."""
+    import harness.diagnosis.llm as llm_mod
+    from harness.config.model_catalog import ModelProfile
+    from harness.operator import menu as menu_mod
+    from harness.operator.menu import check_profile
+
+    monkeypatch.setattr(llm_mod, "list_models",
+                        lambda url, api_key=None, timeout=10.0:
+                        ["Qwen2.5-7B-Instruct"])
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0]))
+    profile = ModelProfile(provider="local", model="harness-diag",
+                           url="http://127.0.0.1:8000/v1")
+    assert check_profile(profile) == "Qwen2.5-7B-Instruct"
+
+    out = capsys.readouterr().out
+    assert "not served" in out
+
+
+def test_check_profile_quiet_when_served_or_skipped(monkeypatch, capsys):
+    import harness.diagnosis.llm as llm_mod
+    from harness.config.model_catalog import ModelProfile
+    from harness.operator.menu import check_profile
+
+    monkeypatch.setattr(llm_mod, "list_models",
+                        lambda url, api_key=None, timeout=10.0:
+                        ["Qwen/Qwen2.5-7B-Instruct"])
+    ok = ModelProfile(provider="local", model="Qwen2.5-7B-Instruct",
+                      url="http://127.0.0.1:8000/v1")
+    assert check_profile(ok) is None                  # suffix match on the id
+    assert check_profile(ModelProfile(provider="gemini")) is None   # skipped
+    assert check_profile(ModelProfile(provider="stub")) is None
+    dead = ModelProfile(provider="local", model="m",
+                        url="http://127.0.0.1:8000/v1")
+    monkeypatch.setattr(llm_mod, "list_models",
+                        lambda url, api_key=None, timeout=10.0: (_ for _ in ()).throw(
+                            llm_mod.LLMError("LLM unreachable")))
+    assert check_profile(dead) is None                # warning only, no raise
+    captured = capsys.readouterr()
+    assert "unreachable" in captured.out + captured.err

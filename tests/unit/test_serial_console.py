@@ -87,12 +87,49 @@ def test_probe_accepts_legit_read_only_forms():
         assert validate_serial_probe(good) == good
 
 
+# ---- LLM endpoint discovery probes (read-only listings, exact-flag pinned) ----
+
+def test_probe_accepts_llm_discovery_probes():
+    for good in (
+        "hostname -I",
+        "hostname",
+        "ss -l -t -n",
+        "ss -l -t -n -p",
+        "ss -4 -l -t",
+        "ip -4 addr",
+        "ip -br addr",
+        "ip -o -4 route",
+        "sudo -S docker ps",
+        "docker ps",
+        "docker ps -a",
+    ):
+        assert validate_serial_probe(good) == good
+
+
+def test_probe_rejects_llm_discovery_mutations_and_bundles():
+    for bad in (
+        "ip addr add 10.0.0.9/24 dev eth0",   # mutation via positional value
+        "ip route add blackhole 10.0.0.9",    # route mutation
+        "ip addr flush dev eth0",             # second positional after subcommand
+        "docker run -it alpine sh",           # subcommand whitelist: ps only
+        "docker rm -f vllm",
+        "docker exec vllm sh",
+        "docker ps --format '{{.Names}}'",    # no value flags pinned for ps
+        "ss -ltnp",                           # bundled short flags: not pinned
+        "ss -l -t -n state established",      # no positionals on ss
+        "hostname some-name",                 # no positionals on hostname
+        "sudo -S docker rm -f vllm",          # sudo cannot smuggle mutations
+    ):
+        with pytest.raises(SerialProbeDenied):
+            validate_serial_probe(bad)
+
+
 def test_probe_rejects_i2c_write_and_destructive_sudo():
     for bad in (
         "i2cset -y 0 0x51 0x40 0xff",          # i2cset is the I2C WRITE tool
         "i2cset",                              # never expressible at all
         "ipmitool sel clear",                  # destructive ipmitool subcommand
-        "ipmitool sel delete 5",
+        "ipmitool sel delete 5",               # destructive ipmitool subcommand
         "ipmitool sensor thresh set 0 80",     # write form
         "ipmitool raw 0x30 0x40",              # raw write not allowed
         "sudo -S i2cset -y 0 0x51 0x40 0xff",  # sudo cannot smuggle writes in
@@ -248,6 +285,148 @@ def test_console_allowed_at_lab():
     assert sc.open is not None  # construction ok at lab
 
 
+# ---- per-rack manager addresses ----
+
+def test_address_for_rack_prefers_per_rack_map():
+    d = _console(rack="Q71", rack_addresses={"Q61": "10.0.128.74",
+                                             "Q71": "10.0.128.98"})
+    assert d.address_for_rack() == "10.0.128.98"
+    assert d.address_for_rack("q61") == "10.0.128.74"      # numeric compare
+    assert d.address_for_rack("61") == "10.0.128.74"
+    assert d.address_for_rack("Q99") == "192.168.202.51"   # unmapped -> default
+    assert _console(rack="Q71").address_for_rack() == "192.168.202.51"
+
+
+def test_console_open_connects_to_per_rack_address(tmp_path, monkeypatch):
+    import harness.engine.sol as sol_mod
+
+    connected = {}
+
+    class _Client:
+        def set_missing_host_key_policy(self, policy):
+            pass
+
+        def load_host_keys(self, path):
+            pass
+
+        def connect(self, **kw):
+            connected["hostname"] = kw["hostname"]
+
+    monkeypatch.setattr(sol_mod.paramiko, "SSHClient", _Client)
+    monkeypatch.setattr(sol_mod, "load_key_material",
+                        lambda store, vault, tmp: tmp_path / "id.pem")
+    from harness.config.vault import MemorySecretStore
+    from harness.engine.sol import SerialConsole
+
+    sc = SerialConsole(
+        _lab_console(rack="Q71",
+                     rack_addresses={"Q71": "10.0.128.98"},
+                     known_hosts_path=str(tmp_path / "kh")),
+        MemorySecretStore({"secret/bmc/sudo": b"x\n"}),
+    )
+    sc.open()
+    assert connected["hostname"] == "10.0.128.98"
+
+
+def test_console_open_failure_is_staged_not_raw(tmp_path, monkeypatch):
+    """An unreachable rack manager (timeout / refused / auth) surfaces as a
+    staged SerialConsoleError naming the address -- never a raw paramiko
+    traceback out of the wizard."""
+    import harness.engine.sol as sol_mod
+
+    class _DeadClient:
+        def set_missing_host_key_policy(self, policy):
+            pass
+
+        def load_host_keys(self, path):
+            pass
+
+        def close(self):
+            pass
+
+        def connect(self, **kw):
+            raise TimeoutError(10060, "connection attempt failed")
+
+    monkeypatch.setattr(sol_mod.paramiko, "SSHClient", _DeadClient)
+    monkeypatch.setattr(sol_mod, "load_key_material",
+                        lambda store, vault, tmp: tmp_path / "id.pem")
+    from harness.config.vault import MemorySecretStore
+    from harness.engine.sol import SerialConsole, SerialConsoleError
+
+    sc = SerialConsole(
+        _lab_console(rack="Q71", rack_addresses={"Q71": "10.0.128.98"},
+                     known_hosts_path=str(tmp_path / "kh")),
+        MemorySecretStore({"secret/bmc/sudo": b"x\n"}),
+    )
+    with pytest.raises(SerialConsoleError,
+                       match=r"ssh to 10\.0\.128\.98"):
+        sc.open()
+
+
+def test_console_bastion_chain_connects_through_jump_host(
+        tmp_path, monkeypatch):
+    """Two-hop fleet: paramiko reaches the BASTION with the debug console's
+    key, then nests SSH to the per-rack manager over a direct-tcpip channel
+    (password from the vault; key tried first)."""
+    import harness.engine.sol as sol_mod
+
+    connects = []
+
+    class _Client:
+        def __init__(self):
+            self._transport = _FakeTransport()
+
+        def get_transport(self):
+            return self._transport
+
+        def set_missing_host_key_policy(self, policy):
+            pass
+
+        def load_host_keys(self, path):
+            pass
+
+        def connect(self, **kw):
+            connects.append({"hostname": kw["hostname"],
+                             "user": kw["username"],
+                             "password": kw.get("password"),
+                             "sock": kw.get("sock")})
+
+        def close(self):
+            pass
+
+    class _FakeTransport:
+        def open_channel(self, kind, target, src, timeout=None):
+            assert kind == "direct-tcpip"
+            connects.append({"channel": target})
+            return object()  # opaque sock for the nested connect
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sol_mod.paramiko, "SSHClient", _Client)
+    monkeypatch.setattr(sol_mod, "load_key_material",
+                        lambda store, vault, tmp: tmp_path / "id.pem")
+    from harness.config.vault import MemorySecretStore
+    from harness.engine.sol import SerialConsole
+
+    bastion = _lab_console(rack="Q71", known_hosts_path=str(tmp_path / "kh"))
+    inner = _lab_console(rack="Q71", tool="direct", port=22, user="root",
+                         rack_addresses={"Q71": "10.0.128.98"},
+                         password_vault_path="secret/rm-pw",
+                         known_hosts_path=str(tmp_path / "kh"))
+    sc = SerialConsole(inner, MemorySecretStore({"secret/rm-pw": b"s3cret\n"}),
+                       bastion=bastion)
+    sc.open()
+    assert connects[0] == {"hostname": "192.168.202.51", "user": "log",
+                           "password": None, "sock": None}       # bastion: key auth
+    assert connects[1] == {"channel": ("10.0.128.98", 22)}       # through bastion
+    assert connects[2]["hostname"] == "10.0.128.98"              # nested rackmgr
+    assert connects[2]["user"] == "root"
+    assert connects[2]["password"] == "s3cret"                   # vault password
+    assert connects[2]["sock"] is not None
+    sc.close()
+
+
 def test_console_open_tolerates_missing_known_hosts(tmp_path, monkeypatch):
     """A known_hosts path whose parent dir does not exist (e.g. setup declined
     the rack-manager install) must not crash open() with FileNotFoundError; the
@@ -339,6 +518,85 @@ def test_run_probes_resolves_sudo_from_store():
     assert "start serial session -i 12 -p 2200" in client.written
     assert 'send "sudo -S i2cdump -y -f 0 0x51\\r"' in client.written
     assert 'send "0penBmc\\r"' in client.written  # trailing newline stripped
+
+
+def test_run_probes_direct_mode_renders_no_jumpin():
+    """``tool: direct`` fleets (plain `start serial session` builtin in the
+    rackmgr shell): no jumpin spawn, no CLI-prompt wait, host SOL port, and a
+    clean double-exit to EOF."""
+    from harness.config.vault import MemorySecretStore
+    from harness.engine.sol import SerialConsole
+    client = _FakeClient()
+    sc = SerialConsole(
+        _lab_console(tool="direct", port=22),
+        MemorySecretStore({"secret/bmc/sudo": b"0penBmc\n"}),
+    )
+    sc._client = client
+    sc.run_probes(["hostname -I", "sudo -S docker ps"])
+    script = client.written
+    assert "spawn jumpin" not in script
+    assert 'expect "RScmCli#"' not in script
+    assert "spawn /bin/bash" in script
+    assert 'send "start serial session -i 12 -p 22\\r"' in script
+    assert '"Status Description:" { exit 3 }' in script       # fail-fast kept
+    assert 'send "hostname -I\\r"' in script
+    assert 'send "sudo -S docker ps\\r"' in script
+    assert 'send "0penBmc\\r"' in script                      # handshake kept
+    assert script.count('send "exit\\r"') == 2                # detach + bash exit
+    assert "expect eof" in script
+
+
+def test_console_auth_failure_names_rejected_methods(tmp_path, monkeypatch):
+    """When the rackmgr rejects key AND password auth, the staged error says
+    which methods were tried and where to fix the material."""
+    import harness.engine.sol as sol_mod
+
+    class _AuthFailClient:
+        def set_missing_host_key_policy(self, policy):
+            pass
+
+        def load_host_keys(self, path):
+            pass
+
+        def close(self):
+            pass
+
+        def connect(self, **kw):
+            raise ConnectionError("Authentication failed.")
+
+    monkeypatch.setattr(sol_mod.paramiko, "SSHClient", _AuthFailClient)
+    monkeypatch.setattr(sol_mod, "load_key_material",
+                        lambda store, vault, tmp: tmp_path / "id.pem")
+    from harness.config.vault import MemorySecretStore
+    from harness.engine.sol import SerialConsole, SerialConsoleError
+
+    sc = SerialConsole(
+        _lab_console(rack="Q71", user="root",
+                     rack_addresses={"Q71": "10.0.128.98"},
+                     password_vault_path="secret/rm-pw",
+                     known_hosts_path=str(tmp_path / "kh")),
+        MemorySecretStore({"secret/rm-pw": b"pw\n"}),
+    )
+    with pytest.raises(SerialConsoleError, match="both auth methods rejected"):
+        sc.open()
+    with pytest.raises(SerialConsoleError, match="secret/rm-pw"):
+        sc.open()
+
+
+def test_run_probes_dead_session_error_includes_tried_command():
+    """The staged error names the exact start command + tool + address so a
+    tool/port mismatch (jumpin vs direct, 2200 vs 22) is visible instantly."""
+    from harness.config.vault import MemorySecretStore
+    from harness.engine.sol import SerialConsole, SerialConsoleError
+    client = _FakeClient(out=b"Status Description: start_serial_session failed\n")
+    sc = SerialConsole(_lab_console(), MemorySecretStore({"secret/bmc/sudo": b"x\n"}))
+    sc._client = client
+    with pytest.raises(SerialConsoleError, match="tried via jumpin"):
+        sc.run_probes(["lspci"])
+    with pytest.raises(SerialConsoleError,
+                       match=r"start serial session -i 12 -p 2200"):
+        client.written = ""
+        sc.run_probes(["lspci"])
 
 
 def test_run_probes_missing_sudo_secret_raises():

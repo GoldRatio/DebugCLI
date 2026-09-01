@@ -164,7 +164,8 @@ class SessionEngine:
                 self._note(f"model={recovered.model_key} "
                            "(recovered from console pre-batch)")
                 self._base_snippets = retrieve_snippets(self.ctx, symptom, recovered.model_key)
-        self._collect_all(self._plan.collectors)
+        self._collect_all(list(self._plan.collectors)
+                          + list(self.ctx.extra_collectors))
         self._collect_doc_probes(self._plan.doc_probes)
 
     def _model_key(self) -> str | None:

@@ -191,7 +191,7 @@ def test_picker_rows_marks_current_and_add_row(tmp_path):
     assert len(profiles) == add_idx
     assert "[current]" in labels[1]          # gemini-2.5-flash marked
     assert "[current]" not in labels[0]      # openai default not marked
-    assert labels[add_idx].startswith("+ add a custom model")
+    assert labels[add_idx].startswith("+ add / configure a model")
 
 
 # ---- local provider ----
@@ -218,6 +218,61 @@ def test_resolve_url_override_wins_over_catalog_entry(tmp_path):
     assert catalog.resolve().url is None
 
 
+# ---- tunnel persistence (rack-and-cable endpoint behind the rackmgr hop) ----
+
+def test_tunnel_round_trips_through_persisted_file(tmp_path):
+    path = tmp_path / "models.yaml"
+    catalog = ModelCatalog.load(path)
+    catalog.add(ModelProfile(provider="local", model="Qwen2.5-7B-Instruct",
+                             tunnel="10.0.0.42:8000"))
+    catalog.save(path)
+    reloaded = ModelCatalog.load(path)
+    assert reloaded.current.tunnel == "10.0.0.42:8000"
+    assert reloaded.current.ident == "local/Qwen2.5-7B-Instruct"
+    assert reloaded.current.url is None          # tunnel replaces a direct url
+    assert reloaded.user_models[0].to_dict()["tunnel"] == "10.0.0.42:8000"
+
+
+def test_tunnel_validation_rejects_bad_spec(tmp_path):
+    with pytest.raises(ValueError, match="invalid tunnel target"):
+        ModelProfile.from_dict({"provider": "local", "model": "m",
+                                "tunnel": "no-port"})
+    with pytest.raises(ValueError, match="out of range"):
+        ModelProfile.from_dict({"provider": "local", "model": "m",
+                                "tunnel": "h:99999"})
+
+
+def test_resolve_explicit_url_drops_profile_tunnel(tmp_path):
+    """A pinned ``--llm-url`` is authoritative: the resolved profile carries
+    the direct endpoint and loses the tunnel (no double endpoint)."""
+    path = tmp_path / "models.yaml"
+    path.write_text(json.dumps({
+        "current": {"provider": "local", "model": "Qwen2.5-7B-Instruct",
+                    "tunnel": "10.0.0.42:8000"}}))
+    catalog = ModelCatalog.load(path)
+    assert catalog.current.tunnel == "10.0.0.42:8000"
+    resolved = catalog.resolve(url="http://10.9.9.9:8000/v1")
+    assert resolved.url == "http://10.9.9.9:8000/v1" and resolved.tunnel is None
+    assert catalog.resolve().tunnel == "10.0.0.42:8000"  # no url -> tunnel kept
+
+
+def test_needs_setup_flags_only_silent_default_builtins():
+    assert ModelProfile(provider="local").needs_setup
+    assert ModelProfile(provider="openai").needs_setup
+    for configured in (
+        ModelProfile(provider="local", model="Qwen2.5-7B-Instruct"),
+        ModelProfile(provider="local", model="harness-diag",
+                     url="http://127.0.0.1:8000/v1"),
+        ModelProfile(provider="local", model="harness-diag",
+                     tunnel="10.0.0.42:8000"),
+        ModelProfile(provider="local", model="harness-diag",
+                     api_key_vault_path="secret/llm/key"),
+        ModelProfile(provider="gemini"),
+        ModelProfile(provider="stub"),
+    ):
+        assert not configured.needs_setup, configured.ident
+
+
 def test_build_local_llm_instance():
     store = MemorySecretStore()
     llm = ModelProfile(provider="local", model="Qwen2.5-7B-Instruct",
@@ -225,3 +280,44 @@ def test_build_local_llm_instance():
     assert isinstance(llm, LocalLLM)
     assert llm.model == "Qwen2.5-7B-Instruct"
     assert llm.json_mode is True              # vLLM supports response_format
+
+
+# ---- timeout resolution (local generation takes minutes; cloud stays fail-fast) ----
+
+def test_build_timeout_defaults_are_provider_aware(monkeypatch):
+    """Unset profile timeout -> provider default: self-hosted endpoints get a
+    generous generation budget (long prompt over the tunnel, possible cold
+    start), cloud endpoints fail fast."""
+    monkeypatch.delenv("HARNESS_LLM_TIMEOUT", raising=False)
+    store = MemorySecretStore()
+    local = ModelProfile(provider="local", model="Qwen/Qwen3.8-27B",
+                         tunnel="10.0.0.42:8000").build(store)
+    assert isinstance(local, LocalLLM) and local.timeout == 600.0
+    assert ModelProfile(provider="openai", model="gpt-4o").build(store).timeout == 120.0
+    assert ModelProfile(provider="gemini",
+                        model="gemini-2.5-flash").build(store).timeout == 120.0
+
+
+def test_build_explicit_profile_timeout_wins(monkeypatch):
+    monkeypatch.delenv("HARNESS_LLM_TIMEOUT", raising=False)
+    llm = ModelProfile(provider="local", model="m",
+                       timeout=900.0).build(MemorySecretStore())
+    assert llm.timeout == 900.0
+
+
+def test_harness_llm_timeout_env_still_overrides(monkeypatch):
+    monkeypatch.setenv("HARNESS_LLM_TIMEOUT", "45")
+    llm = ModelProfile(provider="local", model="m").build(MemorySecretStore())
+    assert llm.timeout == 45.0
+
+
+def test_profile_timeout_unset_round_trips_as_absent():
+    """``timeout`` stays out of persisted models.yaml unless the operator set
+    it (old files without the key load unchanged as unset)."""
+    p = ModelProfile(provider="local", model="m")
+    assert p.timeout is None and p.effective_timeout == 600.0
+    assert "timeout" not in p.to_dict()
+    assert ModelProfile.from_dict(p.to_dict()).timeout is None
+    p2 = ModelProfile(provider="local", model="m", timeout=300.0)
+    assert p2.to_dict()["timeout"] == 300.0
+    assert ModelProfile.from_dict(p2.to_dict()) == p2

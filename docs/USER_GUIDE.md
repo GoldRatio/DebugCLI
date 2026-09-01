@@ -229,14 +229,92 @@ harness session --inventory inventory.yaml --host h1 --server-number 3
 ## 5. Console path (serial/SOL, lab/QA only)
 
 ```powershell
-harness console --inventory inventory.yaml --rack Q71 --cable 8 --probe "lspci -vvv -n -s 00:06:00.0"
+harness console --inventory inventory.yaml --rack Q71 --cable 8 --probe "lspci -vvv -n -s 00:06.0"
 ```
 
-- Rack id normalizes: `Q71`, `q71`, `71` → `jumpin q71-1 rm`.
-- `port: 2200` (BMC access port) drops you into the BMC BusyBox shell; the
-  collector plan substitutes host-OS probes with BMC equivalents
-  (`sudo -S ipmitool sensor list`, `sudo -S ipmitool sel list`, `dmesg -r`),
-  and skips pcie/storage probes that need host-OS tools.
+- Two start mechanisms via `console_defaults.tool`:
+  - `jumpin` (default): spawns `jumpin q71-1 rm` and waits for the rack-manager
+    CLI prompt. Rack id normalizes: `Q71`, `q71`, `71` → `jumpin q71-1 rm`.
+  - `direct`: fleet managers that run `start serial session` as a plain shell
+    builtin — no spawn, no prompt wait; the start command is sent straight
+    into the SSH shell (the exact pattern of a manual `sol()` helper).
+- `port` selects the node console service: `2200` = BMC access port (BMC
+  BusyBox shell; the collector plan substitutes host-OS probes with BMC
+  equivalents (`sudo -S ipmitool sensor list`, `sudo -S ipmitool sel list`,
+  `dmesg -r`) and skips pcie/storage probes that need host-OS tools); `22` =
+  host SOL (the host Linux root shell where `docker`/`ss`/`hostname` run —
+  what LLM endpoint discovery uses).
+- Each rack may run its own manager: `console_defaults.rack_addresses`
+  (`Q71: 10.0.128.98`, ...) is compared numerically per rack, falling back to
+  `address`. Pin each manager's host key in `known_hosts_path`
+  (`ssh-keyscan <ip> >> config/rackmgr_known_hosts`) — connections fail
+  closed otherwise.
+
+### Rack-level Redfish evidence (no jumpin needed)
+
+The rack manager also serves a per-node Redfish API on its own HTTPS port
+(`https://<rack_ip>/<cable>/amc1/redfish/v1`). Configure a vault password and
+the debug step collects two read-only evidence sets straight from the rack —
+**no serial session, no server jumpin** (and they arrive even when the console
+hop is the broken thing):
+
+```yaml
+console_defaults:
+  # ... console fields above ...
+  redfish_user: root
+  redfish_password_vault_path: secret/harness/rackmgr/redfish
+```
+
+```powershell
+harness secrets set-password secret/harness/rackmgr/redfish
+```
+
+- Fetched per target: the node **event log** (`EventLog/Entries`, sorted by
+  creation time) and its **service conditions** — the same two reads the
+  rack-side `get_event_logs` / `get_service_conditions` helpers do.
+- GET-only by construction: the client surface cannot express a write, so
+  firmware-update/power-control endpoints are unreachable (unlike raw
+  `curl`, which happily POSTs).
+- Transport auto-falls-back: direct HTTPS to the rack IP first; if it is not
+  routable from the workstation, the request rides the rack-manager SSH hop
+  (same pinned-host-key primitive as the LLM tunnel). Each dump records which
+  transport served it.
+- Same trust gate as the console: lab/qa only. The password is vaulted, joins
+  the redaction set, and never reaches prompts or the audit log.
+- Without the vault path, behavior is unchanged — Redfish collection simply
+  does not run.
+
+### LLM-only console (`llm_console:`)
+
+The golden server hosting the vLLM model is often reached differently from
+the debug console (different tool, port, or account). The optional
+`llm_console:` block — same shape as `console_defaults:` — is used ONLY for
+LLM endpoint discovery and the LLM tunnel hop; the debug path above keeps
+using `console_defaults:` untouched:
+
+```yaml
+console_defaults:               # debug path (unchanged)
+  address: 192.168.202.51
+  user: log
+  identity_vault_path: secret/harness/rackmgr/id_ed25519
+  known_hosts_path: config/rackmgr_known_hosts
+  tool: jumpin
+  trust_level: lab
+  port: 2200
+  sudo_vault_path: secret/harness/bmc/sudo
+llm_console:                    # LLM-only access to the golden server
+  address: 192.168.202.51       # fallback
+  user: root
+  identity_vault_path: secret/harness/rackmgr/id_ed25519
+  known_hosts_path: config/rackmgr_known_hosts
+  tool: direct                  # start serial session straight in the SSH shell
+  trust_level: lab
+  port: 22                      # host SOL (host root shell: docker/ss/hostname)
+  sudo_vault_path: secret/harness/bmc/sudo
+  rack_addresses: {Q71: 10.0.128.98}
+```
+
+Absent `llm_console:`, the LLM paths fall back to `console_defaults:`.
 - sudo probes trigger an automatic `password for` → send-password handshake
   from `sudo_vault_path`.
 
@@ -273,7 +351,53 @@ Under `harness_runs/<run-id>/`:
 ## 9. Locally hosted model (temporary debug agent)
 
 You can serve the reasoning model on a lab box (vLLM is natively
-OpenAI-compatible) and point the harness at it for a few runs:
+OpenAI-compatible) and point the harness at it — including on the golden
+server itself, the same rack/cable target you are debugging. The simple path
+is the guided setup — `harness menu → model → local/harness-diag` (or
+`/model` in a session):
+
+1. Provider and endpoint URL (Enter = `http://127.0.0.1:8000/v1`).
+2. Transport: **direct** if the workstation can reach the endpoint, or
+   **tunnel — model runs on the golden server** if it lives on the rack/cable
+   debug target. The wizard asks the rack/cable (prefilled from the active
+   session target), probes the node over the jumpin console, and you pick the
+   tunnel `HOST:PORT` from the discovered candidates.
+3. The wizard probes `GET /models` through the hop and lists the served
+   model ids — pick one (vLLM rejects any other name).
+
+The choice is remembered in `config/models.yaml`, so every later run targets
+the server by `--rack/--cable` as usual and the LLM hop is automatic.
+
+To see the candidates standalone (same read-only probes: `hostname -I`,
+`ss`, `sudo -S docker ps` when the sudo password is configured):
+
+```powershell
+harness llm discover --inventory inventory.yaml --rack Q61 --cable 8
+#   addresses : 10.0.0.42, ...
+#   container : vllm-qwen -> 8000
+#   suggested: harness llm check --tunnel 10.0.0.42:8000 --inventory ...
+```
+
+If the rack manager refuses the forward, the wizard prints the
+reverse-tunnel relay recipe and can save the relay URL as the endpoint:
+
+```text
+# from the node console (jumpin session):
+ssh -fN -R 127.0.0.1:18000:127.0.0.1:8000 <relay-reachable-from-node>
+# the harness then calls http://127.0.0.1:18000/v1 like any local endpoint
+```
+
+Manual fallback (no discovery tooling on the node): open the console and read
+the listening sockets directly — port `8000` shows as hex `1F40` with state
+`0A` (LISTEN):
+
+```powershell
+harness console --inventory inventory.yaml --rack Q61 --cable 8 `
+  --probe "cat /proc/net/tcp" --probe "cat /etc/hosts"
+```
+
+The equivalent one-shot flags (also useful to override the remembered model
+for a single run):
 
 ```powershell
 # 1. Preflight: reachability + served model list (staged report)
@@ -294,6 +418,9 @@ harness diagnose --inventory inventory.yaml --rack Q61 --cable 8 ... `
 
 Notes:
 
+- After every pick the endpoint is probed non-blockingly; if the chosen model
+  id is not in the served list, the picker offers the served ids (vLLM
+  rejects any other name — a silent `harness-diag` id would 404 every call).
 - `--llm-tunnel` implies provider `local`; it reuses `console_defaults`
   credentials + pinned host keys, opens at run start, closes at run end.
 - If the rack manager refuses forwarding (`[FAIL] forward`), the output prints

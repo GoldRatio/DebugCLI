@@ -284,6 +284,12 @@ print(summarize(dumps).interesting)   # anomalous lines surfaced to the LLM
 - [ ] sudo probe renders the `password for` -> send-password handshake.
 - [ ] Live run reaches Q71 cable 8 console and returns `LnkSta:` lines.
 - [ ] Host-key change on the rack manager causes a hard stop (not silent trust).
+- [ ] Redfish (if `redfish_password_vault_path` configured): a diagnose run on
+      a rack/cable target shows `redfish` dumps (`GET <preflight>`,
+      `GET /Systems/.../EventLog/Entries`, `GET /ServiceConditions`) in
+      `dumps/` WITHOUT opening a serial session for them; without the vault
+      path, no redfish collector is built. Direct-vs-tunnel transport is
+      recorded per dump in `meta.transport`.
 
 ---
 

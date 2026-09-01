@@ -40,6 +40,7 @@ _PATH_KEYS = {
     "console_identity_vault_path",
     "sudo_vault_path",
     "api_key_vault_path",
+    "redfish_password_vault_path",
 }
 
 
@@ -82,6 +83,9 @@ def lint_inventory(inv: Inventory) -> list[InventoryIssue]:
             _lint_value(host.name, "console.cable", host.console.cable, issues)
             if host.console.sudo_vault_path is not None:
                 _lint_value(host.name, "console.sudo_vault_path", host.console.sudo_vault_path, issues)
+            if host.console.redfish_password_vault_path is not None:
+                _lint_value(host.name, "console.redfish_password_vault_path",
+                            host.console.redfish_password_vault_path, issues)
             if host.console.port is not None and not 1 <= host.console.port <= 65535:
                 issues.append(InventoryIssue(host.name, "console.port",
                                              f"port {host.console.port} out of range 1-65535"))
@@ -93,8 +97,35 @@ def lint_inventory(inv: Inventory) -> list[InventoryIssue]:
         _lint_value(None, "console_defaults.known_hosts_path", d.known_hosts_path, issues)
         if d.sudo_vault_path is not None:
             _lint_value(None, "console_defaults.sudo_vault_path", d.sudo_vault_path, issues)
+        if d.redfish_password_vault_path is not None:
+            _lint_value(None, "console_defaults.redfish_password_vault_path",
+                        d.redfish_password_vault_path, issues)
+        if d.password_vault_path is not None:
+            _lint_value(None, "console_defaults.password_vault_path",
+                        d.password_vault_path, issues)
+        if d.node_password_vault_path is not None:
+            _lint_value(None, "console_defaults.node_password_vault_path",
+                        d.node_password_vault_path, issues)
         if d.port is not None and not 1 <= d.port <= 65535:
             issues.append(InventoryIssue(None, "console_defaults.port",
+                                         f"port {d.port} out of range 1-65535"))
+    if inv.llm_console is not None:
+        d = inv.llm_console
+        _lint_value(None, "llm_console.identity_vault_path", d.identity_vault_path, issues)
+        _lint_value(None, "llm_console.known_hosts_path", d.known_hosts_path, issues)
+        if d.sudo_vault_path is not None:
+            _lint_value(None, "llm_console.sudo_vault_path", d.sudo_vault_path, issues)
+        if d.redfish_password_vault_path is not None:
+            _lint_value(None, "llm_console.redfish_password_vault_path",
+                        d.redfish_password_vault_path, issues)
+        if d.password_vault_path is not None:
+            _lint_value(None, "llm_console.password_vault_path",
+                        d.password_vault_path, issues)
+        if d.node_password_vault_path is not None:
+            _lint_value(None, "llm_console.node_password_vault_path",
+                        d.node_password_vault_path, issues)
+        if d.port is not None and not 1 <= d.port <= 65535:
+            issues.append(InventoryIssue(None, "llm_console.port",
                                          f"port {d.port} out of range 1-65535"))
     return issues
 
@@ -123,6 +154,7 @@ def _from_mapping(raw: dict | None) -> Inventory:
     hosts = []
     llm = _llm_from_mapping(raw.get("llm"))
     console_defaults = _console_defaults_from_mapping(raw.get("console_defaults"), trust)
+    llm_console = _console_defaults_from_mapping(raw.get("llm_console"), trust)
     for entry in raw.get("hosts", []) or []:
         ssh = entry["ssh"]
         bmc = entry["bmc"]
@@ -143,6 +175,15 @@ def _from_mapping(raw: dict | None) -> Inventory:
                 prompts=(prompts[0], prompts[1]) if prompts else ("RScmCli#", "~#"),
                 port=int(port_raw) if port_raw is not None else None,
                 sudo_vault_path=console_raw.get("sudo_vault_path"),
+                redfish_user=console_raw.get("redfish_user"),
+                redfish_password_vault_path=console_raw.get("redfish_password_vault_path"),
+                rack_addresses={str(k): str(v) for k, v in
+                                (console_raw.get("rack_addresses") or {}).items()}
+                                if console_raw.get("rack_addresses") else None,
+                bastion=console_raw.get("bastion"),
+                password_vault_path=console_raw.get("password_vault_path"),
+                node_user=console_raw.get("node_user"),
+                node_password_vault_path=console_raw.get("node_password_vault_path"),
             )
         hosts.append(
             Host(
@@ -165,7 +206,8 @@ def _from_mapping(raw: dict | None) -> Inventory:
                 console=console,
             )
         )
-    return Inventory(trust_level=trust, hosts=hosts, llm=llm, console_defaults=console_defaults)
+    return Inventory(trust_level=trust, hosts=hosts, llm=llm,
+                     console_defaults=console_defaults, llm_console=llm_console)
 
 
 def _console_defaults_from_mapping(raw: object, trust: str) -> ConsoleDefaults | None:
@@ -183,6 +225,13 @@ def _console_defaults_from_mapping(raw: object, trust: str) -> ConsoleDefaults |
         prompts=(prompts[0], prompts[1]) if prompts else ("RScmCli#", "~#"),
         port=int(port_raw) if port_raw is not None else None,
         sudo_vault_path=raw.get("sudo_vault_path"),
+        rack_addresses={str(k): str(v) for k, v in
+                        (raw.get("rack_addresses") or {}).items()}
+                        if raw.get("rack_addresses") else None,
+        bastion=raw.get("bastion"),
+        password_vault_path=raw.get("password_vault_path"),
+        node_user=raw.get("node_user"),
+        node_password_vault_path=raw.get("node_password_vault_path"),
     )
 
 

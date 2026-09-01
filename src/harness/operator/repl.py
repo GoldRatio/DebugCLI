@@ -488,11 +488,13 @@ def _run_probes(session: Session, subsystems: list[str], doc_topics: list[str],
     from ..diagnosis.engine import decode_dumps, prebatch_console_plan
     from ..engine.allowlist import default_policy
     from ..engine.bmc import BmcRunner
+    from ..engine.redfish import RedfishClient, RedfishError
     from ..engine.session import SSHSession
     from ..engine.sol import ConsoleRunner, SerialConsole
     from ..inspect.collectors.bmc_console import BmcConsoleCollector
     from ..inspect.collectors.doc_guided import DocGuidedProbeCollector
     from ..inspect.collectors.ipmi import IpmiCollector
+    from ..inspect.collectors.redfish import RedfishCollector
     from ..inspect.decoder import Decoder
     from ..inspect.model import PROFILE_COLLECTORS
     from ..inspect.registry import make_collector
@@ -543,7 +545,18 @@ def _run_probes(session: Session, subsystems: list[str], doc_topics: list[str],
                 bmc_runner = BmcRunner(host.bmc.address, host.bmc.username,
                                        bmc_password)
 
+        redfish_collector = None
+        if use_console and host.console.redfish_password_vault_path is not None:
+            try:
+                redfish_collector = RedfishCollector(
+                    RedfishClient(host.console, host.console.cable,
+                                  session.store))
+            except RedfishError as exc:
+                progress(f"redfish unavailable: {exc}")
+
         def collector_factory(name, _runner):
+            if name == "redfish":
+                return redfish_collector
             if _runner.is_console:
                 if name in ("pcie", "storage"):
                     return None
@@ -610,6 +623,12 @@ def _run_probes(session: Session, subsystems: list[str], doc_topics: list[str],
                 runner, doc_commands).collect()
             ok = sum(1 for d in dumps["doc_guided"] if d.ok)
             lines.append(f"doc-guided: {len(dumps['doc_guided'])} dump(s), {ok} ok")
+
+        if redfish_collector is not None:
+            progress("probe redfish: event_log, service_conditions")
+            dumps["redfish"] = redfish_collector.collect()
+            ok = sum(1 for d in dumps["redfish"] if d.ok)
+            lines.append(f"redfish: {len(dumps['redfish'])} dump(s), {ok} ok")
 
         decoded = decode_dumps(Decoder(),
                                [d for ds in dumps.values() for d in ds])
@@ -1101,17 +1120,55 @@ def _slash_lint(session: Session) -> None:
 def _set_session_model(session: Session, catalog, profile) -> None:
     """Switch the session's reasoning + routing adapters to ``profile`` and
     remember it in ``config/models.yaml`` for the next run. The profile's own
-    endpoint wins; otherwise a session-pinned ``--llm-url``/tunnel is kept."""
+    endpoint wins; a profile tunnel opens (or reuses) a rack-manager forward
+    for the in-session adapters and is kept so spawned runs open their own
+    hop; otherwise a session-pinned ``--llm-url`` is merged as before. A
+    failed forward aborts the switch (the previous model stays active)."""
     from dataclasses import replace as _dc_replace
 
-    effective = (_dc_replace(profile, url=session.llm_url)
-                 if not profile.url and session.llm_url else profile)
+    if profile.tunnel:
+        if session.llm_tunnel == profile.tunnel and session.llm_url:
+            effective = _dc_replace(profile, url=session.llm_url)
+        else:
+            from ..engine.tunnel import LLMForward, TunnelError, parse_tunnel_spec
+            from .cli import _ACTIVE_LLM_FORWARDS
+            from .llm_discover import llm_bastion_domain, llm_console_domain
+
+            console = llm_console_domain(session.inv,
+                                         session.target.rack or "",
+                                         session.target.cable or "")
+            if console is None:
+                _print_line(session, ui.warn(
+                    "  x profile tunnel needs a fleet llm_console (or "
+                    "console_defaults) block in the inventory"))
+                return
+            forward = LLMForward(*parse_tunnel_spec(profile.tunnel), console,
+                                 session.store,
+                                 bastion=llm_bastion_domain(
+                                     session.inv, session.target.rack or "",
+                                     session.target.cable or ""))
+            try:
+                url = forward.start()
+            except TunnelError as exc:
+                forward.close()
+                _print_line(session, ui.warn(
+                    f"  x rack-manager forward failed ({exc.stage}): {exc} "
+                    "(switch aborted; previous model stays active)"))
+                return
+            _ACTIVE_LLM_FORWARDS.append(forward)
+            session.llm_tunnel = profile.tunnel
+            session.llm_url = url
+            effective = _dc_replace(profile, url=url)
+    else:
+        effective = (_dc_replace(profile, url=session.llm_url)
+                     if not profile.url and session.llm_url else profile)
+        if profile.url:
+            session.llm_url = profile.url
+            session.llm_tunnel = None
     session.llm = effective.build(session.store)
     session.router_llm = effective.build(session.store)
     session.llm_ident = profile.ident
     session.llm_mode = "stub" if profile.ident == "stub" else profile.ident.split("/")[0]
-    if profile.url:
-        session.llm_url = profile.url
     catalog.choose(profile)
     catalog.save()
     _print_line(session, ui.good(
@@ -1121,10 +1178,15 @@ def _set_session_model(session: Session, catalog, profile) -> None:
 
 def _slash_model(session: Session, arg: str) -> None:
     """``/model`` / ``/model <ident>`` -- pick the LLM reasoning model from the
-    catalog (arrow-key picker, type-to-filter), or switch straight to a named
-    ident. The choice is applied to the next run and remembered."""
+    catalog (arrow-key picker, type-to-filter), switch straight to a named
+    ident, or run the guided setup for an unconfigured built-in / the ``+``
+    row. The choice is applied to the next run and remembered; the picked
+    endpoint is probed against the served list (a mismatch offers a one-key
+    switch)."""
+    from dataclasses import replace as _dc_replace
+
     from ..config.model_catalog import ModelCatalog, picker_rows
-    from .menu import ask_model_profile, select
+    from .menu import ask_model_profile, check_profile, select
 
     if session.task is not None and session.task.alive:
         _print_line(session, ui.warn("  model switching is disabled while a run is "
@@ -1133,28 +1195,46 @@ def _slash_model(session: Session, arg: str) -> None:
     catalog = ModelCatalog.load(inv=session.inv)
     arg = arg.strip()
     if arg:
-        profile = catalog.resolve(model_id=arg, url=session.llm_url)
-        _set_session_model(session, catalog, profile)
-        return
-    labels, profiles, add_idx = picker_rows(catalog)
-    idx = select("LLM model (reasoning backend)", labels, reader=session.reader)
-    if idx is None:
-        return
-    if idx == add_idx:
-        profile = ask_model_profile(reader=session.reader)
-        if profile is None:
-            return
-        catalog.add(profile)
+        profile = catalog.resolve(model_id=arg)
     else:
-        profile = profiles[idx]
+        labels, profiles, add_idx = picker_rows(catalog)
+        idx = select("LLM model (reasoning backend)", labels, reader=session.reader)
+        if idx is None:
+            return
+        if idx == add_idx:
+            profile = ask_model_profile(reader=session.reader, inv=session.inv,
+                                        store=session.store,
+                                        target_label=session.target_label or None)
+            if profile is None:
+                return
+            catalog.add(profile)
+        else:
+            profile = profiles[idx]
+            if profile.needs_setup:
+                guided = ask_model_profile(provider=profile.provider,
+                                           reader=session.reader,
+                                           inv=session.inv, store=session.store,
+                                           target_label=session.target_label or None)
+                if guided is None:
+                    return
+                catalog.add(guided)
+                profile = guided
     _set_session_model(session, catalog, profile)
+    suggestion = check_profile(profile, url=session.llm_url,
+                               reader=session.reader,
+                               rack=session.target.rack or "",
+                               cable=session.target.cable or "")
+    if suggestion and suggestion != profile.model:
+        profile = _dc_replace(profile, model=suggestion)
+        _set_session_model(session, catalog, profile)
 
 
 _HELP = """\
 /help      this list
 /hosts     list inventory hosts
 /use <h|rack cable n|ip|alias>   switch the active target
-/model [ident]  pick the LLM model (arrow keys, type to filter); or set one
+/model [ident]  pick the LLM model (arrow keys, type to filter); guided setup
+                for a new endpoint; or set one directly
 /context   queue a note for the next run
 /testlog <path>  queue a harness/FAT test log for the next run (failures become evidence)
 /status    what is running / what was done

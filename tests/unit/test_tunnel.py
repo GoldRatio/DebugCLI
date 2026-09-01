@@ -86,7 +86,7 @@ def _install_fakes(monkeypatch, *, auth_error=None, channel_error=None,
             seen["host_keys"] = path
 
         def connect(self, hostname, username, key_filename,
-                    look_for_keys, allow_agent, timeout):
+                    look_for_keys, allow_agent, timeout, **kw):
             if auth_error is not None:
                 raise auth_error
             seen["connect"] = (hostname, username, key_filename)
@@ -128,6 +128,27 @@ def test_auth_failure_is_staged_and_key_material_cleaned(tmp_path, monkeypatch):
     assert "auth boom" in str(exc.value)
     assert not seen["key_path"].exists()      # materialized key always unlinked
     assert fwd.url is None
+
+
+def test_auth_failure_names_rejected_methods(tmp_path, monkeypatch):
+    """Key + vault password both rejected -> the staged error says where to
+    fix the material."""
+    err = Exception("Authentication failed.")
+    _install_fakes(monkeypatch, auth_error=err)
+    domain = ConsoleDomain(
+        address="192.168.202.51", user="root",
+        identity_vault_path="secret/harness/rackmgr/id_ed25519",
+        known_hosts_path=str(tmp_path / "kh"),
+        rack="Q71", cable="8", trust_level="lab",
+        password_vault_path="secret/rm-pw")
+    from harness.config.vault import MemorySecretStore
+    fwd = LLMForward("10.0.0.42", 8000, domain,
+                     MemorySecretStore({"secret/rm-pw": b"pw\n"}),
+                     tmp_dir=tmp_path)
+    with pytest.raises(TunnelError, match="both auth methods rejected"):
+        fwd.start()
+    with pytest.raises(TunnelError, match="secret/rm-pw"):
+        fwd.start()
 
 
 def test_start_binds_local_url_and_context_manager_closes(tmp_path, monkeypatch):

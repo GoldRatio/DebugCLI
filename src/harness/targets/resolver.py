@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from ..config.models import BMCDomain, ConsoleDomain, Host, Inventory, SSHDomain
+from ..config.models import BMCDomain, ConsoleDefaults, ConsoleDomain, Host, Inventory, SSHDomain
 from ..config.vault import SecretStore
 from ..engine.sol import validate_identifier
 from .aliases import load_targets
@@ -96,8 +96,9 @@ def _canonical_rack_id(rack: str) -> str:
     return rack
 
 
-def _console_domain(inv: Inventory, rack: str, cable: str) -> ConsoleDomain:
-    defaults = inv.console_defaults
+def _console_domain(inv: Inventory, rack: str, cable: str,
+                    defaults: ConsoleDefaults | None = None) -> ConsoleDomain:
+    defaults = defaults or inv.console_defaults
     if defaults is None:
         raise TargetError(
             "rack/cable targeting needs a fleet-level 'console_defaults:' block in "
@@ -120,6 +121,11 @@ def _console_domain(inv: Inventory, rack: str, cable: str) -> ConsoleDomain:
         prompts=defaults.prompts,
         port=defaults.port,
         sudo_vault_path=defaults.sudo_vault_path,
+        rack_addresses=defaults.rack_addresses,
+        bastion=defaults.bastion,
+        password_vault_path=defaults.password_vault_path,
+        node_user=defaults.node_user,
+        node_password_vault_path=defaults.node_password_vault_path,
     )
 
 
@@ -156,9 +162,13 @@ def resolve_target(
     ssh_user: str = _DEFAULT_SSH_USER,
     identity_vault_path: str | None = None,
     known_hosts_path: str = _DEFAULT_KNOWN_HOSTS,
+    console_defaults: ConsoleDefaults | None = None,
 ) -> Target:
     """Resolve a runtime spec to a connection ``Target`` (never raises on bad
-    credentials -- those surface as clear ``TargetError``s before any connection)."""
+    credentials -- those surface as clear ``TargetError``s before any connection).
+
+    ``console_defaults`` overrides the inventory's block (the LLM paths layer
+    their own ``llm_console`` config over the same rack/cable addressing)."""
     if spec.name is not None:
         try:
             host = inv.get(spec.name)
@@ -183,7 +193,7 @@ def resolve_target(
         alias_model = None
 
     if spec.rack is not None and spec.cable is not None:
-        console = _console_domain(inv, spec.rack, spec.cable)
+        console = _console_domain(inv, spec.rack, spec.cable, defaults=console_defaults)
         label = f"{console.rack}-cable{console.cable}"
         return Target(
             kind="console", label=label, trust_level=console.trust_level,

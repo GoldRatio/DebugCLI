@@ -16,6 +16,14 @@ Sources of *available* models (deduplicated by ident):
   ``local/harness-diag`` for a locally served vLLM/Ollama endpoint),
 - ``stub`` (pipeline-only, no reasoning) -- always available last.
 
+A profile may carry ``tunnel: HOST:PORT`` -- an endpoint not reachable from
+the workstation, carried per run through the rack-manager SSH hop by
+``operator.cli._prepare_llm_endpoint`` (explicit ``--llm-tunnel``/``--llm-url``
+flags always win). The typical case is a model served on the golden server
+itself -- the rack/cable debug target; note rack/cable alone addresses a
+serial console, so the profile stores the node's rackmgr-side HOST, not the
+rack/cable. Once configured, the model needs zero per-run flags.
+
 Resolution precedence for the *current* model:
 ``--llm-model <ident>`` > ``--llm <provider>`` > persisted ``current`` >
 inventory ``llm`` block > default (``openai/harness-diag``).
@@ -27,6 +35,7 @@ import json
 import os
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import ClassVar
 
 _PROVIDERS = ("openai", "gemini", "local", "stub")
 
@@ -37,14 +46,31 @@ _DEFAULT_MODELS = {"openai": "harness-diag", "gemini": "gemini-2.5-flash",
 @dataclass(frozen=True)
 class ModelProfile:
     """One selectable LLM backend. ``url``/``api_key_vault_path`` are optional
-    and fall back to each adapter's env defaults when omitted."""
+    and fall back to each adapter's env defaults when omitted. ``tunnel``
+    (``HOST:PORT``) marks an endpoint behind the rack-manager SSH hop; the
+    forward is opened per run and the adapter is pointed at its local URL."""
 
     provider: str = "openai"
     model: str = "harness-diag"
     url: str | None = None
     api_key_vault_path: str | None = None
-    timeout: float = 120.0
+    tunnel: str | None = None
+    # None = provider default: self-hosted endpoints (local) get a generous
+    # generation budget -- a full structured diagnosis for a long prompt can
+    # take minutes behind the rack-manager tunnel -- while cloud providers
+    # stay fail-fast. HARNESS_LLM_TIMEOUT env still overrides everything.
+    timeout: float | None = None
     label: str | None = None
+
+    _PROVIDER_DEFAULT_TIMEOUTS: ClassVar[dict[str, float]] = {"local": 600.0}
+
+    @property
+    def effective_timeout(self) -> float:
+        """The adapter timeout in force: explicit profile value, else the
+        provider default (600s self-hosted, 120s cloud)."""
+        if self.timeout:
+            return self.timeout
+        return self._PROVIDER_DEFAULT_TIMEOUTS.get(self.provider, 120.0)
 
     @property
     def ident(self) -> str:
@@ -55,6 +81,18 @@ class ModelProfile:
     @property
     def display(self) -> str:
         return self.label or self.ident
+
+    @property
+    def needs_setup(self) -> bool:
+        """True for the silent-default built-ins (``openai/harness-diag``,
+        ``local/harness-diag``): no endpoint of their own, so selecting them
+        should launch the guided setup instead of quietly falling back to env
+        defaults. Operator-configured profiles (any url/tunnel/vault path or
+        a real model id) never trigger it."""
+        return (self.provider in ("openai", "local")
+                and self.model == "harness-diag"
+                and not self.url and not self.tunnel
+                and not self.api_key_vault_path)
 
     def build(self, store: object) -> object:
         """Build the live adapter. The API key, when vault-path configured, is
@@ -72,12 +110,12 @@ class ModelProfile:
             return StubLLM()
         if self.provider == "gemini":
             return GeminiLLM(url=self.url, api_key=api_key, model=self.model,
-                             timeout=self.timeout)
+                             timeout=self.effective_timeout)
         if self.provider == "local":
             return LocalLLM(url=self.url, api_key=api_key, model=self.model,
-                            timeout=self.timeout)
+                            timeout=self.effective_timeout)
         return OpenAICompatLLM(url=self.url, api_key=api_key, model=self.model,
-                               timeout=self.timeout)
+                               timeout=self.effective_timeout)
 
     def to_dict(self) -> dict:
         d = {"provider": self.provider, "model": self.model}
@@ -85,7 +123,9 @@ class ModelProfile:
             d["url"] = self.url
         if self.api_key_vault_path:
             d["api_key_vault_path"] = self.api_key_vault_path
-        if self.timeout != 120.0:
+        if self.tunnel:
+            d["tunnel"] = self.tunnel
+        if self.timeout is not None:
             d["timeout"] = self.timeout
         if self.label:
             d["label"] = self.label
@@ -103,6 +143,14 @@ class ModelProfile:
             model = "stub"
         if not model:
             raise ValueError("model id is required")
+        tunnel = str(data["tunnel"]).strip() if data.get("tunnel") else None
+        if tunnel:
+            from ..engine.tunnel import parse_tunnel_spec
+
+            try:
+                parse_tunnel_spec(tunnel)
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
         return cls(
             provider=provider,
             model=model,
@@ -110,7 +158,9 @@ class ModelProfile:
             api_key_vault_path=(
                 str(data["api_key_vault_path"]).strip()
                 if data.get("api_key_vault_path") else None),
-            timeout=float(data.get("timeout", 120.0)),
+            tunnel=tunnel,
+            timeout=(float(data["timeout"])
+                     if data.get("timeout") is not None else None),
             label=str(data["label"]).strip() if data.get("label") else None,
         )
 
@@ -172,10 +222,12 @@ class ModelCatalog:
         """The effective profile under the resolution precedence (flag-provider
         and ``model_id`` come from the CLI; otherwise the remembered current).
         ``url``, when given (``--llm-url``), overrides whatever endpoint the
-        resolved profile carried -- per-run endpoint pinning."""
+        resolved profile carried and drops its ``tunnel`` -- a pinned direct
+        URL is authoritative; per-run endpoint pinning. The tunnel is otherwise
+        carried along and honored by ``_prepare_llm_endpoint``."""
         profile = self._resolve_base(provider=provider, model_id=model_id)
         if url and profile.url != url:
-            return replace(profile, url=url.strip())
+            return replace(profile, url=url.strip(), tunnel=None)
         return profile
 
     def _resolve_base(self, provider: str | None = None,
@@ -295,5 +347,5 @@ def picker_rows(catalog: ModelCatalog) -> tuple[list[str], list[ModelProfile], i
         labels.append(f"{p.display}{mark}")
         profiles.append(p)
     add_idx = len(profiles)
-    labels.append("+ add a custom model (provider, model id, optional url / key vault path)")
+    labels.append("+ add / configure a model (guided: endpoint, tunnel, served model id)")
     return labels, profiles, add_idx

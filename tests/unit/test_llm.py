@@ -9,6 +9,7 @@ from harness.diagnosis.llm import (
     OpenAICompatLLM,
     StubLLM,
     list_models,
+    probe_chat,
 )
 from harness.diagnosis.schema import Diagnosis, Risk
 
@@ -112,7 +113,13 @@ def test_fenced_reply_parses_via_chat_json(monkeypatch):
     assert llm.chat_json([{"role": "user", "content": "hi"}]) == {"ok": True}
 
 
-def test_gemini_system_only_request_gets_user_turn(monkeypatch):
+@pytest.mark.parametrize("cls", [OpenAICompatLLM, LocalLLM, GeminiLLM])
+def test_system_only_request_gets_user_turn_all_adapters(monkeypatch, cls):
+    """The single-shot diagnosis path builds a system-only payload; some
+    OpenAI-compatible layers (Gemini's, strict local gateways -- observed as
+    HTTP 400 ``No user query found in messages`` from a rack-served vLLM)
+    refuse it. Every adapter must guarantee a user turn on the wire, and
+    never double it when one is already present."""
     import json
 
     import harness.diagnosis.llm as llm_mod
@@ -130,18 +137,20 @@ def test_gemini_system_only_request_gets_user_turn(monkeypatch):
         def __exit__(self, *exc):
             return False
 
-    seen = {}
+    seen = []
 
     def fake_urlopen(request, timeout):
-        seen["messages"] = json.loads(request.data)["messages"]
+        seen.append(json.loads(request.data)["messages"])
         return _FakeResp(json.dumps({
             "choices": [{"message": {"content": '{"ok": true}'}}],
         }).encode())
 
     monkeypatch.setattr(llm_mod.urllib.request, "urlopen", fake_urlopen)
-    llm = GeminiLLM(url="http://127.0.0.1:9/v1", api_key="k", timeout=1.0)
+    llm = cls(url="http://127.0.0.1:9/v1", api_key="k", timeout=1.0)
     assert llm.chat_json([{"role": "system", "content": "diagnose"}]) == {"ok": True}
-    assert [m["role"] for m in seen["messages"]] == ["system", "user"]
+    assert [m["role"] for m in seen[0]] == ["system", "user"]
+    assert llm.chat_json([{"role": "user", "content": "hi"}]) == {"ok": True}
+    assert [m["role"] for m in seen[1]] == ["user"]  # passthrough, no duplicate
 
 
 def _diagnosis_json(confidence=0.5):
@@ -260,6 +269,20 @@ def test_list_models_unreachable_raises_llm_error():
         list_models("http://127.0.0.1:1/v1", timeout=1.0)
 
 
+def test_list_models_connection_reset_is_staged(monkeypatch):
+    """A refused tunnel forward resets the socket mid-read -- the raw
+    ConnectionResetError must surface as a staged LLMError, never a
+    traceback out of the wizard."""
+    import harness.diagnosis.llm as llm_mod
+
+    def reset_during_read(request, timeout):
+        raise ConnectionResetError(10054, "forcibly closed by the remote host")
+
+    monkeypatch.setattr(llm_mod.urllib.request, "urlopen", reset_during_read)
+    with pytest.raises(LLMError, match="LLM connection failed"):
+        list_models("http://127.0.0.1:9/v1")
+
+
 def test_list_models_malformed_reply_raises(monkeypatch):
     import harness.diagnosis.llm as llm_mod
 
@@ -277,3 +300,113 @@ def test_list_models_malformed_reply_raises(monkeypatch):
                         lambda request, timeout: _FakeResp())
     with pytest.raises(LLMError):
         list_models("http://127.0.0.1:9/v1")
+
+
+# ---- probe_chat: minimal chat/completions preflight (llm check stage) ----
+
+def test_probe_chat_mirrors_single_shot_wire_shape(monkeypatch):
+    """The probe must send the same request shape the run's ``reason`` step
+    sends -- system + guaranteed user turn, json response format -- so a
+    server-side validation 400 surfaces here, before a run's collection
+    phase."""
+    import json
+
+    import harness.diagnosis.llm as llm_mod
+
+    class _FakeResp:
+        def __init__(self, data: bytes):
+            self._data = data
+
+        def read(self):
+            return self._data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    seen = {}
+
+    def fake_urlopen(request, timeout):
+        seen["url"] = request.full_url
+        seen["body"] = json.loads(request.data)
+        return _FakeResp(json.dumps({
+            "model": "Qwen/Qwen3.8-27B",
+            "choices": [{"message": {"content": '{"ok"'}}],
+        }).encode())
+
+    monkeypatch.setattr(llm_mod.urllib.request, "urlopen", fake_urlopen)
+    served = probe_chat("http://127.0.0.1:9/v1/", model="Qwen/Qwen3.8-27B",
+                        timeout=5.0)
+    assert served == "Qwen/Qwen3.8-27B"      # server-echoed serving id
+    assert seen["url"].endswith("/chat/completions")  # trailing slash stripped
+    body = seen["body"]
+    assert [m["role"] for m in body["messages"]] == ["system", "user"]
+    assert body["max_tokens"] == 1
+    assert body["response_format"] == {"type": "json_object"}
+
+
+def test_probe_chat_stages_http_400_detail(monkeypatch):
+    import io
+    import urllib.error as urllib_error
+
+    import harness.diagnosis.llm as llm_mod
+
+    def refuse(request, timeout):
+        raise urllib_error.HTTPError(
+            "http://127.0.0.1:9/v1/chat/completions", 400, "Bad Request",
+            {}, io.BytesIO(
+                b'{"error":{"message":"No user query found in messages."}}'))
+
+    monkeypatch.setattr(llm_mod.urllib.request, "urlopen", refuse)
+    with pytest.raises(LLMError, match="No user query found in messages"):
+        probe_chat("http://127.0.0.1:9/v1", model="m")
+
+
+def test_probe_chat_connection_reset_is_staged(monkeypatch):
+    import harness.diagnosis.llm as llm_mod
+
+    def reset_during_read(request, timeout):
+        raise ConnectionResetError(10054, "forcibly closed by the remote host")
+
+    monkeypatch.setattr(llm_mod.urllib.request, "urlopen", reset_during_read)
+    with pytest.raises(LLMError, match="LLM connection failed"):
+        probe_chat("http://127.0.0.1:9/v1", model="m")
+
+
+def test_probe_chat_unreachable_raises_llm_error():
+    with pytest.raises(LLMError):
+        probe_chat("http://127.0.0.1:1/v1", model="m", timeout=1.0)
+
+
+# ---- generation timeouts: staged, actionable, never "connection failed" ----
+
+def test_chat_read_timeout_is_staged_with_actionable_hint(monkeypatch):
+    """A mid-generation read timeout (local model over a tunnel, socket idle
+    while the model produces) must state the budget and the fix -- not look
+    like a dead connection (``LLM connection failed: timed out Timeout
+    error``)."""
+    import urllib.error as urllib_error
+
+    import harness.diagnosis.llm as llm_mod
+
+    monkeypatch.delenv("HARNESS_LLM_TIMEOUT", raising=False)
+    llm = LocalLLM(url="http://127.0.0.1:9/v1", timeout=600.0)
+
+    def stall_mid_generation(request, timeout):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(llm_mod.urllib.request, "urlopen", stall_mid_generation)
+    with pytest.raises(LLMError, match="timed out after 600s"):
+        llm.chat_json([{"role": "user", "content": "hi"}])
+    with pytest.raises(LLMError, match="HARNESS_LLM_TIMEOUT"):
+        llm.chat_json([{"role": "user", "content": "hi"}])
+
+    def stall_during_connect(request, timeout):
+        # connect-phase timeouts arrive wrapped by urllib
+        raise urllib_error.URLError(TimeoutError("timed out"))
+
+    monkeypatch.setattr(llm_mod.urllib.request, "urlopen", stall_during_connect)
+    with pytest.raises(LLMError, match="timed out after 600s"):
+        llm.chat_json([{"role": "user", "content": "hi"}])

@@ -72,6 +72,24 @@ def test_classify_paths():
     assert classify("secret/harness/llm") == "llm"
 
 
+def test_classify_dash_password_paths_as_password():
+    """An SSH/login password stored under the llm/ tree (e.g. the
+    rack-manager password for the LLM hop) prompts as a PASSWORD, not an
+    API key."""
+    assert classify("secret/harness/llm/rackmgr-password") == "password"
+    assert classify("secret/harness/llm/hop-password") == "password"
+    assert classify(f"{LLM_VAULT}/gemini-key") == "llm"   # API keys unchanged
+
+
+def test_classify_sudo_paths_as_password():
+    """The per-rack node-sudo entry (captured fresh at every model setup)
+    prompts as a PASSWORD with a filename-based label -- never the invisible
+    LLM API-key prompt."""
+    assert classify("secret/harness/llm/node-sudo-71") == "password"
+    assert label_for("secret/harness/llm/node-sudo-71") == "node-sudo-71 password"
+    assert "sudo" in label_for("secret/harness/bmc/sudo")   # BMC label preserved
+
+
 def test_label_for_password_paths():
     assert "sudo" in label_for("secret/harness/bmc/sudo")
     assert "BMC" in label_for("secret/harness/bmc/bmc-ro")

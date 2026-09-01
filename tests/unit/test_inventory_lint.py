@@ -29,6 +29,52 @@ def test_vault_paths_clean():
     assert lint_inventory(inv) == []
 
 
+def test_console_defaults_parse_rack_addresses(tmp_path):
+    """Per-rack addresses, the bastion chain, and the node login fields all
+    round-trip into the ConsoleDefaults/ConsoleDomain model; the LLM-only
+    ``llm_console`` block parses alongside the debug console_defaults."""
+    inv_path = tmp_path / "inv.yaml"
+    inv_path.write_text(
+        "trust_level: lab\n"
+        "console_defaults:\n"
+        "  address: 192.168.202.51\n"
+        "  user: log\n"
+        "  identity_vault_path: secret/harness/rackmgr/id_ed25519\n"
+        "  known_hosts_path: config/rackmgr_known_hosts\n"
+        "  tool: jumpin\n"
+        "  port: 2200\n"
+        "  sudo_vault_path: secret/harness/bmc/sudo\n"
+        "llm_console:\n"
+        "  address: 192.168.202.51\n"
+        "  user: root\n"
+        "  identity_vault_path: secret/harness/rackmgr/id_ed25519\n"
+        "  known_hosts_path: config/rackmgr_known_hosts\n"
+        "  tool: direct\n"
+        "  port: 22\n"
+        "  bastion: 192.168.202.51\n"
+        "  password_vault_path: secret/harness/llm/rackmgr-password\n"
+        "  node_user: yemankyaw\n"
+        "  node_password_vault_path: secret/harness/llm/node-sudo-71\n"
+        "  rack_addresses:\n"
+        "    Q61: 10.0.128.74\n"
+        "    Q71: 10.0.128.98\n"
+        "hosts: []\n", encoding="utf-8")
+    inv = load_inventory(str(inv_path))
+    d = inv.console_defaults
+    assert d.tool == "jumpin" and d.port == 2200          # debug path unchanged
+    assert d.rack_addresses is None
+    lc = inv.llm_console
+    assert lc.tool == "direct" and lc.port == 22 and lc.user == "root"
+    assert lc.bastion == "192.168.202.51"
+    assert lc.password_vault_path == "secret/harness/llm/rackmgr-password"
+    assert lc.node_user == "yemankyaw"
+    assert lc.node_password_vault_path == "secret/harness/llm/node-sudo-71"
+    assert lc.rack_addresses == {"Q61": "10.0.128.74", "Q71": "10.0.128.98"}
+    assert lc.address_for_rack("Q71") == "10.0.128.98"
+    assert lc.address_for_rack("Q63") == "192.168.202.51"
+    assert lint_inventory(inv) == []
+
+
 def test_inline_secret_flagged():
     bmc = BMCDomain(address="10.0.0.11", username="bmc-ro",
                     password_vault_path="AKIA1234567890123456")

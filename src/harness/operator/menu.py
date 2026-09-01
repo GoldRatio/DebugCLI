@@ -23,6 +23,7 @@ consoles (best-effort; if that fails the numbered fallback still works).
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 
@@ -742,26 +743,365 @@ def confirm(prompt: str, *, default: bool = False) -> bool:
     return line in ("y", "yes")
 
 
-def ask_model_profile(*, reader: LineReader | None = None):
-    """Three short prompts building a custom LLM ``ModelProfile``.
+_TARGET_LABEL_RE = re.compile(r"^(Q?\d+)-cable(\d+)$", re.IGNORECASE)
 
-    Used by the ``+ add a custom model`` row in the model picker (menu and
-    ``/model`` in the REPL). Provider must be ``openai``, ``gemini`` or
-    ``local``; the URL and API-key vault path are optional and fall back to
-    the provider defaults. Returns None when cancelled.
+
+def _rack_cable_from_label(label: str | None) -> tuple[str, str] | None:
+    """Session target labels like ``Q61-cable8`` prefill the rack/cable asks."""
+    if not label:
+        return None
+    m = _TARGET_LABEL_RE.match(label.strip())
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _golden_server_tunnel(*, reader: LineReader | None = None, inv=None,
+                          store=None, target_label: str | None = None,
+                        ) -> tuple[str, str, str] | None:
+    """Ask which golden server hosts the model (rack/cable -- the same
+    addressing as the debug target), capture the node login credentials
+    fresh, probe the node over the jumpin console, and compose the tunnel
+    ``HOST:PORT``. Discovered candidates are picked from arrow-key lists;
+    manual entry is the fallback. Returns ``(spec, rack, cable, node_user)``
+    or None on cancel."""
+    from ..engine.sol import SerialProbeDenied
+    from ..engine.tunnel import parse_tunnel_spec
+    from ..targets.resolver import TargetError
+    from .llm_discover import discover, llm_console
+
+    prefill = _rack_cable_from_label(target_label)
+    rack = ask_text("Rack of the golden server"
+                    + (f" (Enter = {prefill[0]})" if prefill else " (e.g. Q61)"),
+                    reader=reader).strip() or (prefill[0] if prefill else "")
+    if not rack:
+        return None
+    cable = ask_text("Cable"
+                     + (f" (Enter = {prefill[1]})" if prefill else " (e.g. 8)"),
+                     reader=reader).strip() or (prefill[1] if prefill else "")
+    if not cable:
+        return None
+
+    discovered = None
+    node_user = ""
+    if inv is not None and store is not None:
+        # Node login capture -- prompted at EVERY model setup (the node user
+        # and its sudo password are per-host and change over time). The
+        # docker probe authenticates with this password via the sudo
+        # handshake, and the login handshake reuses it (sudo and login share
+        # the user's own password). The capture happens here where the
+        # terminal is sane.
+        node_user = ask_text("Node user on the golden server (e.g. yemankyaw)",
+                             reader=reader).strip()
+        if not node_user:
+            return None
+        from .credential_gate import CredentialPrompter
+        from .llm_discover import _node_sudo_path
+
+        node_sudo_path = _node_sudo_path(rack)
+        try:
+            material = CredentialPrompter(store).prompt_now(node_sudo_path)
+        except KeyError:
+            print(_ui.warn(f"  ! node sudo password skipped -- {node_sudo_path} "
+                           "stays unregistered; the docker probe will fail"),
+                  file=sys.stderr)
+            return None
+        store.put(node_sudo_path, material)
+        print(_ui.dim(f"  probing {rack}-cable{cable} over the console..."))
+        try:
+            discovered = discover(rack, cable, inv, store, node_user=node_user)
+        except (TargetError, SerialProbeDenied) as exc:
+            print(_ui.warn(f"  ! discovery failed: {exc}"), file=sys.stderr)
+            print(_ui.dim("    continuing with manual entry"), file=sys.stderr)
+        if discovered is not None and any(
+                "not in pinned known_hosts" in n for n in discovered.notes):
+            from .llm_discover import pin_llm_host_key
+
+            if ask_text("Pin the rack manager's host key via the bastion "
+                        "now? [y/N]", reader=reader).strip().lower() in (
+                            "y", "yes"):
+                try:
+                    summary = pin_llm_host_key(rack, cable, inv, store)
+                    print(_ui.good(f"  host key pinned: {summary}"))
+                    discovered = discover(rack, cable, inv, store)
+                except Exception as exc:  # noqa: BLE001 - staged, never fatal
+                    print(_ui.warn(f"  ! pinning failed: {exc}"), file=sys.stderr)
+                    print(_ui.dim("    continuing with manual entry"),
+                          file=sys.stderr)
+    host = port = None
+    if discovered is not None:
+        for note in discovered.notes:
+            print(_ui.dim(f"    - {note}"))
+        ports = discovered.suggested_ports()
+        if ports:
+            opts = [f"{p} [docker]" if p in discovered.containers.values()
+                    else str(p) for p in ports]
+            pidx = select("vLLM port", [*opts, "enter manually"], reader=reader)
+            if pidx is None:
+                return None
+            port = str(ports[pidx]) if pidx < len(ports) else None
+        addrs = discovered.addresses
+        if addrs:
+            aidx = select("Node HOST", [*addrs, "enter manually"], reader=reader)
+            if aidx is None:
+                return None
+            host = addrs[aidx] if aidx < len(addrs) else None
+    console = llm_console(inv) if inv is not None else None
+    if console is not None:
+        print(_ui.dim(f"  hop: rack manager {console.address_for_rack(rack)}; "
+                      "HOST must be reachable from there"))
+    if port is None:
+        port = ask_text("vLLM port (Enter = 8000)", reader=reader).strip()
+    if host is None:
+        host = ask_text("Node HOST as the rack manager addresses it "
+                        "(the node's own address, e.g. from `hostname -I`)",
+                        reader=reader).strip()
+    if not host:
+        return None
+    if console is not None and host in (
+            console.address_for_rack(rack), console.address):
+        print(_ui.warn("  ! that HOST is the rack manager's address -- the "
+                       "tunnel must target the golden server's OWN address "
+                       "(run `hostname -I` on the node)"), file=sys.stderr)
+    spec = f"{host}:{port or '8000'}"
+    try:
+        parse_tunnel_spec(spec)
+    except ValueError as exc:
+        print(f"  x {exc}", file=sys.stderr)
+        return None
+    return spec, rack, cable, node_user
+
+
+def ask_model_profile(*, reader: LineReader | None = None, provider: str | None = None,
+                      inv=None, store=None, target_label: str | None = None):
+    """Guided setup for a custom LLM ``ModelProfile``.
+
+    Used by the ``+ add / configure a model`` row in the model picker (menu
+    and ``/model`` in the REPL) and when an unconfigured built-in
+    (``local/harness-diag`` / ``openai/harness-diag``) is selected -- the
+    provider is then preselected and only the missing pieces are asked.
+
+    Asks: provider (arrow-key select), endpoint URL (default
+    ``http://127.0.0.1:8000/v1``; skipped for gemini), then transport:
+
+    - ``direct``: the endpoint is reachable from this workstation.
+    - ``tunnel``: the model runs on the golden server -- the rack/cable debug
+      target. The wizard asks rack/cable, probes the node over the jumpin
+      console (addresses, listening ports, docker port mappings) and lets the
+      operator pick the tunnel ``HOST:PORT`` from the candidates; manual
+      entry is the fallback. ``target_label`` (the active debug target)
+      prefills the rack/cable asks when it matches.
+
+    The wizard probes ``GET /models`` -- direct endpoints with a plain
+    request, tunnel endpoints through an ``LLMForward`` when ``inv``/``store``
+    are supplied. A reachable endpoint lets the operator pick the served model
+    id from a list (vLLM rejects any other name). A tunnel refused at the
+    ``forward`` stage prints the reverse-tunnel relay recipe and offers to
+    save the relay URL instead; other failures are warnings and the profile is
+    saved anyway with a manual model id. Provider must be ``openai``,
+    ``gemini`` or ``local``. Returns None when cancelled.
     """
     from ..config.model_catalog import ModelProfile
+    from ..diagnosis.llm import LLMError, list_models
+    from ..engine.tunnel import LLMForward, TunnelError, parse_tunnel_spec
+    from .llm_discover import llm_bastion_domain, llm_console_domain
 
-    provider = ask_text("Provider (openai | gemini | local)", reader=reader).strip().lower()
+    if provider is None:
+        idx = select("Provider", ["openai (OpenAI-compatible endpoint)",
+                                  "gemini (Google Gemini)",
+                                  "local (vLLM / llama.cpp / Ollama)"],
+                     reader=reader)
+        if idx is None:
+            return None
+        provider = ("openai", "gemini", "local")[idx]
+    provider = provider.strip().lower()
     if provider not in ("openai", "gemini", "local"):
         print(f"  x unknown provider {provider!r} (openai | gemini | local)",
               file=sys.stderr)
         return None
-    model = ask_text("Model id (e.g. gpt-4o)", reader=reader).strip()
+
+    url = None
+    tunnel = None
+    if provider != "gemini":
+        raw = ask_text("Endpoint URL (Enter = http://127.0.0.1:8000/v1)",
+                       reader=reader).strip()
+        url = raw or "http://127.0.0.1:8000/v1"
+        tidx = select("Transport", [
+            "direct -- endpoint reachable from this workstation",
+            ("tunnel -- model runs on the golden server (the rack/cable "
+             "debug target); HTTP via the rack-manager hop")],
+            reader=reader)
+        if tidx is None:
+            return None
+        if tidx == 1:
+            golden = _golden_server_tunnel(reader=reader, inv=inv, store=store,
+                                           target_label=target_label)
+            if golden is None:
+                return None
+            tunnel, golden_rack, golden_cable, _node_user = golden
+
+    ids: list[str] = []
+    forward = None
+    probe_url = None
+    try:
+        if tunnel:
+            console = (llm_console_domain(inv, golden_rack, golden_cable)
+                       if inv is not None else None)
+            if inv is not None and store is not None and console is not None:
+                host, port = parse_tunnel_spec(tunnel)
+                forward = LLMForward(host, port, console, store,
+                                     bastion=llm_bastion_domain(
+                                         inv, golden_rack, golden_cable))
+                try:
+                    probe_url = forward.start()
+                except TunnelError as exc:
+                    forward.close()
+                    forward = None
+                    print(_ui.warn(f"  ! tunnel hop failed ({exc.stage}): {exc}"),
+                          file=sys.stderr)
+                    if exc.stage == "forward":
+                        # rackmgr refuses / cannot route to the node (jumpin-only
+                        # fleet): the sanctioned fallback is a reverse tunnel the
+                        # operator runs from the node console, then the harness
+                        # calls the relay like any local endpoint.
+                        print(_ui.dim(
+                            "    fallback: console onto the node and run\n"
+                            f"      ssh -fN -R 127.0.0.1:18000:127.0.0.1:{port} "
+                            "<relay-reachable-from-node>\n"
+                            "    the workstation then reaches the model at "
+                            "http://127.0.0.1:18000/v1"))
+                        answer = ask_text(
+                            "Save the relay URL as the endpoint instead? [y/N]",
+                            reader=reader).strip().lower()
+                        if answer in ("y", "yes"):
+                            url = "http://127.0.0.1:18000/v1"
+                            tunnel = None
+                            probe_url = url
+                        else:
+                            print(_ui.dim(
+                                f"    `harness llm check --tunnel {tunnel} "
+                                "--inventory <path>` re-tests each stage"),
+                                file=sys.stderr)
+                    else:
+                        print(_ui.dim(f"    `harness llm check --tunnel {tunnel} "
+                                      "--inventory <path>` re-tests each stage"),
+                                      file=sys.stderr)
+            else:
+                print(_ui.dim(f"  ! tunnel saved unprobed (`harness llm check "
+                              f"--tunnel {tunnel} --inventory <path>` probes it)"),
+                      file=sys.stderr)
+        elif url:
+            probe_url = url
+        if probe_url:
+            try:
+                ids = list_models(probe_url, timeout=10.0)
+                print(_ui.good(f"  endpoint reachable: {len(ids)} model(s) served"))
+            except LLMError as exc:
+                refused = getattr(forward, "forward_error", None) if forward else None
+                print(_ui.warn(f"  ! endpoint unreachable: {exc}"), file=sys.stderr)
+                if refused:
+                    print(_ui.dim(f"    tunnel target refused: {refused} -- the "
+                                  "HOST:PORT must point at the golden server's "
+                                  "vLLM port as reachable from the manager "
+                                  "(the node's own address from `hostname -I`, "
+                                  "not the manager's)"), file=sys.stderr)
+                print(_ui.dim(f"    `harness llm check --url {probe_url}` "
+                              "stages the failure; saving anyway"),
+                      file=sys.stderr)
+    finally:
+        if forward is not None:
+            forward.close()
+
+    model = ""
+    if ids:
+        midx = select("Served model id", [*ids, "+ type a model id manually"],
+                      reader=reader)
+        if midx is None:
+            return None
+        if midx < len(ids):
+            model = ids[midx]
     if not model:
+        model = ask_text("Model id (must match the server's served name)",
+                         reader=reader).strip()
+        if not model:
+            return None
+    vault = None
+    if provider != "local":
+        vault = ask_text("API key vault path (Enter = env fallback, "
+                         "e.g. GEMINI_API_KEY)", reader=reader).strip() or None
+    # A tunnel profile carries no direct URL: the hop owns the endpoint, and
+    # persisting the placeholder would just be misleading in models.yaml.
+    return ModelProfile(provider=provider, model=model,
+                        url=None if tunnel else url,
+                        api_key_vault_path=vault, tunnel=tunnel)
+
+
+def check_profile(profile, *, url: str | None = None, inv=None, store=None,
+                  reader: LineReader | None = None, rack: str = "",
+                  cable: str = "") -> str | None:
+    """Non-blocking post-pick sanity probe for a selected ``ModelProfile``.
+
+    Confirms the endpoint answers ``GET /models`` and that the profile's model
+    id is actually served (vLLM rejects any other name). Direct endpoints are
+    probed as-is; tunnel endpoints through an ``LLMForward`` when
+    ``inv``/``store`` are supplied (rack/cable select the per-rack manager);
+    an explicit ``url`` override wins (the REPL passes its live forward URL).
+    Gemini is skipped -- its ``/models`` needs the API key and a failing
+    diagnosis surfaces that anyway. Every failure is a printed warning only; a
+    run is never blocked. Returns a replacement model id when the operator
+    picks one from the served list, else None.
+    """
+    from ..diagnosis.llm import LLMError, list_models
+    from ..engine.tunnel import LLMForward, TunnelError, parse_tunnel_spec
+    from .llm_discover import llm_bastion_domain, llm_console_domain
+
+    if profile is None or profile.provider in ("stub", "gemini"):
         return None
-    url = ask_text("Endpoint URL (Enter = provider default)", reader=reader).strip() or None
-    vault = ask_text("API key vault path (Enter = env fallback)",
-                     reader=reader).strip() or None
-    return ModelProfile(provider=provider, model=model, url=url,
-                        api_key_vault_path=vault)
+    forward = None
+    try:
+        probe_url = url or profile.url
+        if not probe_url and profile.tunnel:
+            console = llm_console_domain(inv, rack, cable) if inv is not None else None
+            if inv is None or store is None or console is None:
+                print(_ui.dim(f"  (tunnel {profile.tunnel} not probed here -- "
+                             "harness llm check --tunnel ... --inventory <path> "
+                             "tests it)"))
+                return None
+            forward = LLMForward(*parse_tunnel_spec(profile.tunnel), console,
+                                 store, bastion=llm_bastion_domain(inv, rack, cable))
+            try:
+                probe_url = forward.start()
+            except TunnelError as exc:
+                forward.close()
+                print(_ui.warn(f"  ! tunnel hop failed ({exc.stage}): {exc}"))
+                print(_ui.dim("    the run will fail fast; harness llm check "
+                             "--tunnel ... stages each leg"))
+                return None
+        if not probe_url:
+            return None  # env-default endpoint: nothing meaningful to probe
+        try:
+            ids = list_models(probe_url, timeout=10.0)
+        except LLMError as exc:
+            refused = getattr(forward, "forward_error", None)
+            print(_ui.warn(f"  ! endpoint {probe_url} unreachable: {exc}"))
+            if refused:
+                print(_ui.dim(f"    tunnel target refused: {refused} -- the "
+                              "HOST must be the golden server's own address "
+                              "(from `hostname -I`), not the manager's"))
+            print(_ui.dim(f"    `harness llm check --url {probe_url}` stages "
+                         "the failure"))
+            return None
+        if any(m == profile.model or m.endswith("/" + profile.model)
+               for m in ids):
+            print(_ui.good(f"  endpoint ok: {len(ids)} model(s) served, "
+                          f"{profile.model} available"))
+            return None
+        print(_ui.warn(f"  ! model {profile.model!r} is not served at {probe_url}"))
+        if not ids:
+            return None
+        midx = select("Switch to a served model id?", [*ids, "keep it anyway"],
+                      reader=reader)
+        if midx is None or midx == len(ids):
+            return None
+        return ids[midx]
+    finally:
+        if forward is not None:
+            forward.close()

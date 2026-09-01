@@ -21,9 +21,15 @@ prioritized list of **human-approved** repair actions.
 - **Two zero-YAML targeting modes** — target any server by rack/cable
   (`--rack Q61 --cable 8`) or by IP (`--address 10.0.0.50`); named inventory
   hosts keep working.
-- **Serial-console path (lab/QA)** — `jumpin` → BMC serial session with an
-  expect-script engine: automatic prompt waits, `sudo -S` password handshake
-  (password fetched from the secret store, never embedded), host-key pinning.
+- **Serial-console path (lab/QA)** — SSH to the rack manager, then a serial
+  session with an expect-script engine: automatic prompt waits, `sudo -S`
+  password handshake (password fetched from the secret store, never embedded),
+  host-key pinning. Two start mechanisms: `tool: jumpin` (spawn the jump CLI)
+  or `tool: direct` (send `start serial session -i <cable> -p <port>` straight
+  into the rackmgr shell — for fleets without the jump CLI), with optional
+  per-rack manager IPs (`rack_addresses:`). An optional `llm_console:` block
+  gives the LLM paths (endpoint discovery + tunnel hop) their own
+  tool/port/account without touching the debug console config.
 - **Credential safety** — credentials are registered via a non-agent
   `harness secrets` CLI (or on demand: `harness menu` / `harness session` prompt
   the OPERATOR for each credential the moment it is needed — generate + install
@@ -145,8 +151,7 @@ The LLM reasoning backend is picked like in opencode/pi:
 
 - **`harness menu` → `model`** — arrow-key picker (type to filter) over the
   catalog: inventory `llm` block + well-known defaults + any custom models you
-  have added. `+ add a custom model` registers a provider/model/url/key vault
-  path for your own endpoint.
+  have added. `+ add / configure a model` runs the guided setup (below).
 - **`harness session` → `/model`** (or `/model <ident>`) — same picker, or a
   direct ident, right inside the chat; the switch applies to the next run.
 - **`--llm-model <ident>`** — pin one model for a one-shot `diagnose`/`session`.
@@ -155,6 +160,31 @@ The pick is remembered in `config/models.yaml` (machine-local, git-ignored) so
 the next run keeps it. Precedence: `--llm-model` > `--llm` > remembered >
 inventory `llm` block > default `openai/harness-diag`. Calibration is keyed per
 model ident, so a swap never inherits another model's calibration.
+
+### Guided setup (new models without the flags)
+
+Selecting an unconfigured built-in (`local/harness-diag`,
+`openai/harness-diag`) or the `+` row in the picker starts a short wizard:
+
+1. Provider (arrow keys: `openai` | `gemini` | `local`).
+2. Endpoint URL (Enter = `http://127.0.0.1:8000/v1`).
+3. Transport: **direct** (endpoint reachable from the workstation), or
+   **tunnel — model runs on the golden server (the rack/cable debug target)**:
+   the wizard asks rack/cable, probes the node over the jumpin console
+   (`hostname -I`, `ss`, `sudo -S docker ps` — all read-only), and you pick
+   the tunnel `HOST:PORT` from the discovered candidates. Manual entry is the
+   fallback (`harness llm discover` does the same probe standalone).
+4. The wizard probes `GET /models` (tunnel endpoints through the hop itself)
+   and lists the served model ids — pick one; vLLM rejects any other name.
+   A tunnel refused at the `forward` stage prints the reverse-tunnel relay
+   recipe and offers to save the relay URL instead; other failures are
+   warnings and the profile is saved anyway.
+
+The result (endpoint, tunnel, model id) is persisted in `config/models.yaml`;
+every later run and session uses it with zero `--llm-*` flags. An explicit
+`--llm-url`/`--llm-tunnel` still overrides it for one run. After every pick a
+non-blocking check probes the endpoint and offers a one-key switch when the
+chosen model id is not in the served list.
 
 ### Locally hosted model (vLLM on a lab server)
 
@@ -169,16 +199,24 @@ harness diagnose --inventory src/harness/config/inventory.yaml `
   --llm local --llm-model local/Qwen2.5-7B-Instruct `
   --llm-url http://10.0.0.42:8000/v1
 
-# B) Model served on a node only reachable via the rack-manager console hop:
-#    the harness forwards HTTP through the rackmgr SSH connection for the run
-#    (same pinned host keys + vault identity as the serial-console path).
+# B) Model served on the golden server (the rack/cable debug target):
+#    find the endpoint first -- read-only probes over the jumpin console
+harness llm discover --inventory src/harness/config/inventory.yaml `
+  --rack Q61 --cable 8
+#    then verify the tunnel (stages: ssh -> forward -> GET /models)
 harness llm check --tunnel 10.0.0.42:8000 --inventory src/harness/config/inventory.yaml
 harness diagnose ... --llm local --llm-model local/Qwen2.5-7B-Instruct `
   --llm-tunnel 10.0.0.42:8000
 ```
 
-`harness llm check` stages each leg (`ssh` -> `forward` -> `http`) and prints a
-reverse-tunnel fallback recipe when the rack manager refuses forwarding.
+With the guided setup (case B: pick "tunnel", enter the rack/cable of the
+golden server, and pick the discovered `HOST:PORT`) the flags are only needed
+once — afterwards `harness diagnose ...` and `harness session → /model`
+resolve the endpoint from the remembered profile. If the rack manager refuses
+forwarding, the wizard prints the reverse-tunnel relay recipe (run from the
+node console) and can save the relay URL directly. `harness llm check` stages
+each leg (`ssh` -> `forward` -> `http`) and prints the same recipe when the
+rack manager refuses forwarding.
 Calibration idents stay per model (`local/Qwen2.5-7B-Instruct`), so temporary
 debug models never pollute another backend's bins; remove the flags to return
 to the previous model.

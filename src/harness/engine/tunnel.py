@@ -52,6 +52,13 @@ class LLMForward:
     """Context-managed local forward ``127.0.0.1:<ephemeral> -> <target>:<port>``
     carried over the rack-manager SSH connection.
 
+    When the rack manager is unroutable from the workstation (``bastion`` set
+    to the jump host's :class:`ConsoleDomain`), the SSH connection opens
+    THROUGH the bastion: paramiko -> bastion (key auth) -> ``direct-tcpip`` to
+    ``rackmgr:22`` -> nested SSH (key first, then the vault-sourced password
+    ``console.password_vault_path``) -> ``direct-tcpip`` to the node's vLLM
+    port from the rack manager.
+
     Usage::
 
         with LLMForward("10.0.0.42", 8000, inv.console_defaults, store) as fwd:
@@ -63,7 +70,8 @@ class LLMForward:
 
     def __init__(self, target_host: str, target_port: int,
                  console: ConsoleDomain, store: SecretStore,
-                 tmp_dir: Path | None = None, timeout: float = 30.0) -> None:
+                 tmp_dir: Path | None = None, timeout: float = 30.0,
+                 bastion: ConsoleDomain | None = None) -> None:
         if console.trust_level not in ("lab", "qa"):
             raise TunnelError("trust", (
                 f"rack-manager forwarding allowed only at lab/qa, "
@@ -71,11 +79,13 @@ class LLMForward:
         self.target_host = target_host
         self.target_port = int(target_port)
         self.console = console
+        self.bastion = bastion
         self._store = store
         self._tmp_dir = Path(tmp_dir or tempfile.gettempdir())
         self._timeout = timeout
         self.url: str | None = None
         self._client: paramiko.SSHClient | None = None
+        self._bastion_client: paramiko.SSHClient | None = None
         self._server: socket.socket | None = None
         self._stop = threading.Event()
         # Last direct-tcpip failure, surfaced by staged diagnostics.
@@ -83,11 +93,65 @@ class LLMForward:
 
     # ---- lifecycle ----
 
+    def _connect_client(self, client: paramiko.SSHClient, hostname: str,
+                        user: str, key_path: Path, password: str | None,
+                        sock: socket.socket | None = None,
+                        password_vault_path: str | None = None) -> None:
+        """One SSH connect with staged failure (never a raw traceback)."""
+        try:
+            client.connect(
+                hostname=hostname,
+                username=user,
+                key_filename=str(key_path) if key_path else None,
+                look_for_keys=False,
+                allow_agent=False,
+                timeout=min(self._timeout, 30.0),
+                sock=sock,
+                password=password,
+            )
+        except Exception as exc:
+            hint = ""
+            if "Authentication failed" in str(exc):
+                hint = (f" -- both auth methods rejected for {user}@{hostname}"
+                        + (f" (fix the material at {password_vault_path} or "
+                           "install the harness key on the host)"
+                           if password_vault_path else
+                           " (install the harness key on the host)"))
+            raise TunnelError(
+                "auth", f"ssh to {hostname} failed: {exc}{hint}") from exc
+
     def start(self) -> str:
         """Connect, bind the local listener, start the accept loop. Idempotent;
         returns the local base URL (``http://127.0.0.1:<port>/v1``)."""
         if self.url is not None:
             return self.url
+        sock: socket.socket | None = None
+        if self.bastion is not None:
+            self._bastion_client = paramiko.SSHClient()
+            self._bastion_client.set_missing_host_key_policy(_MissingHostReject())
+            try:
+                self._bastion_client.load_host_keys(self.bastion.known_hosts_path)
+            except FileNotFoundError:
+                pass
+            b_key = load_key_material(self._store, self.bastion.identity_vault_path,
+                                      self._tmp_dir)
+            try:
+                self._connect_client(self._bastion_client,
+                                     self.bastion.address_for_rack(),
+                                     self.bastion.user, b_key, None)
+            finally:
+                if b_key.exists():
+                    b_key.unlink()
+            rackmgr_addr = self.console.address_for_rack()
+            try:
+                sock = self._bastion_client.get_transport().open_channel(
+                    "direct-tcpip", (rackmgr_addr, 22), ("127.0.0.1", 0),
+                    timeout=min(self._timeout, 30.0))
+            except Exception as exc:
+                raise TunnelError(
+                    "auth", f"bastion {self.bastion.address_for_rack()} could "
+                    f"not open a channel to {rackmgr_addr}: {exc}") from exc
+
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(_MissingHostReject())
         try:
@@ -96,19 +160,21 @@ class LLMForward:
             pass  # no pinned keys yet; _MissingHostReject fails closed
         key_path = load_key_material(
             self._store, self.console.identity_vault_path, self._tmp_dir)
+        password = None
+        if self.console.password_vault_path is not None:
+            try:
+                password = self._store.get(
+                    self.console.password_vault_path).decode(
+                    errors="strict").rstrip("\r\n")
+            except KeyError:
+                raise TunnelError(
+                    "auth", "rack-manager password missing from vault: "
+                    f"{self.console.password_vault_path!r}") from None
         try:
-            client.connect(
-                hostname=self.console.address,
-                username=self.console.user,
-                key_filename=str(key_path),
-                look_for_keys=False,
-                allow_agent=False,
-                timeout=min(self._timeout, 30.0),
-            )
-        except Exception as exc:
-            raise TunnelError(
-                "auth",
-                f"ssh to rack manager {self.console.address} failed: {exc}") from exc
+            self._connect_client(client, self.console.address_for_rack(),
+                                 self.console.user, key_path, password,
+                                 sock=sock,
+                                 password_vault_path=self.console.password_vault_path)
         finally:
             if key_path.exists():
                 key_path.unlink()
@@ -139,6 +205,9 @@ class LLMForward:
         client, self._client = self._client, None
         if client is not None:
             client.close()
+        bastion, self._bastion_client = self._bastion_client, None
+        if bastion is not None:
+            bastion.close()
 
     def __enter__(self) -> Self:
         self.start()

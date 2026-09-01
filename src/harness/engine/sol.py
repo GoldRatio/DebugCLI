@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import re
 import shlex
+import socket
 import tempfile
 import time
 from collections.abc import Callable
@@ -226,6 +227,29 @@ _PROBE_SPEC: dict[str, _ProbeRule] = {
             "sdr": frozenset({"list", "elist"}),
         },
     ),
+    # ---- LLM endpoint discovery on the node (read-only listings only) ----
+    # hostname: node IPv4 addresses for the rackmgr-side tunnel HOST.
+    "hostname": _ProbeRule(
+        flags=frozenset({"-I", "-A", "-f", "-s"}),
+    ),
+    # ss: listening TCP sockets (vLLM port discovery); no positionals, so
+    # filters like `ss ... state X` / `ss ... dst X` are not expressible.
+    "ss": _ProbeRule(
+        flags=frozenset({"-l", "-t", "-n", "-p", "-4", "-6"}),
+    ),
+    # ip: address/route listings only. No positional values, so `ip addr add`
+    # (or any mutation) is not expressible.
+    "ip": _ProbeRule(
+        subcommands=frozenset({"addr", "route"}),
+        flags=frozenset({"-4", "-6", "-o", "-br"}),
+    ),
+    # docker: `ps` listing only (container port mappings). Subcommand
+    # whitelist without subcommand_values => `run`/`rm`/`exec`/`kill` are
+    # rejected outright and any positional after `ps` is rejected.
+    "docker": _ProbeRule(
+        subcommands=frozenset({"ps"}),
+        flags=frozenset({"-a"}),
+    ),
 }
 
 
@@ -356,20 +380,35 @@ def render_expect_script(*, tool: str, rack: str, cable: str,
                          commands: list[str],
                          prompts: ExpectPrompts | None = None,
                          port: int | None = None,
-                         sudo_password: str | None = None) -> str:
+                         sudo_password: str | None = None,
+                         node_user: str | None = None,
+                         node_password: str | None = None) -> str:
     """Render the ``expect -c`` script the harness pipes to the rack manager shell.
 
     ``rack``/``cable``/``tool`` are wrapped in single quotes in the Tcl ``spawn`` and
     ``send`` strings; values are identifier-validated to prevent injection. The rack
     id is normalized for the rack manager CLI: a leading ``q``/``Q`` is stripped and
     the rest lowercased, so ``Q61``, ``q61`` and ``61`` all render ``q61-1``. Each
-    ``command`` is validated read-only. ``port`` is the BMC access port (2200);
-    when set, the session is started with ``start serial session -i <cable> -p <port>``
-    and the ``sudo -S`` probes in ``commands`` get the password handshake:
-    the script waits for the ``[sudo] password for`` prompt, sends the password,
-    then waits for the node prompt again. If the serial session fails to start
-    (rack manager prints ``Status Description:``), the script exits non-zero
-    BEFORE any probe or the sudo password reaches the wire.
+    ``command`` is validated read-only. ``port`` is the node console service port
+    (e.g. 2200 = BMC access port, 22 = host SOL); when set, the session is started
+    with ``start serial session -i <cable> -p <port>`` and the ``sudo -S`` probes in
+    ``commands`` get the password handshake: the script waits for the
+    ``[sudo] password for`` prompt, sends the password, then waits for the node
+    prompt again. If the serial session fails to start (rack manager prints
+    ``Status Description:``), the script exits non-zero BEFORE any probe or the
+    sudo password reaches the wire.
+
+    ``tool`` selects the start mechanism: ``jumpin`` (default) spawns the jump
+    CLI (``jumpin q<rack>-1 rm``) and waits for the rack-manager CLI prompt
+    (``prompts.rack_manager``) before starting the session; ``direct`` runs
+    ``start serial session`` straight in the rack manager's SSH shell -- the
+    script is piped into a non-interactive bash that executes stdin lines as
+    they arrive, so there is no prompt to wait for.
+
+    ``node_user``/``node_password`` enable the node LOGIN handshake: when the
+    serial console reattaches at a getty ``login:`` prompt (e.g. after a node
+    reboot), the script logs in before running the probes. The password is
+    the node user's own (sudo and login share it); never embedded in config.
     """
     prompts = prompts or ExpectPrompts()
     validate_identifier(tool, "tool")
@@ -380,20 +419,44 @@ def render_expect_script(*, tool: str, rack: str, cable: str,
         raise SerialProbeDenied(f"port out of range: {port!r}")
     if sudo_password is not None and not _SAFE_VALUE.match(sudo_password):
         raise SerialProbeDenied("sudo password contains unsafe characters")
+    if (node_password is not None and not _SAFE_VALUE.match(node_password)):
+        raise SerialProbeDenied("node login password contains unsafe characters")
+    if node_password is not None and not node_user:
+        raise SerialProbeDenied("node login needs node_user")
+    if node_user:
+        validate_identifier(node_user, "node user")
     commands = [validate_serial_probe(c) for c in commands]
 
     lines = ["expect -c '"]
-    lines.append(f"    spawn {tool} {rack_token}-1 rm")
-    lines.append(f'    expect "{prompts.rack_manager}"')
+    direct = tool == "direct"
+    if direct:
+        # No jump CLI: the fleet manager runs `start serial session` as a
+        # plain shell builtin. Expect needs a process to drive, so spawn a
+        # local interactive bash on the rack manager and run the session
+        # through it. There is no prompt to wait for: the tty buffers the
+        # start command until bash reads stdin.
+        lines.append("    spawn /bin/bash")
+    else:
+        lines.append(f"    spawn {tool} {rack_token}-1 rm")
+        lines.append(f'    expect "{prompts.rack_manager}"')
     port_arg = f" -p {port}" if port is not None else ""
     lines.append(f'    send "start serial session -i {cable}{port_arg}\\r"')
     # If the serial session cannot be established the rack manager prints
     # "Status Description: ... failed ..." and returns to its own prompt. The
     # expect script MUST die there (non-zero exit): otherwise the probes and the
     # sudo password would be typed into the rack manager CLI shell instead of
-    # the node. The failure branch is listed first so it wins the match.
+    # the node. The failure branch is listed first so it wins the match. When
+    # the console reattaches at a getty login prompt, the node login handshake
+    # runs first (the session then persists for later runs).
     lines.append("    expect {")
     lines.append('        "Status Description:" { exit 3 }')
+    if node_user and node_password is not None:
+        lines.append('        "login:" {')
+        lines.append(f'            send "{_tcl_escape(node_user)}\\r"')
+        lines.append('            expect "Password:"')
+        lines.append(f'            send "{_tcl_escape(node_password)}\\r"')
+        lines.append(f'            expect "{prompts.node}"')
+        lines.append("        }")
     lines.append(f'        "{prompts.node}" {{}}')
     lines.append("    }")
 
@@ -425,11 +488,17 @@ def render_expect_script(*, tool: str, rack: str, cable: str,
         if cmd.startswith("sudo -S "):
             first_sudo = False
 
-    # Wait the serial disconnect back to the rack manager prompt so the LAST
-    # probe's trailing output (echo + results still in flight on the serial
-    # line) is captured before the expect process exits and kills the session.
+    # Detach the serial session and capture the LAST probe's trailing output
+    # before the expect process exits and kills the session.
     lines.append('    send "exit\\r"')
-    lines.append(f'    expect "{prompts.rack_manager}"')
+    if direct:
+        # Back at the spawned rack-manager bash (unknown prompt text): give
+        # the detach a beat, end the bash, and run to EOF.
+        lines.append("    sleep 1")
+        lines.append('    send "exit\\r"')
+        lines.append("    expect eof")
+    else:
+        lines.append(f'    expect "{prompts.rack_manager}"')
     lines.append("'")
     return "\n".join(lines)
 
@@ -452,21 +521,97 @@ class SerialConsole:
 
     The transport is opened by paramiko to the rack manager; the expect script is
     piped to its (bash) stdin, mirroring the operator's ``write-output | ssh ... /bin/bash``.
+
+    When the rack managers sit on a network the workstation cannot route
+    (``bastion`` is set), the SSH connection opens THROUGH the bastion instead:
+    paramiko connects to the bastion (key auth), opens a ``direct-tcpip``
+    channel to ``rackmgr:22``, and nests a second SSH over that channel -- key
+    auth first, then the vault-sourced password (``console.password_vault_path``)
+    when the rack managers have no keys.
     """
 
     def __init__(self, console: ConsoleDomain, store: SecretStore,
-                 tmp_dir: Path | None = None, timeout: float = 300.0) -> None:
+                 tmp_dir: Path | None = None, timeout: float = 300.0,
+                 bastion: ConsoleDomain | None = None) -> None:
         if console.trust_level not in ("lab", "qa"):
             raise SerialConsoleError(
                 f"serial console allowed only at lab/qa, not {console.trust_level}")
         self.console = console
+        self.bastion = bastion
         self._store = store
         self._tmp_dir = Path(tmp_dir or tempfile.gettempdir())
         self._timeout = timeout
         self._client: paramiko.SSHClient | None = None
+        self._bastion_client: paramiko.SSHClient | None = None
         self.log: list[str] = []
 
+    def _connect_client(self, client: paramiko.SSHClient, hostname: str,
+                        user: str, key_path: Path, password: str | None,
+                        sock: socket.socket | None = None,
+                        password_vault_path: str | None = None) -> None:
+        """One SSH connect with staged failure (never a raw traceback)."""
+        try:
+            client.connect(
+                hostname=hostname,
+                username=user,
+                key_filename=str(key_path) if key_path else None,
+                look_for_keys=False,
+                allow_agent=False,
+                timeout=min(self._timeout, 30.0),
+                sock=sock,
+                password=password,
+            )
+        except Exception as exc:
+            # Unreachable / refused / auth failure must surface as a staged,
+            # caught error (the discovery batch turns it into probe notes and
+            # the wizard falls back to manual entry) -- never a raw traceback.
+            # When auth itself failed, name the rejected methods so the fix is
+            # obvious (key not installed / wrong vault password).
+            methods = f"key ({key_path.name})" if key_path else "key"
+            if password is not None:
+                methods += " + vault password"
+            hint = ""
+            if "Authentication failed" in str(exc):
+                hint = (f" -- both auth methods rejected for {user}@{hostname}"
+                        + (f" (fix the material at {password_vault_path} or "
+                           "install the harness key on the host)"
+                           if password_vault_path else
+                           " (install the harness key on the host)"))
+            raise SerialConsoleError(
+                f"ssh to {hostname} failed: {exc}{hint}") from exc
+
     def open(self) -> None:
+        sock: socket.socket | None = None
+        if self.bastion is not None:
+            # Two-hop fleet: reach the rack manager THROUGH the bastion. The
+            # bastion client uses the bastion domain's key auth; the nested
+            # client rides a direct-tcpip channel to rackmgr:22.
+            self._bastion_client = paramiko.SSHClient()
+            self._bastion_client.set_missing_host_key_policy(_MissingHostReject())
+            try:
+                self._bastion_client.load_host_keys(self.bastion.known_hosts_path)
+            except FileNotFoundError:
+                pass
+            b_key = load_key_material(self._store, self.bastion.identity_vault_path,
+                                      self._tmp_dir)
+            try:
+                self._connect_client(self._bastion_client,
+                                     self.bastion.address_for_rack(),
+                                     self.bastion.user, b_key, None)
+            finally:
+                if b_key.exists():
+                    b_key.unlink()
+            transport = self._bastion_client.get_transport()
+            rackmgr_addr = self.console.address_for_rack()
+            try:
+                sock = transport.open_channel(
+                    "direct-tcpip", (rackmgr_addr, 22), ("127.0.0.1", 0),
+                    timeout=min(self._timeout, 30.0))
+            except Exception as exc:
+                raise SerialConsoleError(
+                    f"bastion {self.bastion.address_for_rack()} could not open "
+                    f"a channel to {rackmgr_addr}: {exc}") from exc
+
         client = paramiko.SSHClient()
         # Pin host keys; do NOT auto-accept (never replicate StrictHostKeyChecking=no).
         client.set_missing_host_key_policy(_MissingHostReject())
@@ -475,15 +620,20 @@ class SerialConsole:
         except FileNotFoundError:
             pass  # no pinned keys yet; _MissingHostReject fails closed
         key_path = load_key_material(self._store, self.console.identity_vault_path, self._tmp_dir)
+        password = None
+        if self.console.password_vault_path is not None:
+            try:
+                password = self._store.get(self.console.password_vault_path).decode(
+                    errors="strict").rstrip("\r\n")
+            except KeyError:
+                raise SerialConsoleError(
+                    "rack-manager password missing from vault: "
+                    f"{self.console.password_vault_path!r}") from None
         try:
-            client.connect(
-                hostname=self.console.address,
-                username=self.console.user,
-                key_filename=str(key_path),
-                look_for_keys=False,
-                allow_agent=False,
-                timeout=min(self._timeout, 30.0),
-            )
+            self._connect_client(client, self.console.address_for_rack(),
+                                 self.console.user, key_path, password,
+                                 sock=sock,
+                                 password_vault_path=self.console.password_vault_path)
         finally:
             if key_path.exists():
                 key_path.unlink()
@@ -493,6 +643,9 @@ class SerialConsole:
         if self._client is not None:
             self._client.close()
             self._client = None
+        if self._bastion_client is not None:
+            self._bastion_client.close()
+            self._bastion_client = None
 
     def run_probes(self, commands: list[str]) -> ConsoleResult:
         """Build the expect script from read-only probes and run it on the console."""
@@ -507,11 +660,25 @@ class SerialConsole:
                 raise SerialConsoleError(
                     f"sudo password missing from vault: {self.console.sudo_vault_path!r}") from None
             sudo_password = secret.decode(errors="strict").rstrip("\r\n")
+        node_password = None
+        if self.console.node_password_vault_path is not None:
+            try:
+                secret = self._store.get(self.console.node_password_vault_path)
+            except KeyError:
+                raise SerialConsoleError(
+                    "node login password missing from vault: "
+                    f"{self.console.node_password_vault_path!r}") from None
+            node_password = secret.decode(errors="strict").rstrip("\r\n")
         script = render_expect_script(
             tool=self.console.tool, rack=self.console.rack, cable=self.console.cable,
             commands=commands, prompts=prompts,
             port=self.console.port, sudo_password=sudo_password,
+            node_user=self.console.node_user, node_password=node_password,
         )
+        start_cmd = (f"start serial session -i {self.console.cable}"
+                     + (f" -p {self.console.port}" if self.console.port else ""))
+        tried = (f"via {self.console.tool} @ {self.console.address_for_rack()}: "
+                 f"{start_cmd!r}")
         stdin, stdout, stderr = self._client.exec_command("/bin/bash", timeout=self._timeout)
         stdin.write(script)
         stdin.channel.shutdown_write()
@@ -520,15 +687,18 @@ class SerialConsole:
         code = stdout.channel.recv_exit_status()
         combined = out + ("\n[stderr]\n" + err if err.strip() else "")
         if code != 0:
-            raise SerialConsoleError(f"console script exited {code}: {err.strip()[:300]}")
+            raise SerialConsoleError(
+                f"console script exited {code} ({tried}): {err.strip()[:300]}")
         if _DEAD_SESSION.search(out + "\n" + err):
             # The expect session died before the probes ran (e.g. the rack
-            # manager rejected `jumpin`, or the node prompt never appeared):
-            # expect may still exit 0 while printing "spawn id ... not open".
-            # A dead session must never masquerade as successful probe output.
+            # manager rejected the session start, or the node prompt never
+            # appeared): expect may still exit 0 while printing
+            # "spawn id ... not open". A dead session must never masquerade
+            # as successful probe output.
             raise SerialConsoleError(
                 "serial session died before probes ran "
-                f"({_DEAD_SESSION.search(out + chr(10) + err).group(0)!r})")
+                f"({_DEAD_SESSION.search(out + chr(10) + err).group(0)!r}; "
+                f"tried {tried})")
         self.log.append(script)
         return ConsoleResult(output=combined, probe_count=len(commands))
 

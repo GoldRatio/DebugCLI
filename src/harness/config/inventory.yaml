@@ -25,6 +25,12 @@ console_defaults:
   trust_level: lab            # console targeting is prod-blocked by default
   prompts: ["RScmCli#", "~#"]
   port: 2200                  # BMC access port for the serial session
+#   redfish_user: root          # optional: rack-level Redfish GET collection
+#   redfish_password_vault_path: secret/harness/rackmgr/redfish
+#   (set the secret once: harness secrets set-password secret/harness/rackmgr/redfish)
+#   When configured, the debug step ALSO fetches read-only evidence straight
+#   from the rack manager (event logs, service conditions) over HTTPS -- no
+#   serial session and no server jumpin needed. GET endpoints only.
   sudo_vault_path: secret/harness/bmc/sudo   # BMC sudo password (never inline)
 
 hosts:

@@ -53,6 +53,14 @@ class OpenAICompatLLM:
         ``{kind: question|probe|diagnosis, ...}``. ``messages`` are
         ``[{"role": "system"|"user"|"assistant", "content": str}]``.
         """
+        if not any(m.get("role") == "user" for m in messages):
+            # Several OpenAI-compatible layers (Gemini's, strict local
+            # gateways) refuse system-only payloads with HTTP 400
+            # ``No user query found in messages`` -- the single-shot
+            # diagnosis path builds exactly that shape, so every adapter
+            # guarantees a user turn on the wire.
+            messages = [*messages, {"role": "user",
+                                    "content": "Produce the requested JSON output now."}]
         body = {
             "model": self.model,
             "messages": messages,
@@ -75,7 +83,16 @@ class OpenAICompatLLM:
             detail = exc.read().decode("utf-8", errors="replace")[:300]
             raise LLMError(f"LLM HTTP {exc.code}: {detail!r}") from exc
         except urllib_error.URLError as exc:
+            if isinstance(exc.reason, TimeoutError):
+                # connect-phase timeout, wrapped by urllib
+                raise LLMError(_timeout_message(self.timeout)) from exc
             raise LLMError(f"LLM unreachable: {exc.reason}") from exc
+        except TimeoutError as exc:
+            # read timeout mid-generation: the socket sat silent past the
+            # budget while the model was still producing (or loading)
+            raise LLMError(_timeout_message(self.timeout)) from exc
+        except OSError as exc:
+            raise LLMError(f"LLM connection failed: {exc}") from exc
         content = data["choices"][0]["message"]["content"]
         try:
             return json.loads(content)
@@ -105,6 +122,16 @@ def _schema_fix_prompt(errors: str) -> str:
         f"{errors[:500]}\n\n"
         "Reply with ONLY strict JSON matching this exact schema (no markdown "
         f"fences, no extra fields, no prose):\n{schema}")
+
+
+def _timeout_message(timeout: float) -> str:
+    """Staged explanation for a chat-call socket timeout: state the budget and
+    the two knobs (env override, profile timeout) instead of a bare
+    ``timed out Timeout error``."""
+    return (f"LLM response timed out after {timeout:.0f}s -- local models "
+            "over a tunnel (long prompt, cold start) may need more; set "
+            "HARNESS_LLM_TIMEOUT or the model profile timeout, or retry "
+            "(a warm server generates faster)")
 
 
 def _coerce_json_text(text: str) -> str | None:
@@ -156,12 +183,69 @@ def list_models(url: str | None = None, api_key: str | None = None,
         raise LLMError(f"LLM HTTP {exc.code}: {detail!r}") from exc
     except urllib_error.URLError as exc:
         raise LLMError(f"LLM unreachable: {exc.reason}") from exc
+    except OSError as exc:
+        # Socket-level resets/mid-read drops (e.g. a refused tunnel forward)
+        # escape urllib as raw ConnectionResetError/TimeoutError -- a staged
+        # LLMError keeps every caller on the warning path, never a traceback.
+        raise LLMError(f"LLM connection failed: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise LLMError("LLM /models returned non-JSON") from exc
     try:
         return [str(m["id"]) for m in data["data"]]
     except (KeyError, TypeError) as exc:
         raise LLMError(f"LLM /models reply missing model ids: {exc}") from exc
+
+
+def probe_chat(url: str | None = None, api_key: str | None = None,
+               model: str | None = None, timeout: float = 10.0) -> str:
+    """Preflight: minimal ``chat/completions`` request in the exact wire
+    shape the single-shot diagnosis call sends (system + guaranteed user
+    turn, ``response_format: json_object``) with a 1-token cap.
+
+    ``/models`` reachability says nothing about request validation: a server
+    that refuses the run's payload (``No user query found in messages``, an
+    unsupported ``response_format``) only says so at the ``reason`` step --
+    after a full run's collection phase. This probe surfaces such 400s in
+    seconds; ``harness llm check`` runs it after the transport stage.
+    Returns the model id the server reports serving. Raises
+    :class:`LLMError` on any failure stage.
+    """
+    base = (url or os.environ.get("HARNESS_LLM_URL", "http://127.0.0.1:8000/v1")).rstrip("/")
+    body = {
+        "model": model or os.environ.get("HARNESS_LLM_MODEL", "harness-diag"),
+        "messages": [
+            {"role": "system", "content": 'Reply with the JSON object {"ok": true}.'},
+            {"role": "user", "content": "Produce the requested JSON output now."},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 1,
+        "response_format": {"type": "json_object"},
+    }
+    request = urllib.request.Request(
+        f"{base}/chat/completions",
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    if api_key:
+        request.add_header("Authorization", f"Bearer {api_key}")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:300]
+        raise LLMError(f"LLM HTTP {exc.code}: {detail!r}") from exc
+    except urllib_error.URLError as exc:
+        raise LLMError(f"LLM unreachable: {exc.reason}") from exc
+    except OSError as exc:
+        # Socket-level resets/mid-read drops surface here too -- same staged
+        # error contract as ``list_models`` (warning path, never a traceback).
+        raise LLMError(f"LLM connection failed: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise LLMError("LLM chat probe returned non-JSON") from exc
+    if not isinstance(data, dict):
+        raise LLMError("LLM chat probe reply malformed")
+    return str(data.get("model") or body["model"])
 
 
 class GeminiLLM(OpenAICompatLLM):
@@ -185,14 +269,6 @@ class GeminiLLM(OpenAICompatLLM):
             timeout=timeout,
         )
         self.json_mode = False  # Gemini's OpenAI-compat layer rejects response_format
-
-    def chat_json(self, messages: list[dict], temperature: float = 0.0) -> dict:
-        """Gemini's OpenAI-compat layer refuses system-only requests
-        (systemInstruction with empty ``contents``). Guarantee a user turn."""
-        if not any(m.get("role") == "user" for m in messages):
-            messages = [*messages, {"role": "user",
-                                    "content": "Produce the requested JSON output now."}]
-        return super().chat_json(messages, temperature=temperature)
 
 
 class StubLLM:

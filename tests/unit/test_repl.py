@@ -922,6 +922,200 @@ def test_session_slash_model_busy_is_rejected(tmp_path, capsys):
     assert "disabled while a run is active" in capsys.readouterr().out
 
 
+def test_session_slash_model_unconfigured_builtin_launches_wizard(
+        tmp_path, monkeypatch, capsys):
+    """``/model`` on the silent-default local row runs the guided setup; the
+    configured profile becomes the session's active adapter and is saved."""
+    monkeypatch.chdir(tmp_path)
+    from harness.config.model_catalog import ModelProfile
+    from harness.diagnosis.llm import LocalLLM
+    from harness.operator import menu as menu_mod
+
+    holder = {}
+
+    def on_session(session):
+        holder["session"] = session
+
+    def fake_wizard(*, provider=None, **kw):
+        assert provider == "local"
+        assert kw.get("target_label") == "h1"   # context for the golden-server hop
+        return ModelProfile(provider="local", model="Qwen2.5-7B-Instruct",
+                            url="http://10.0.0.42:8000/v1")
+
+    monkeypatch.setattr(menu_mod, "ask_model_profile", fake_wizard)
+    monkeypatch.setattr(menu_mod, "check_profile", lambda *a, **kw: None)
+
+    # defaults order: openai, gemini, local, stub, +add -> pick index 2
+    reader = _ScriptedReader(["/model", "/quit"], keys=["down", "down", "enter"])
+    code = run_session(_session_args(tmp_path), overrides={
+        "reader": reader,
+        "on_session": on_session,
+        "llm": StubLLM(),
+        "router_llm": StubLLM(),
+    })
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "model: local/Qwen2.5-7B-Instruct (active for the next run; saved)" in out
+    session = holder["session"]
+    assert session.llm_ident == "local/Qwen2.5-7B-Instruct"
+    assert isinstance(session.llm, LocalLLM)
+    assert session.llm.url == "http://10.0.0.42:8000/v1"
+    saved = json.loads((tmp_path / "config" / "models.yaml").read_text(
+        encoding="utf-8"))
+    assert saved["current"]["model"] == "Qwen2.5-7B-Instruct"
+
+
+def test_set_session_model_tunnel_opens_forward(tmp_path, monkeypatch):
+    """A tunnel profile opens a rack-manager forward for the in-session
+    adapters, binds them to its local URL, and keeps the spec so spawned
+    runs open their own hop."""
+    monkeypatch.chdir(tmp_path)
+    import harness.engine.tunnel as tunnel_mod
+    from harness.config.model_catalog import ModelCatalog, ModelProfile
+    from harness.operator import repl as repl_mod
+
+    inv_path = tmp_path / "inv_console.yaml"
+    inv_path.write_text(
+        "trust_level: lab\n"
+        "console_defaults:\n"
+        "  address: 192.168.202.51\n"
+        "  user: log\n"
+        "  identity_vault_path: secret/harness/rackmgr/id_ed25519\n"
+        "  known_hosts_path: config/rackmgr_known_hosts\n"
+        "  tool: jumpin\n"
+        "  trust_level: lab\n"
+        "  port: 2200\n"
+        "  sudo_vault_path: secret/harness/bmc/sudo\n"
+        "hosts: []\n", encoding="utf-8")
+    session = _make_session(tmp_path)
+    session.inv = load_inventory(inv_path)
+    session.inv_path = str(inv_path)
+
+    recorded = {}
+
+    class _StubForward:
+        def __init__(self, host, port, domain, store, timeout=30.0, bastion=None):
+            recorded["target"] = (host, port)
+
+        def start(self):
+            return "http://127.0.0.1:28300/v1"
+
+        def close(self):
+            recorded["closed"] = True
+
+    monkeypatch.setattr(tunnel_mod, "LLMForward", _StubForward)
+
+    catalog = ModelCatalog.load(tmp_path / "nope.yaml", inv=session.inv)
+    profile = ModelProfile(provider="local", model="Qwen2.5-7B-Instruct",
+                           tunnel="10.0.0.42:8000")
+    repl_mod._set_session_model(session, catalog, profile)
+
+    assert recorded["target"] == ("10.0.0.42", 8000)
+    assert session.llm_tunnel == "10.0.0.42:8000"
+    assert session.llm_url == "http://127.0.0.1:28300/v1"
+    assert session.llm.url == "http://127.0.0.1:28300/v1"
+    saved = json.loads((tmp_path / "config" / "models.yaml").read_text(
+        encoding="utf-8"))
+    assert saved["current"]["tunnel"] == "10.0.0.42:8000"
+
+
+def test_set_session_model_tunnel_failure_keeps_current_model(
+        tmp_path, monkeypatch, capsys):
+    """A failed forward aborts the switch: the previous model stays active."""
+    monkeypatch.chdir(tmp_path)
+    import harness.engine.tunnel as tunnel_mod
+    from harness.config.model_catalog import ModelCatalog, ModelProfile
+    from harness.operator import repl as repl_mod
+
+    inv_path = tmp_path / "inv_console.yaml"
+    inv_path.write_text(
+        "trust_level: lab\n"
+        "console_defaults:\n"
+        "  address: 192.168.202.51\n"
+        "  user: log\n"
+        "  identity_vault_path: secret/harness/rackmgr/id_ed25519\n"
+        "  known_hosts_path: config/rackmgr_known_hosts\n"
+        "  tool: jumpin\n"
+        "  trust_level: lab\n"
+        "  port: 2200\n"
+        "  sudo_vault_path: secret/harness/bmc/sudo\n"
+        "hosts: []\n", encoding="utf-8")
+    session = _make_session(tmp_path)
+    session.inv = load_inventory(inv_path)
+    session.inv_path = str(inv_path)
+
+    class _DeadForward:
+        def __init__(self, *a, **kw):
+            pass
+
+        def start(self):
+            raise tunnel_mod.TunnelError("auth", "ssh to rack manager failed")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tunnel_mod, "LLMForward", _DeadForward)
+
+    catalog = ModelCatalog.load(tmp_path / "nope.yaml")
+    profile = ModelProfile(provider="local", model="Qwen2.5-7B-Instruct",
+                           tunnel="10.0.0.42:8000")
+    repl_mod._set_session_model(session, catalog, profile)
+
+    out = capsys.readouterr().out
+    assert "switch aborted" in out
+    assert isinstance(session.llm, StubLLM)       # unchanged
+    assert session.llm_tunnel is None
+    assert not (tmp_path / "config" / "models.yaml").exists()  # nothing saved
+
+
+def test_set_session_model_tunnel_needs_console_defaults(tmp_path, capsys):
+    """A tunnel profile in an inventory without console_defaults is refused
+    (the rack-manager SSH hop is the only path to nodes)."""
+    from harness.config.model_catalog import ModelCatalog, ModelProfile
+    from harness.operator import repl as repl_mod
+
+    session = _make_session(tmp_path)
+    catalog = ModelCatalog.load(tmp_path / "nope.yaml")
+    profile = ModelProfile(provider="local", model="Qwen2.5-7B-Instruct",
+                           tunnel="10.0.0.42:8000")
+    repl_mod._set_session_model(session, catalog, profile)
+    assert "console_defaults" in capsys.readouterr().out
+    assert isinstance(session.llm, StubLLM)       # unchanged
+
+
+def test_session_slash_model_served_mismatch_switch(tmp_path, monkeypatch,
+                                                    capsys):
+    """When the picked model id is not served, the probe's one-key suggestion
+    replaces it (e.g. harness-diag -> the actually served Qwen id)."""
+    monkeypatch.chdir(tmp_path)
+    from harness.operator import menu as menu_mod
+
+    holder = {}
+
+    def on_session(session):
+        holder["session"] = session
+
+    suggestions = iter(["Qwen2.5-7B-Instruct"])
+
+    def fake_check(profile, **kw):
+        return next(suggestions)
+
+    monkeypatch.setattr(menu_mod, "check_profile", fake_check)
+
+    reader = _ScriptedReader(["/model local/harness-diag", "/quit"])
+    code = run_session(_session_args(tmp_path), overrides={
+        "reader": reader,
+        "on_session": on_session,
+        "llm": StubLLM(),
+        "router_llm": StubLLM(),
+    })
+    assert code == 0
+    out = capsys.readouterr().out
+    assert out.count("model: local/Qwen2.5-7B-Instruct (active for the next "
+                     "run; saved)") == 1
+    assert holder["session"].llm_ident == "local/Qwen2.5-7B-Instruct"
+
+
 def test_session_slash_targets_round_trip(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)  # keep config/targets.yaml inside tmp_path
     reader = _ScriptedReader([

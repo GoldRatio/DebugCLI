@@ -59,10 +59,16 @@ _IP4_RE = re.compile(
 def classify(vault_path: str) -> str:
     """Best-effort classification of a vault path to a prompt kind.
 
-    ``llm`` paths ask for an API key, ``ssh`` paths ask for an identity key
-    (generate or file, optionally installed onto the target), everything else is
-    treated as a password.
+    Paths ending in ``-password`` (or ``password``) are SSH/login passwords
+    even when they live under the ``llm/`` tree (e.g. the rack-manager SSH
+    password for the LLM hop); sudo passwords (e.g. the per-rack node-sudo
+    entry) prompt as passwords too; ``llm`` paths otherwise ask for an API
+    key, ``ssh`` paths ask for an identity key (generate or file, optionally
+    installed onto the target), everything else is treated as a password.
     """
+    name = vault_path.rsplit("/", 1)[-1]
+    if name.endswith("password") or "sudo" in name:
+        return "password"
     if vault_path == LLM_VAULT or vault_path.startswith(LLM_VAULT + "/"):
         return "llm"
     if (
@@ -79,8 +85,11 @@ def classify(vault_path: str) -> str:
 
 def label_for(vault_path: str) -> str:
     """Human label for a password-style vault path."""
-    if "sudo" in vault_path or vault_path == BMC_SUDO_VAULT:
+    if vault_path == BMC_SUDO_VAULT:
         return "BMC sudo password"
+    if "sudo" in vault_path:
+        name = vault_path.rsplit("/", 1)[-1]
+        return f"{name} password"
     if vault_path.startswith("secret/harness/bmc/") or vault_path == BMC_PASSWORD_VAULT:
         return "BMC password"
     name = vault_path.rsplit("/", 1)[-1]

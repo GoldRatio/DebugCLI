@@ -70,6 +70,10 @@ class EngineContext:
     test_log_lines: list[str] | None = None
     test_log_queries: list[str] | None = None
     test_log_case_terms: list[str] | None = None
+    # Collector names appended to EVERY plan (independent of symptom
+    # classification) when their factory can build them -- e.g. "redfish",
+    # whose rack-level evidence is orthogonal to the classified subsystem.
+    extra_collectors: tuple[str, ...] = ()
 
 
 def retrieve_snippets(ctx: EngineContext, symptom: str, model_key: str | None,
@@ -202,6 +206,13 @@ class DiagnosticEngine:
             if (collector := self.ctx.collector_factory(name, self.ctx.runner))
             is not None
         ]
+        planned_names = {name for name, _ in collectors}
+        for name in self.ctx.extra_collectors:
+            if name in planned_names:
+                continue
+            if (collector := self.ctx.collector_factory(name, self.ctx.runner)) \
+                    is not None:
+                collectors.append((name, collector))
         prebatch_console_plan(self.ctx, plan, collectors)
 
         # A console pre-batch can resurrect model detection that a transient

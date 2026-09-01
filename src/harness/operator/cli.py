@@ -80,6 +80,7 @@ from ..diagnosis.llm import (
     OpenAICompatLLM,
     StubLLM,
     list_models,
+    probe_chat,
 )
 from ..diagnosis.parts_validate import PartsValidator
 from ..diagnosis.schema import Diagnosis
@@ -89,6 +90,7 @@ from ..diagnosis.verifier import Verifier
 from ..engine.allowlist import default_policy
 from ..engine.bmc import BmcRunner
 from ..engine.interactive import InteractiveShell
+from ..engine.redfish import RedfishClient
 from ..engine.runner import CommandResult, Runner
 from ..engine.session import SSHSession
 from ..engine.single_test import SingleTestDriver, SingleTestError
@@ -103,6 +105,7 @@ from ..engine.tunnel import LLMForward, TunnelError, parse_tunnel_spec
 from ..inspect.base import RegisterDump
 from ..inspect.collectors.bmc_console import BmcConsoleCollector
 from ..inspect.collectors.ipmi import IpmiCollector
+from ..inspect.collectors.redfish import RedfishCollector
 from ..inspect.decoder import Decoder
 from ..inspect.registry import make_collector
 from ..operator.gate import ApprovalDecision, ApprovalGate
@@ -221,29 +224,45 @@ def _preflight_llm_url(url: str) -> None:
 
 
 def _prepare_llm_endpoint(args, inv: Inventory, store: SecretStore):
-    """Per-run LLM endpoint setup (``--llm-tunnel`` / ``--llm-url``).
+    """Per-run LLM endpoint setup (``--llm-tunnel`` / ``--llm-url`` / profile).
 
-    Tunnel mode opens an ``LLMForward`` through the inventory's rack manager
+    Explicit flags win. With neither flag given, the resolved model profile
+    (``config/models.yaml`` current) supplies the endpoint: a profile
+    ``tunnel`` opens an ``LLMForward`` through the inventory's rack manager
     and rewrites ``args.llm_url`` to the forward's local URL so every adapter
-    resolution binds to it. Direct URLs get a reachability preflight. Returns
-    the open forward (or None); it is tracked in ``_ACTIVE_LLM_FORWARDS`` so
-    ``_close_llm_forwards`` can tear it down deterministically at run end, and
-    an atexit hook guarantees no hop outlives the process.
+    resolution binds to it; a profile ``url`` is preflighted like an explicit
+    ``--llm-url``. Returns the open forward (or None); it is tracked in
+    ``_ACTIVE_LLM_FORWARDS`` so ``_close_llm_forwards`` can tear it down
+    deterministically at run end, and an atexit hook guarantees no hop
+    outlives the process.
     """
     tunnel_spec = getattr(args, "llm_tunnel", None)
+    url = getattr(args, "llm_url", None)
+    profile_url = None
+    if not tunnel_spec and not url:
+        profile = _resolve_profile(args, inv)
+        tunnel_spec = getattr(profile, "tunnel", None)
+        profile_url = getattr(profile, "url", None)
     if not tunnel_spec:
-        url = getattr(args, "llm_url", None)
-        if url:
-            _preflight_llm_url(url)
+        effective_url = url or profile_url
+        if effective_url:
+            _preflight_llm_url(effective_url)
         return None
     target_host, target_port = parse_tunnel_spec(tunnel_spec)
-    domain = inv.console_defaults
+    from .llm_discover import llm_bastion_domain, llm_console_domain
+
+    domain = llm_console_domain(inv, getattr(args, "rack", None) or "",
+                                getattr(args, "cable", None) or "")
     if domain is None:
         raise RuntimeError(
-            "--llm-tunnel requires a fleet console_defaults block in the "
-            "inventory (the rack-manager SSH hop is the only path to nodes)")
+            "--llm-tunnel requires a fleet llm_console (or console_defaults) "
+            "block in the inventory (the rack-manager SSH hop is the only "
+            "path to nodes)")
     forward = LLMForward(target_host, target_port, domain, store,
-                         timeout=float(getattr(args, "llm_timeout", 30.0)))
+                         timeout=float(getattr(args, "llm_timeout", 30.0)),
+                         bastion=llm_bastion_domain(
+                             inv, getattr(args, "rack", None) or "",
+                             getattr(args, "cable", None) or ""))
     try:
         args.llm_url = forward.start()
     except TunnelError as exc:
@@ -272,7 +291,7 @@ def _tunnel_failure(exc: TunnelError, target: str) -> RuntimeError:
     """Stage-specific operator guidance for a failed rack-manager forward."""
     if exc.stage == "auth":
         return RuntimeError(
-            f"rack-manager SSH hop failed: {exc} (check console_defaults "
+            f"rack-manager SSH hop failed: {exc} (check llm_console/console_defaults "
             "identity / known_hosts; `harness llm check --tunnel ...` "
             "re-tests each stage)")
     if exc.stage == "forward":
@@ -320,6 +339,30 @@ def _console_sudo_secret(store: SecretStore, domain: ConsoleDomain, secrets: lis
         secrets.append(store.get(domain.sudo_vault_path).decode().rstrip("\r\n"))
     except KeyError:
         pass
+
+
+def _build_redfish_collector(domain: ConsoleDomain, store: SecretStore,
+                             secrets: list[str], progress) -> RedfishCollector | None:
+    """Redfish collector for the debug step: rack-level read-only evidence
+    (event logs, service conditions) fetched over HTTPS from the rack manager
+    -- no serial session, no server jumpin.
+
+    Enabled by the console block's ``redfish_password_vault_path``; a missing
+    vault secret disables it with a visible note (staged, never fatal). The
+    password joins the redaction set before any request is made.
+    """
+    if domain.redfish_password_vault_path is None:
+        return None
+    try:
+        secrets.append(store.get(domain.redfish_password_vault_path)
+                       .decode().rstrip("\r\n"))
+    except KeyError:
+        if progress is not None:
+            progress(f"redfish disabled: secret missing from vault "
+                     f"({domain.redfish_password_vault_path!r})")
+        return None
+    return RedfishCollector(
+        RedfishClient(domain, domain.cable, store))
 
 
 def _build_retriever(docs_dir: str | None):
@@ -908,10 +951,10 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
                 f"target {target.label!r} has no console block (use --rack/--cable "
                 "with a fleet console_defaults block, or a named host with a "
                 "console block)")
+        domain = _console_overrides(host.console, args)
+        _console_sudo_secret(store, domain, secrets)
         console_runner = overrides.get("console_runner")
         if console_runner is None:
-            domain = _console_overrides(host.console, args)
-            _console_sudo_secret(store, domain, secrets)
             console_runner = ConsoleRunner(SerialConsole(domain, store))
         runner: Runner = console_runner
     else:
@@ -929,6 +972,13 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
         progress = _progress_printer()
     if hasattr(runner, "on_probe"):
         runner.on_probe = lambda res: progress(f"probe {_probe_line(res)}")
+
+    # Rack-level Redfish evidence (parallel to the console probes): enabled by
+    # the console block's redfish vault path, independent of the serial path.
+    redfish_collector = overrides.get("redfish_collector")
+    if redfish_collector is None and use_console:
+        redfish_collector = _build_redfish_collector(domain, store, secrets,
+                                                     progress)
 
     # Preserve the raw test logs in the run dir so every diagnosis is
     # reproducible from its own harness_runs/<id>/ directory.
@@ -1017,6 +1067,8 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
     topology_hook = lambda sig, model_key: loads_for_rail(sig, model_key)
 
     def collector_factory(name, _runner):
+        if name == "redfish":
+            return redfish_collector
         if _runner.is_console:
             # BMC BusyBox shell: no rdmsr/smartctl/lspci/dmidecode. Map the
             # host-OS subsystems to BMC-shell probes; skip host-only ones.
@@ -1088,6 +1140,7 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
         test_log_lines=test_log_lines,
         test_log_queries=test_log_queries,
         test_log_case_terms=test_log_case_terms,
+        extra_collectors=("redfish",) if redfish_collector is not None else (),
     )
     if session_mode:
         engine = SessionEngine(
@@ -1139,6 +1192,8 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
         _prompt_label_after_run(out, out.parent / "cases")
     if llm_forward is not None:
         llm_forward.close()          # the hop lives exactly as long as the run
+    if redfish_collector is not None:
+        redfish_collector.client.close()   # tunnel (if any) dies with the run
     return diagnosis
 
 
@@ -1896,11 +1951,16 @@ def _baselines(out_dir: str | Path) -> list[Path]:
         key=lambda p: p.stat().st_mtime, reverse=True)
 
 
-def _menu_model(inv) -> int:
+def _menu_model(inv, store) -> int:
     """Pick the LLM reasoning model from the catalog (remembered in
-    ``config/models.yaml`` so the next run uses it)."""
+    ``config/models.yaml`` so the next run uses it). Selecting an
+    unconfigured built-in (``local/harness-diag`` etc.) or the ``+`` row
+    launches the guided setup; every non-stub pick is probed against the
+    endpoint's served list."""
+    from dataclasses import replace as _dc_replace
+
     from ..config.model_catalog import ModelCatalog, picker_rows
-    from .menu import ask_model_profile, select
+    from .menu import ask_model_profile, check_profile, select
 
     catalog = ModelCatalog.load(inv=inv)
     labels, profiles, add_idx = picker_rows(catalog)
@@ -1908,12 +1968,25 @@ def _menu_model(inv) -> int:
     if idx is None:
         return 0
     if idx == add_idx:
-        profile = ask_model_profile()
+        profile = ask_model_profile(inv=inv, store=store)
         if profile is None:
             return 0
         catalog.add(profile)
     else:
-        catalog.choose(profiles[idx])
+        profile = profiles[idx]
+        if profile.needs_setup:
+            guided = ask_model_profile(provider=profile.provider, inv=inv,
+                                       store=store)
+            if guided is None:
+                return 0
+            catalog.add(guided)
+            profile = guided
+        else:
+            catalog.choose(profile)
+    suggestion = check_profile(profile, inv=inv, store=store)
+    if suggestion and suggestion != profile.model:
+        profile = _dc_replace(profile, model=suggestion)
+        catalog.choose(profile)
     catalog.save()
     print(f"  model: {catalog.current.ident} (remembered for the next run)")
     return 0
@@ -2705,7 +2778,7 @@ def run_menu(args) -> int:
                     argv += _wizard_flags(args, "console")
                     _run_wizard_sub(argv)
                 elif key == "model":
-                    _menu_model(inv)
+                    _menu_model(inv, store)
                 elif key == "docs":
                     _menu_docs(args)
                 elif key == "targets":
@@ -2793,7 +2866,10 @@ def run_llm_check(args) -> int:
     Tunnel mode exercises each leg of the rack-manager hop (ssh auth ->
     direct-tcpip forward -> HTTP) and, when forwarding is refused, prints the
     reverse-tunnel fallback recipe. Direct mode probes reachability and lists
-    served models. Exit 0 = usable; 1 = failed stage; 2 = usage/config error.
+    served models. Both modes then send a minimal chat/completions probe in
+    the run's exact wire shape so server-side request validation (a 400 the
+    run would otherwise only hit at the ``reason`` step) fails the check
+    here. Exit 0 = usable; 1 = failed stage; 2 = usage/config error.
     """
     url = getattr(args, "url", None)
     tunnel_spec = getattr(args, "tunnel", None)
@@ -2807,22 +2883,29 @@ def run_llm_check(args) -> int:
             inv_path = getattr(args, "inventory", None)
             if not inv_path:
                 print("llm check: --tunnel needs --inventory (the rack-manager "
-                      "hop comes from its console_defaults block)", file=sys.stderr)
+                      "hop comes from its llm_console/console_defaults block)",
+                      file=sys.stderr)
                 return 2
             inv = load_inventory(inv_path)
-            if inv.console_defaults is None:
-                print("llm check: inventory has no console_defaults block "
-                      "(nothing to tunnel through)", file=sys.stderr)
+            from .llm_discover import llm_bastion_domain, llm_console_domain
+
+            domain = llm_console_domain(inv, getattr(args, "rack", None) or "")
+            if domain is None:
+                print("llm check: inventory has no llm_console or "
+                      "console_defaults block (nothing to tunnel through)",
+                      file=sys.stderr)
                 return 2
             store = _make_store(args)
-            print(f"rack manager: {inv.console_defaults.address}; "
+            print(f"rack manager: {domain.address_for_rack()}; "
                   f"target: {target_host}:{target_port}")
             forward = LLMForward(target_host, target_port,
-                                 inv.console_defaults, store, timeout=timeout)
+                                 domain, store, timeout=timeout,
+                                 bastion=llm_bastion_domain(
+                                     inv, getattr(args, "rack", None) or ""))
             try:
                 url = forward.start()
                 stages.append(("ssh", True,
-                               f"authenticated to {inv.console_defaults.address}"))
+                               f"authenticated to {domain.address_for_rack()}"))
                 stages.append(("forward", True,
                                f"{target_host}:{target_port} via {url}"))
             except TunnelError as exc:
@@ -2841,20 +2924,109 @@ def run_llm_check(args) -> int:
             _print_stages(stages)
             return 1
         stages.append(("http", True, f"{len(ids)} model(s) served at {url}"))
-        _print_stages(stages)
-        for model_id in ids:
-            print(f"  - {model_id}")
         if want_model:
             served = any(m == want_model or m.endswith("/" + want_model)
                          for m in ids)
             if not served:
+                reason = f"requested model {want_model!r} is not in the served list"
+                stages.append(("model", False, reason))
+                _print_stages(stages)
+                for model_id in ids:
+                    print(f"  - {model_id}")
                 print(f"warning: requested model {want_model!r} is not in the "
                       "served list", file=sys.stderr)
                 return 1
+        probe_model = want_model or (ids[0] if ids else None)
+        try:
+            chat_model = probe_chat(url, model=probe_model, timeout=timeout)
+        except LLMError as exc:
+            stages.append(("chat", False, str(exc)))
+            _print_stages(stages)
+            print("  the endpoint answered /models but refused a minimal "
+                  "chat/completions request in the run's wire shape",
+                  file=sys.stderr)
+            return 1
+        stages.append(("chat", True, f"chat/completions ok (served {chat_model})"))
+        _print_stages(stages)
+        for model_id in ids:
+            print(f"  - {model_id}")
         return 0
     finally:
         if forward is not None:
             forward.close()
+
+
+def run_llm_pin_host(args) -> int:
+    """Fetch the per-rack manager's SSH host key through the bastion and pin
+    it into ``llm_console.known_hosts_path`` (the ``ssh-keyscan`` pattern,
+    no credentials). Exit 0 = pinned; 1 = failed; 2 = usage error."""
+    from .llm_discover import pin_llm_host_key
+
+    rack = getattr(args, "rack", None)
+    cable = getattr(args, "cable", None)
+    if not (rack and cable):
+        print("llm pin-host: --rack and --cable are required", file=sys.stderr)
+        return 2
+    inv = load_inventory(args.inventory)
+    store = _make_store(args)
+    try:
+        summary = pin_llm_host_key(rack, cable, inv, store)
+    except Exception as exc:  # noqa: BLE001 - staged CLI error
+        print(f"llm pin-host: {exc}", file=sys.stderr)
+        return 1
+    print(f"  pinned: {summary}")
+    print("  re-run `harness llm discover` (or the model wizard) to proceed")
+    return 0
+
+
+def run_llm_discover(args) -> int:
+    """Node-side vLLM endpoint discovery on the rack/cable target.
+
+    ``harness llm discover --inventory PATH --rack R --cable N`` runs a batch
+    of read-only probes over the jumpin console (``hostname -I``, ``ss``,
+    ``sudo -S docker ps`` when the sudo password is configured) and prints
+    the candidates the model wizard's tunnel step uses: the node's
+    rackmgr-side addresses, listening ports, and container port mappings.
+    Exit 0 = usable candidates; 1 = probes ran but nothing parsed; 2 =
+    usage/targeting error.
+    """
+    from ..targets.resolver import TargetError, TargetSpec, resolve_target
+    from .llm_discover import discover
+
+    rack = getattr(args, "rack", None)
+    cable = getattr(args, "cable", None)
+    if not (rack and cable):
+        print("llm discover: --rack and --cable are required (the golden "
+              "server hosting the model)", file=sys.stderr)
+        return 2
+    inv = load_inventory(args.inventory)
+    store = _make_store(args)
+    try:
+        target = resolve_target(TargetSpec(rack=rack, cable=cable), inv, store)
+        result = discover(rack, cable, inv, store)
+    except TargetError as exc:
+        print(f"llm discover: {exc}", file=sys.stderr)
+        return 2
+    print(f"target: {target.label} (rack manager {target.console.address_for_rack()})")
+    print(f"  addresses : {', '.join(result.addresses) or '(none)'}")
+    for name, port in result.containers.items():
+        print(f"  container : {name} -> {port}")
+    print(f"  listening : {', '.join(str(p) for p in result.ports) or '(none)'}")
+    for note in result.notes:
+        print(f"  note      : {note}")
+    ports = result.suggested_ports()
+    suggested = [(a, p) for a in result.addresses for p in ports]
+    if suggested:
+        print("suggested next step:")
+        for addr, port in suggested:
+            print(f"  harness llm check --tunnel {addr}:{port} "
+                  f"--inventory {args.inventory}")
+        print("  (or pick 'tunnel' in the model wizard -- it asks rack/cable "
+              "and fills the rest)")
+        return 0
+    print("no endpoint candidates; configure the tunnel manually in the "
+          "model wizard", file=sys.stderr)
+    return 1
 
 
 # ---- argparse ----
@@ -3147,13 +3319,36 @@ def build_parser() -> argparse.ArgumentParser:
                         "(needs --inventory); reports which stage fails and "
                         "the fallback when forwarding is refused")
     c.add_argument("--inventory", default=None,
-                   help="inventory whose console_defaults supplies the tunnel hop")
+                   help="inventory whose llm_console/console_defaults supplies "
+                        "the tunnel hop")
+    c.add_argument("--rack", default=None,
+                   help="rack id for per-rack manager addressing "
+                        "(llm_console.rack_addresses)")
     c.add_argument("--model", default=None,
                    help="expected model id; warns when not served")
     c.add_argument("--timeout", type=float, default=10.0)
     c.add_argument("--secret-dir", default=None,
                    help="local dir mapping vault paths to files (lab use)")
     c.set_defaults(func=run_llm_check)
+    c = llm_sub.add_parser(
+        "discover",
+        help="find the vLLM endpoint on the rack/cable target "
+             "(read-only console probes)")
+    c.add_argument("--inventory", required=True)
+    _add_target_args(c, ssh=False)
+    c.add_argument("--secret-dir", default=None,
+                   help="local dir mapping vault paths to files (lab use)")
+    c.set_defaults(func=run_llm_discover)
+    c = llm_sub.add_parser(
+        "pin-host",
+        help="pin a per-rack manager's host key via the bastion "
+             "(ssh-keyscan pattern)")
+    c.add_argument("--inventory", required=True)
+    c.add_argument("--rack", required=True)
+    c.add_argument("--cable", required=True)
+    c.add_argument("--secret-dir", default=None,
+                   help="local dir mapping vault paths to files (lab use)")
+    c.set_defaults(func=run_llm_pin_host)
 
     p = sub.add_parser(
         "report",
