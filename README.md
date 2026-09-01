@@ -14,7 +14,7 @@ approves — any actual repair.
 
 ---
 
-## What it does (plain English)
+## What it does 
 
 - **Connects without changing anything.** Every command it runs on your server
   is checked against a strict read-only allowlist first — anything that could
@@ -35,36 +35,7 @@ approves — any actual repair.
   server, future runs that match the same failure pattern surface the verified
   fix before the AI even starts guessing.
 
-## What's new
-
-- **First-run setup wizard** — `harness` with no inventory file launches a
-  guided setup automatically; credentials are prompted for only at the moment
-  they are needed (zero-setup start).
-- **Model wizard** — pick `+ add / configure a model` in the menu's model
-  picker to connect a model with arrow-key prompts: endpoint, tunnel discovery
-  on the target node, and a pick-list of the model ids the server actually
-  serves. The choice is remembered for every later run.
-- **Rack-level Redfish evidence** — optionally reads the node event log and
-  service conditions over HTTPS (GET-only); arrives even when the console hop
-  is the broken part.
-- **`harness llm discover` / `llm pin-host`** — find the model endpoint on a
-  rack/cable node with read-only probes, and pin a per-rack manager's host key
-  through the bastion.
-- **`harness llm check`, now 4 stages** — `ssh` → `forward` → `http` (/models)
-  → **`chat`**: a real 1-token chat request in the exact shape a diagnosis
-  sends, so server-side rejections surface in seconds instead of minutes into
-  a run.
-- **Local models get time to think** — self-hosted endpoints (vLLM, llama.cpp,
-  Ollama) default to a **10-minute** response budget (long prompts and cold
-  starts are normal); cloud providers stay fail-fast at 2 minutes. Override
-  with `HARNESS_LLM_TIMEOUT` or a `timeout:` in the model profile, and timeout
-  errors now say exactly that.
-- **Runs inspection in the menu** — "Inspect past runs" shows verdicts,
-  commands, and evidence from earlier diagnoses.
-- **Interactive fix labeling** — `harness label --run <id>` records the
-  correct fix + outcome after a repair (the learning loop's ground truth).
-
-## What you need before you start
+## Requirements
 
 - **Python 3.11 or newer** — check with `python --version` (developed on 3.14;
   the examples below are Windows PowerShell, the CLI itself is cross-platform).
@@ -118,7 +89,7 @@ indexing (RAG) and testing.
 6. Every run is archived under `harness_runs/<id>/`; the menu's **Inspect past
    runs** re-opens any of them (verdicts, commands, evidence).
 
-## Pick your AI model (the "brain")
+## Setting the model
 
 The AI model does the reasoning; the harness does everything else. Pick one in
 the menu's **model** picker (arrow keys, type to filter) or with `/model`
