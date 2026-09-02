@@ -206,8 +206,6 @@ def test_run_passes_alias_model_key_when_detection_fails():
 
 
 def test_prompt_renders_provenance_and_unknown_warning():
-    from harness.diagnosis.prompt import build_turn_evidence
-
     no_model = build_prompt(
         model=None,
         decoded=[],
@@ -221,12 +219,11 @@ def test_prompt_renders_provenance_and_unknown_warning():
     assert "detection failed" in no_model
 
     m = from_operator("SuperMicro X11")
-    with_model = build_turn_evidence(
+    with_model = build_prompt(
         model=m,
-        symptom="ECC",
         decoded=[],
         summaries=EvidenceSummary(interesting=[], anomaly_count=0, total=0),
-        doc_snippets=[], parts_refs=[], conversation=[],
+        doc_snippets=[], parts_refs=[], symptom="ECC",
     )
     assert "model=SuperMicro X11" in with_model
     assert "model_source=operator" in with_model

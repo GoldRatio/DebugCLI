@@ -119,32 +119,6 @@ class Diagnosis(BaseModel):
     failure_point: FailurePoint | None = None
 
 
-class SingleTestRequest(BaseModel):
-    """Request to the FAT single-test driver: list the available tests, or run
-    one by exact label. ``run`` only ever accepts a label from the discovered
-    list -- the agent cannot free-type test numbers or commands."""
-
-    action: Literal["list", "run"]
-    test: str | None = None
-
-
-class TurnResponse(BaseModel):
-    """One agent turn in the multi-turn session: ask a question, request further
-    read-only probes, run a FAT single test, or deliver the final Diagnosis.
-
-    The agent never proposes commands -- ``subsystems``/``doc_topics`` are mapped
-    by the harness to curated read-only collectors / the doc library, and the
-    ``single_test`` action is mapped to the vendor FAT single-test menu driver.
-    """
-
-    kind: Literal["question", "probe", "test", "diagnosis"]
-    question: str | None = None
-    subsystems: list[str] = Field(default_factory=list)
-    doc_topics: list[str] = Field(default_factory=list)
-    single_test: SingleTestRequest | None = None
-    diagnosis: Diagnosis | None = None
-
-
 OUTCOMES = ("fixed", "partial", "not_fixed", "inconclusive", "unknown")
 
 

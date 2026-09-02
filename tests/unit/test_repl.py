@@ -14,12 +14,14 @@ from harness.config.vault import MemorySecretStore
 from harness.diagnosis.llm import StubLLM
 from harness.engine.allowlist import AllowPolicy, AllowRule
 from harness.engine.runner import CommandResult, Runner
+from harness.operator.chat_agent import ChatTurn
 from harness.operator.cli import build_parser
 from harness.operator.repl import (
     BackgroundTask,
     Session,
     _diagnose_argv,
     _handle_busy_line,
+    _tool_file,
     run_session,
 )
 from harness.operator.router import _keyword_route
@@ -78,6 +80,7 @@ def _make_session(tmp_path, overrides=None) -> Session:
     inv_path = Path(_inventory(tmp_path))
     inv = load_inventory(inv_path)
     return Session(
+        mode="debug",
         inv_path=str(inv_path),
         inv=inv,
         host=inv.get("h1"),
@@ -92,13 +95,13 @@ def _make_session(tmp_path, overrides=None) -> Session:
         parts_csv=None,
         secret_dir=None,
         console=False,
-        max_turns=6,
+        max_tools=0,
         overrides=overrides or {},
     )
 
 
 def _session_args(tmp_path, **kw):
-    argv = ["session", "--inventory", _inventory(tmp_path), "--host", "h1",
+    argv = ["debug", "--inventory", _inventory(tmp_path), "--host", "h1",
             "--out-dir", str(tmp_path / "runs"),
             "--session-dir", str(tmp_path / "sessions"),
             "--llm", "stub"]
@@ -175,6 +178,14 @@ class _AgentLLM:
     def chat_json(self, messages):
         self.messages = messages
         return self.raw
+
+
+class _NoChatLLM:
+    """Router without a chat_json: forces the keyword-fallback path, which is
+    what natural-language-targeting / intent tests want to exercise."""
+
+    def __call__(self, prompt):
+        raise AssertionError("fallback router must not be called as an LLM")
 
 
 # ---- session helpers ----
@@ -375,6 +386,23 @@ def test_session_repl_end_to_end(tmp_path, capsys):
         return (holder["session"].awaiting
                 and not holder["session"].answered)
 
+    class DiagnoseOnce:
+        """First message -> diagnose tool; follow-up -> conversational answer
+        grounded in the queued note (fed as Operator Notes)."""
+
+        def __init__(self):
+            self.calls: list[list[dict]] = []
+
+        def chat_json(self, messages):
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                return {"say": "Running a read-only diagnosis.",
+                        "tool": "diagnose", "symptom": "ECC error"}
+            return {"say": "Given the note that the DIMM was reseated, "
+                           "I would re-check the error counters.",
+                    "tool": "none"}
+
+    router = DiagnoseOnce()
     reader = _ScriptedReader([
         "diagnose the ECC error",
         "DIMM was reseated already, no change",
@@ -387,21 +415,23 @@ def test_session_repl_end_to_end(tmp_path, capsys):
         "on_session": on_session,
         "session": FakeSession(),
         "llm": StubLLM(),
-        "router_llm": StubLLM(),
+        "router_llm": router,
     })
     assert code == 0
 
     out = capsys.readouterr().out
-    assert "harness session" in out
-    assert "agent asks" in out                       # the StubLLM session question
-    assert "(answer sent to agent)" in out
+    assert "harness debug" in out
     assert "==== Diagnosis" in out                   # full report streamed from the worker
     assert "diagnosis complete" in out
+    assert "re-check the error counters" in out      # follow-up answer
+    # the queued note reached the agent's next decision
+    assert any("reseated" in m.get("content", "")
+               for call in router.calls[1:] for m in call)
 
     session_dir = next((tmp_path / "sessions").iterdir())
     payload = json.loads((session_dir / "session.json").read_text(encoding="utf-8"))
     kinds = [e["kind"] for e in payload["transcript"]]
-    assert "message" in kinds and "answer" in kinds and "diagnosis" in kinds
+    assert "message" in kinds and "diagnosis" in kinds
     assert any("reseated" in e["content"] for e in payload["transcript"])
 
     run_dir = next((tmp_path / "runs").iterdir())
@@ -423,7 +453,7 @@ def test_session_banner_layout(tmp_path, capsys):
     code = run_session(_session_args(tmp_path), overrides={"reader": reader})
     assert code == 0
     out = capsys.readouterr().out
-    assert "harness session" in out
+    assert "harness debug" in out
     assert "h1 (named)" in out                 # target field
     assert "stub" in out                       # llm field
     assert "Type /help for commands, or describe a symptom. /quit exits." in out
@@ -501,7 +531,7 @@ def test_session_background_does_not_tick_status_lines(tmp_path, capsys):
         "on_session": on_session,
         "session": FakeSession(),
         "llm": StubLLM(),
-        "router_llm": StubLLM(),
+        "router_llm": _NoChatLLM(),
     })
     assert code == 0
     out = capsys.readouterr().out
@@ -521,7 +551,8 @@ def test_session_repl_hosts_and_use(tmp_path, capsys):
 
 def test_session_repl_verify_without_baseline(tmp_path, capsys):
     reader = _ScriptedReader(["verify whether the counter changed", "/quit"])
-    code = run_session(_session_args(tmp_path), overrides={"reader": reader})
+    code = run_session(_session_args(tmp_path), overrides={
+        "reader": reader, "llm": StubLLM(), "router_llm": _NoChatLLM()})
     assert code == 0
     out = capsys.readouterr().out
     assert "no baseline yet" in out
@@ -529,8 +560,8 @@ def test_session_repl_verify_without_baseline(tmp_path, capsys):
 
 def test_session_repl_docs_without_library(tmp_path, capsys):
     reader = _ScriptedReader(["look up the DIMM in the manual", "/quit"])
-    code = run_session(_session_args(tmp_path), overrides={"reader": reader})
-    assert code == 0
+    run_session(_session_args(tmp_path), overrides={
+        "reader": reader, "llm": StubLLM(), "router_llm": _NoChatLLM()})
     assert "no doc library" in capsys.readouterr().out
 
 
@@ -1232,7 +1263,7 @@ def test_session_message_names_rack_cable_target(tmp_path, capsys):
         "on_session": on_session,
         "console_runner": console_runner,
         "llm": StubLLM(),
-        "router_llm": StubLLM(),
+        "router_llm": _NoChatLLM(),  # keyword fallback exercises targeting
     })
     assert code == 0
 
@@ -1279,7 +1310,7 @@ def test_session_message_names_ip_target(tmp_path, capsys):
         "session": FakeSession(),
         "store": store,
         "llm": StubLLM(),
-        "router_llm": StubLLM(),
+        "router_llm": _NoChatLLM(),  # keyword fallback exercises targeting
     })
     assert code == 0
 
@@ -1324,7 +1355,7 @@ def test_session_message_unknown_target_shows_error_not_crash(tmp_path, capsys):
         "on_session": on_session,
         "session": FakeSession(),
         "llm": StubLLM(),
-        "router_llm": StubLLM(),
+        "router_llm": _NoChatLLM(),  # keyword fallback exercises targeting
     })
     assert code == 0
     out = capsys.readouterr().out
@@ -1333,3 +1364,170 @@ def test_session_message_unknown_target_shows_error_not_crash(tmp_path, capsys):
     # the active target was NOT switched: the default named host stays active
     # (startup banner labels it `target`; _set_target echoes `active target:`)
     assert "h1 (named)" in out
+
+
+# ---- file tool ----
+
+def test_tool_file_missing_path_is_observation(tmp_path):
+    session = _make_session(tmp_path)
+    out = _tool_file(session, ChatTurn(tool="file", path="does/not/exist.log"))
+    assert "(no such file" in out
+
+
+def test_tool_file_missing_path_field_is_observation(tmp_path):
+    session = _make_session(tmp_path)
+    assert "(file path missing)" in _tool_file(session, ChatTurn(tool="file"))
+
+
+def test_tool_file_directory_is_observation(tmp_path):
+    session = _make_session(tmp_path)
+    out = _tool_file(session, ChatTurn(tool="file", path=str(tmp_path)))
+    assert "(not a file" in out
+
+
+def test_tool_file_reads_text_content(tmp_path):
+    f = tmp_path / "notes.txt"
+    f.write_text("DIMM A2 has been swapped twice\nPOST hangs after MRC init\n",
+                 encoding="utf-8")
+    session = _make_session(tmp_path)
+    out = _tool_file(session, ChatTurn(tool="file", path=str(f)))
+    assert "notes.txt" in out
+    assert "2 lines; content:" in out
+    assert "swapped twice" in out
+
+
+FAT_LOG = (
+    "INFO :2026-08-11 22:01:34 || Model     : T6T\n"
+    "INFO :2026-08-11 22:01:34 || Station   : FAT test start\n"
+    "ERROR:2026-08-11 22:02:01 || [FAIL][P02002001@PCIe Test Fail]\n"
+    "ERROR:2026-08-11 22:02:01 || PCIe compare check test Failed!\n"
+)
+
+
+def test_tool_file_parses_fat_log_and_matches_prior_cases(tmp_path):
+    """A referenced FAT log gets structured parsing AND prior verified fixes
+    from the case store (fleet learning) in the same observation."""
+    from harness.diagnosis.case_store import CaseStore
+    from harness.diagnosis.schema import CaseOutcome
+
+    cases = tmp_path / "cases"
+    case = CaseOutcome(
+        run_id="0" * 32, target_id="other", symptom="PCIe link down in FAT",
+        actions_recommended=["1. Reseat the GPU riser"],
+        actions_taken=["1. Reseated the GPU riser"],
+        outcome="fixed", llm_ident="stub",
+        evidence_summary=[], cited_titles=[],
+        test_log_failures=["P02002001@PCIe Test Fail"],
+    )
+    CaseStore(cases).save(case)
+
+    log = tmp_path / "fat.log"
+    log.write_text(FAT_LOG, encoding="utf-8")
+    session = _make_session(tmp_path)
+    session.cases_dir = str(cases)
+    out = _tool_file(session, ChatTurn(tool="file", path=str(log)))
+    assert "parsed as a factory test log" in out
+    assert "P02002001@PCIe Test Fail" in out
+    assert "prior verified fixes" in out
+    assert "Reseated the GPU riser" in out
+
+
+def test_tool_file_fat_log_without_cases_omits_learning(tmp_path):
+    log = tmp_path / "fat.log"
+    log.write_text(FAT_LOG, encoding="utf-8")
+    session = _make_session(tmp_path)  # empty case store
+    session.cases_dir = str(tmp_path / "cases")
+    out = _tool_file(session, ChatTurn(tool="file", path=str(log)))
+    assert "parsed as a factory test log" in out
+    assert "prior verified fixes" not in out
+
+
+def test_agent_file_tool_wired_in_repl(tmp_path, capsys):
+    """The chat/debug agent can answer from a referenced file in one turn."""
+    log = tmp_path / "fat.log"
+    log.write_text(FAT_LOG, encoding="utf-8")
+    reader = _ScriptedReader([f"read {log} and tell me what failed", "/quit"])
+    code = run_session(_session_args(tmp_path), overrides={
+        "reader": reader,
+        "session": FakeSession(),
+        "llm": StubLLM(),
+        "router_llm": _AgentLLM({"say": "Reading the referenced log.",
+                                 "tool": "file", "path": str(log)}),
+    })
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "reading file" in out
+    assert "parsed as a factory test log" in out
+
+
+# ---- chat mode REPL ----
+
+def _chat_args(tmp_path):
+    return build_parser().parse_args([
+        "chat",
+        "--out-dir", str(tmp_path / "runs"),
+        "--session-dir", str(tmp_path / "sessions"),
+        "--llm", "stub"])
+
+
+def test_chat_repl_starts_without_inventory(tmp_path, capsys):
+    """`harness chat` needs no inventory and never resolves a target."""
+    reader = _ScriptedReader(["/quit"])
+    code = run_session(_chat_args(tmp_path), overrides={"reader": reader})
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "harness chat" in out
+    assert "no target connected" in out
+    assert "inventory" not in out
+
+
+def test_chat_repl_blocks_debug_slash_commands(tmp_path, capsys):
+    reader = _ScriptedReader(["/use h1", "/hosts", "/quit"])
+    run_session(_chat_args(tmp_path), overrides={"reader": reader})
+    out = capsys.readouterr().out
+    assert "debug-only" in out
+    assert "no target is connected" in out
+    assert "h1  lab" not in out
+
+
+def test_chat_repl_agent_reads_file_and_no_target_tools(tmp_path, capsys):
+    """In chat mode the agent can read a referenced file; a diagnose request
+    via the keyword fallback is refused (no target)."""
+    log = tmp_path / "fat.log"
+    log.write_text("plain note about a fan alarm\n", encoding="utf-8")
+    reader = _ScriptedReader(["diagnose the ECC error on 10.0.0.9", "/quit"])
+    run_session(_chat_args(tmp_path), overrides={
+        "reader": reader, "llm": StubLLM(), "router_llm": _NoChatLLM()})
+    out = capsys.readouterr().out
+    assert "chat-only" in out          # fallback refuses the diagnose intent
+    assert "cannot connect to a machine" in out
+
+
+def test_chat_repl_agent_uses_file_tool(tmp_path, capsys):
+    log = tmp_path / "fan.log"
+    log.write_text("FAN1_CTRL fault logged at boot\n", encoding="utf-8")
+    reader = _ScriptedReader([f"check {log}", "/quit"])
+    run_session(_chat_args(tmp_path), overrides={
+        "reader": reader, "llm": StubLLM(),
+        "router_llm": _AgentLLM({"say": "Reading the file now.",
+                                 "tool": "file", "path": str(log)})})
+    out = capsys.readouterr().out
+    assert "reading file" in out
+    assert "FAN1_CTRL fault logged at boot" in out
+
+
+def test_chat_session_persists_mode(tmp_path):
+    """session.json records mode=chat; /resume in chat mode ignores targets."""
+    holder = {}
+
+    def on_session(session):
+        holder["s"] = session
+
+    reader = _ScriptedReader(["hello there", "/quit"])
+    run_session(_chat_args(tmp_path), overrides={
+        "reader": reader, "on_session": on_session,
+        "llm": StubLLM(), "router_llm": _NoChatLLM()})
+    session_dir = next((tmp_path / "sessions").iterdir())
+    payload = json.loads((session_dir / "session.json").read_text(encoding="utf-8"))
+    assert payload["mode"] == "chat"
+    assert "hello there" in [e.get("content") for e in payload["transcript"]]

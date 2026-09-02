@@ -1,16 +1,24 @@
-"""Conversation agent for the session REPL: a decide-and-act tool loop.
+"""Conversation agent for the harness REPL: a decide-and-act tool loop.
 
-The chat REPL is agent-driven: for each operator message the conversation LLM
-sees the dialog plus an evidence digest of the latest diagnosis run and answers
-with one ``ChatTurn`` -- short text for the operator (``say``; ALWAYS printed
-before anything runs) and at most one tool call (diagnose / probe / docs /
-verify).  Tool results feed back into the conversation so the agent can chain
-steps (diagnose -> probe -> docs -> verify) until it can answer, exactly like a
-coding agent that explains, acts, observes, and continues.
+The REPL is agent-driven: for each operator message the conversation LLM sees
+the dialog plus mode-specific context (a debug session adds an evidence digest
+of the latest diagnosis run) and answers with one ``ChatTurn`` -- short text
+for the operator (``say``; ALWAYS printed before anything runs) and at most
+one tool call.  Tool results feed back into the conversation so the agent can
+chain steps until it can answer, exactly like a coding agent that explains,
+acts, observes, and continues.
+
+Two modes share this machinery:
+
+- ``"debug"``: the operator picked a target; the agent drives read-only
+  debugging tools (diagnose / probe / docs / verify / run / file).
+- ``"chat"``: no target, no connection.  A pure reference assistant: docs
+  lookup, past-run loading, and reading files the operator references by path.
 
 Read-only safety is unchanged: the agent only ever picks WHICH existing
 harness action to run; it never emits command text, and every execution path
-still enforces the allowlist + ``security_check`` gates.
+still enforces the allowlist + ``security_check`` gates.  Chat mode cannot
+reach any target tool at all -- its tool set is enforced in ``decide``.
 
 When the conversation LLM is unavailable or answers garbage, ``fallback_turn``
 maps the deterministic keyword router's ``SessionCommand`` (see
@@ -28,9 +36,15 @@ from pydantic import BaseModel, Field
 from ..diagnosis.schema import Diagnosis
 from .router import SUBSYSTEMS, SessionCommand, extract_target
 
-CHAT_TOOLS = ("diagnose", "probe", "docs", "verify", "run")
+Mode = Literal["debug", "chat"]
 
-CHAT_SYSTEM = """You are the conversational agent of a READ-ONLY server-debugging
+DEBUG_TOOLS = ("diagnose", "probe", "docs", "verify", "run", "file")
+CHAT_TOOLS = ("docs", "run", "file")
+
+# Tools that require a live target -- never offered in chat mode.
+DEBUG_ONLY_TOOLS = frozenset({"diagnose", "probe", "verify"})
+
+DEBUG_SYSTEM = """You are the conversational agent of a READ-ONLY server-debugging
 harness. You chat with the operator like a senior debugging partner: explain
 what you are doing, call the harness's read-only tools to gather evidence, and
 answer questions grounded in that evidence.
@@ -53,6 +67,12 @@ Hard rules:
   evidence -- do NOT launch a fresh diagnosis to answer a question about a past
   run.
 
+Work iteratively: you have a budget of 8 tool calls for this one message.
+Prefer chaining tools (diagnose -> probe -> docs -> verify) over answering
+from thin evidence, and prefer more evidence over guessing. When the evidence
+or the operator's intent is unclear, stop and ask ONE concise clarifying
+question in "say" (tool "none") instead of guessing.
+
 Tools (at most one per response):
 - "diagnose": run the full read-only pipeline (collect -> decode -> docs ->
   LLM -> scored diagnosis) on one target. Fields: symptom (required, a crisp
@@ -70,24 +90,75 @@ Tools (at most one per response):
   whenever the operator references an existing run and asks what it found or
   how it relates to something. Fields: run (the hex run id or run directory
   path, e.g. "harness_runs/bcf28c2bc94448919445af3b2e66fdcc").
+- "file": read a file the operator referenced by path (a log, a report) and
+  reason over its contents; READ-ONLY. For factory-test (FAT) logs the
+  harness also attaches prior verified fixes matched from the case library.
+  Fields: path (required).
 - "none": pure conversation -- answer, summarize, recommend next steps, or ask
   ONE concise clarifying question.
 
 Always fill "say" -- it is shown to the operator before anything runs. When
 calling a tool, say briefly what you are about to do and why (1-2 sentences).
 You will see each tool's result before your next decision, and you may chain
-tools until you can answer; stop (tool "none") as soon as you can. Prefer more
-evidence over guessing."""
+tools until you can answer; stop (tool "none") as soon as you can."""
 
-CHAT_CONTRACT = """Respond with STRICT JSON only (no markdown fences, no prose):
-{"say": "...", "tool": "diagnose"|"probe"|"docs"|"verify"|"run"|"none", <tool fields>}
+DEBUG_CONTRACT = """Respond with STRICT JSON only (no markdown fences, no prose):
+{"say": "...", "tool": "diagnose"|"probe"|"docs"|"verify"|"run"|"file"|"none", <tool fields>}
 - diagnose fields: symptom (required -- a crisp symptom phrase, NOT a question
   and NOT a run path), host, rack, cable, ip, alias (optional).
 - probe fields: subsystems, doc_topics.
 - docs fields: query (required).
 - verify fields: metric, baseline.
 - run fields: run (required -- hex run id or run directory path).
+- file fields: path (required -- local file path the operator referenced).
 "say" is always required and is printed to the operator first."""
+
+CHAT_SYSTEM = """You are the conversational assistant of a READ-ONLY
+server-debugging harness. This is CHAT mode: you never connect to machines,
+run probes, or inspect live hardware. You help the operator by (a) answering
+questions from the harness's manual/document library, (b) loading and
+explaining past diagnosis runs, and (c) reading files the operator references
+by path (logs, reports) and reasoning over their contents.
+
+Hard rules:
+- Never claim to have inspected a live machine, run a probe, or collected
+  evidence from a target. This session cannot connect to anything.
+- Ground every factual claim in tool results from this conversation (docs
+  snippets, past-run evidence, file contents). Distinguish what a document or
+  file says from what you infer. When you infer, say that you are inferring.
+- If the operator wants a live diagnosis of a machine, say so plainly: this
+  chat cannot do that -- they should use "Debug a target" (``harness debug``)
+  instead. Then offer what you CAN do here: read their log file, look up the
+  manuals, or load a past run.
+
+Tools (at most one per response):
+- "docs": manual / architecture lookup. Fields: query (required).
+- "run": load a PAST run's recorded diagnosis + evidence digest by run id or
+  directory (READ-ONLY, local file read; never re-runs anything). Use it
+  whenever the operator references an existing run and asks what it found.
+  Fields: run (the hex run id or run directory path).
+- "file": read a file the operator referenced by path (a log, a report) and
+  reason over its contents; READ-ONLY. For factory-test (FAT) logs the
+  harness also attaches prior verified fixes matched from the case library.
+  Fields: path (required).
+- "none": pure conversation -- answer from what you already have, summarize,
+  recommend next steps, or ask ONE concise clarifying question.
+
+Always fill "say" -- it is shown to the operator before anything runs. When
+calling a tool, say briefly what you are about to do and why (1-2 sentences).
+You will see each tool's result before your next decision, and you may chain
+tools until you can answer; stop (tool "none") as soon as you can. Prefer
+looking something up over guessing."""
+
+CHAT_CONTRACT = """Respond with STRICT JSON only (no markdown fences, no prose):
+{"say": "...", "tool": "docs"|"run"|"file"|"none", <tool fields>}
+- docs fields: query (required).
+- run fields: run (required -- hex run id or run directory path).
+- file fields: path (required -- local file path the operator referenced).
+"say" is always required and is printed to the operator first."""
+
+SYSTEM_PROMPTS: dict[str, str] = {"debug": DEBUG_SYSTEM, "chat": CHAT_SYSTEM}
+CONTRACTS: dict[str, str] = {"debug": DEBUG_CONTRACT, "chat": CHAT_CONTRACT}
 
 
 class ChatTurn(BaseModel):
@@ -95,11 +166,13 @@ class ChatTurn(BaseModel):
 
     The agent never proposes commands -- ``subsystems``/``doc_topics`` are
     mapped by the harness to curated read-only collectors, and every other
-    tool reuses an existing read-only pipeline.
+    tool reuses an existing read-only pipeline (or a local read-only file
+    load for ``run``/``file``).
     """
 
     say: str = ""
-    tool: Literal["diagnose", "probe", "docs", "verify", "run", "none"] = "none"
+    tool: Literal["diagnose", "probe", "docs", "verify", "run", "file",
+                  "none"] = "none"
     symptom: str | None = None
     host: str | None = None
     rack: str | None = None
@@ -112,16 +185,27 @@ class ChatTurn(BaseModel):
     metric: str = "ecc"
     baseline: str | None = None
     run: str | None = None
+    path: str | None = None
+
+
+# required non-empty string field per tool; probe is validated separately
+_REQUIRED_FIELD: dict[str, str] = {
+    "diagnose": "symptom",
+    "docs": "query",
+    "run": "run",
+    "file": "path",
+}
 
 
 def decide(llm, messages: list[dict],
-           host_names: tuple[str, ...] = ()) -> ChatTurn | None:
+           host_names: tuple[str, ...] = (),
+           mode: Mode = "debug") -> ChatTurn | None:
     """One agent decision from the conversation LLM.
 
     Returns ``None`` when the LLM is unavailable or its output is unusable
     (missing/malformed JSON, old router format, semantic violations like a
-    diagnose without a symptom) -- the caller then falls back to keyword
-    routing so the session stays usable.
+    diagnose without a symptom, or a target tool in chat mode) -- the caller
+    then falls back to keyword routing so the session stays usable.
     """
     chat_json = getattr(llm, "chat_json", None)
     if not callable(chat_json):
@@ -136,14 +220,16 @@ def decide(llm, messages: list[dict],
         turn = ChatTurn.model_validate(raw)
     except Exception:  # noqa: BLE001 - malformed output falls back
         return None
-    if turn.tool == "diagnose" and not (turn.symptom or "").strip():
+    allowed = (DEBUG_TOOLS if mode == "debug" else CHAT_TOOLS) + ("none",)
+    if turn.tool not in allowed:
         return None
-    if turn.tool == "docs" and not (turn.query or "").strip():
+    required = _REQUIRED_FIELD.get(turn.tool)
+    if required is not None and not (getattr(turn, required) or "").strip():
         return None
     if turn.tool == "probe" and not turn.subsystems and not turn.doc_topics:
         return None
-    if turn.tool == "run" and not (turn.run or "").strip():
-        return None
+    if mode != "debug":
+        return turn
     if turn.host and host_names and turn.host not in host_names:
         turn.host = None  # unknown host -> active target, never an error
     if turn.tool == "diagnose" and not any((turn.rack, turn.cable, turn.ip)):
@@ -158,9 +244,23 @@ def decide(llm, messages: list[dict],
     return turn
 
 
-def fallback_turn(cmd: SessionCommand, text: str) -> ChatTurn:
+def fallback_turn(cmd: SessionCommand, text: str,
+                  mode: Mode = "debug") -> ChatTurn:
     """Map a keyword-routed ``SessionCommand`` to the same ``ChatTurn`` shape
     (used when the conversation LLM is unavailable or answered garbage)."""
+    if mode == "chat":
+        if cmd.intent == "docs":
+            return ChatTurn(say="Looking that up in the manuals.",
+                            tool="docs", query=cmd.query or text)
+        if cmd.intent in ("diagnose", "probe", "verify"):
+            return ChatTurn(say="This session is chat-only -- it cannot "
+                                "connect to a machine. For a live diagnosis "
+                                "use 'Debug a target' (harness debug). Here I "
+                                "can look up manuals, read a file you "
+                                "reference, or load a past run.",
+                            tool="none")
+        return ChatTurn(say="(chat fallback: name a topic to look up, a run "
+                            "id to load, or a file path to read)", tool="none")
     if cmd.intent == "diagnose":
         return ChatTurn(say="Running a read-only diagnosis on the symptom.",
                         tool="diagnose", symptom=cmd.symptom or text,
@@ -200,14 +300,16 @@ def _clip(text: str, limit: int) -> str:
 
 
 def build_messages(*, transcript: list[dict], user_text: str,
-                   evidence_digest: str,
+                   evidence_digest: str = "",
                    host_names: tuple[str, ...] = (),
                    target_label: str = "",
-                   pending: list[str] | None = None) -> list[dict]:
+                   pending: list[str] | None = None,
+                   mode: Mode = "debug") -> list[dict]:
     """Chat messages for one agent decision: system prompt + dialog window +
     a final user message carrying the current state (evidence digest, queued
     notes, the operator's line, and the output contract)."""
-    messages: list[dict] = [{"role": "system", "content": CHAT_SYSTEM}]
+    messages: list[dict] = [{"role": "system",
+                             "content": SYSTEM_PROMPTS[mode]}]
     for entry in list(transcript)[-_TRANSCRIPT_WINDOW:]:
         role = "assistant" if entry.get("role") == "agent" else "user"
         prefix = _ENTRY_PREFIX.get(entry.get("kind", ""), "")
@@ -215,10 +317,11 @@ def build_messages(*, transcript: list[dict], user_text: str,
         if content:
             messages.append({"role": role, "content": content})
     blocks: list[str] = []
-    if host_names:
-        blocks.append("## Available Hosts\n" + ", ".join(host_names))
-    if target_label:
-        blocks.append(f"## Active Target\n{target_label}")
+    if mode == "debug":
+        if host_names:
+            blocks.append("## Available Hosts\n" + ", ".join(host_names))
+        if target_label:
+            blocks.append(f"## Active Target\n{target_label}")
     blocks.append(evidence_digest or
                   "## Latest Run Evidence\n(no diagnosis run yet in this "
                   "session)")
@@ -232,7 +335,7 @@ def build_messages(*, transcript: list[dict], user_text: str,
                       "runs)\n" + ", ".join(f"`{r}`" for r in runs)
                       + "\nUse the 'run' tool to load one of these instead of "
                       "launching a new diagnosis.")
-    blocks.append(CHAT_CONTRACT)
+    blocks.append(CONTRACTS[mode])
     messages.append({"role": "user", "content": "\n\n".join(blocks)})
     return messages
 
@@ -314,7 +417,13 @@ __all__ = [
     "CHAT_CONTRACT",
     "CHAT_SYSTEM",
     "CHAT_TOOLS",
+    "CONTRACTS",
+    "DEBUG_CONTRACT",
+    "DEBUG_ONLY_TOOLS",
+    "DEBUG_SYSTEM",
+    "DEBUG_TOOLS",
     "SUBSYSTEMS",
+    "SYSTEM_PROMPTS",
     "ChatTurn",
     "build_evidence",
     "build_messages",

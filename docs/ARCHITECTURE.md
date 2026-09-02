@@ -15,9 +15,10 @@ src/harness/
                for Quanta FAT `.log` files, structured failure model, log-source
                seam (files now, a website fetcher later)
   diagnosis/   pydantic schema, summarizer, LLM orchestrator, scorer,
-               verifier (baseline diff), session state
+               verifier (baseline diff)
   audit/       append-only hash-chained trace, secret redaction
-  operator/    CLI + interactive menu + REPL + human approval gate + supervisor
+  operator/    CLI + interactive menu + chat/debug REPLs + human approval gate
+               + supervisor
   targets/     dynamic target resolution (named / console rack-cable / SSH-by-IP /
                alias)
   config/      inventory (vault paths only), secrets client, inventory lint
@@ -40,11 +41,28 @@ symptom ─▶ plan.symptom -> subsystem ─▶ minimal collector set
         case store ─▶ case_library.similar matches future runs by failure code
 ```
 
-A `--test-log` run renders a `## Factory Test Log Evidence` section into every
-prompt (single-shot and session), seeds doc retrieval with its failure queries
+A `--test-log` run renders a `## Factory Test Log Evidence` section into the
+prompt, seeds doc retrieval with its failure queries
 (capped), records its failure signatures on the pending case, and — after the
 operator confirms the outcome with `harness report` — the verified case is
 retrieved for future runs whose log shows the same failure code.
+
+## REPL modes (operator.repl + operator.chat_agent)
+
+One decide-and-act loop (`ChatTurn`: `say` + at most one tool per decision)
+serves two modes:
+
+- **debug** (`harness debug`, alias `session`): target picked up front; tools
+  `diagnose | probe | docs | verify | run | file | none`; budget 8 tool calls
+  per operator message; evidence digest of the latest run grounds follow-ups.
+- **chat** (`harness chat`): target-less; tools `docs | run | file | none`;
+  budget 4; never reaches a target pipeline. `file` reads an
+  operator-referenced path and, for FAT logs, attaches prior verified fixes
+  matched from the case store.
+
+Both modes persist `session.json` under `--session-dir` (mode, transcript,
+runs) and fall back to the deterministic keyword router when the conversation
+LLM is unavailable.
 
 ## Execution domains
 

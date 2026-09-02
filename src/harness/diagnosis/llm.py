@@ -276,8 +276,9 @@ class StubLLM:
 
     Lets the whole pipeline (collect -> decode -> RAG -> score -> audit) run and
     be tested without any LLM infrastructure. The diagnosis text makes it obvious
-    that no reasoning happened. In session mode it asks one question, then
-    diagnoses, so multi-turn flows are exercised deterministically.
+    that no reasoning happened. As the REPL conversation agent it never calls a
+    tool (tool "none"), so structured intents fall through to the keyword
+    router.
     """
 
     def __init__(self) -> None:
@@ -294,11 +295,8 @@ class StubLLM:
         )
 
     def chat_json(self, messages: list[dict]) -> dict:
-        if not self._asked:
-            self._asked = True
-            return {
-                "kind": "question",
-                "question": "What previous repair actions were already attempted?",
-            }
-        diag = self.__call__(messages[-1]["content"])
-        return {"kind": "diagnosis", "diagnosis": diag.model_dump()}
+        return {
+            "say": "(stub agent) no reasoning LLM is configured; I cannot "
+                   "decide on tools.",
+            "tool": "none",
+        }

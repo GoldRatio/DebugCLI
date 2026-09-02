@@ -139,31 +139,54 @@ harness            # or: harness menu
 ```
 
 Auto-discovers the inventory, then menus. The top level keeps the daily
-flows only: **Chat session**, **Debug a target** (one-shot diagnosis),
-**Inspect past runs**, and **Advanced...** -- which holds verify, serial
-console, model, docs, targets, secrets, setup and lint.
-Esc cancels; typing filters; non-tty stdin falls back to numbered prompts.
+flows only: **Chat** (target-less reference assistant), **Debug a target**
+(interactive agent debugging), **Inspect past runs**, and **Advanced...** --
+which holds verify, serial console, model, docs, targets, secrets, setup and
+lint. Esc cancels; typing filters; non-tty stdin falls back to numbered prompts.
 
-### Chat session
+### Debug session (interactive, on a target)
 
 ```powershell
-harness session --inventory inventory.yaml --host h1
-harness> the DIMM error is back on h1
+harness debug --inventory inventory.yaml --host h1
+harness debug> the DIMM error is back on h1
 ```
 
-- Non-slash text routes (LLM, keyword fallback) to diagnose / probe / docs /
-  verify / status / reply. A `probe` request runs the read-only collectors for
-  the named subsystem (or doc-named probes mined from the manual) against the
-  active target and reports the decoded registers back in the chat -- it never
-  asks the agent to invent commands.
+- The agent (LLM, keyword fallback) explains what it is about to do and calls
+  read-only tools in the background: `diagnose` (full pipeline), `probe`
+  (collectors for a named subsystem or doc-named probes mined from the manual),
+  `docs`, `verify` (compare against a baseline), `run` (load a past run), and
+  `file` (read a file path you reference, e.g. a log). It never invents
+  commands; every execution path is allowlisted.
+- Debugging is iterative: keep prompting. Follow-ups are grounded in the
+  latest run's evidence digest; the agent may chain up to 8 tool calls per
+  message (`--max-tools` to change).
 - Slash commands: `/help`, `/hosts`, `/use <host|rack cable n|ip|alias>`,
-  `/context <note>`, `/status`, `/stop`, `/runs`, `/history`, `/resume <dir>`,
-  `/lint`, `/targets ...`, `/docs ...`, `/quit`.
-- Type-ahead: messages typed while a run is in progress seed the next run.
+  `/model [ident]`, `/context <note>`, `/testlog <path>`, `/status`, `/stop`,
+  `/runs`, `/history`, `/resume <dir>`, `/lint`, `/targets ...`, `/docs ...`,
+  `/askparts on|off`, `/quit`.
+- Type-ahead: messages typed while a run is in progress are queued; the agent
+  reads them on its next decision and they seed the next run as context.
 - Sessions persist under `--session-dir`; each run keeps `diagnosis.json` /
   `trace.json` / `dumps.json` under `--out-dir`.
 
-### One-shot flags
+### Chat (target-less)
+
+```powershell
+harness chat
+harness chat> what does the manual say about DIMM population rules?
+```
+
+- No inventory, no machine is contacted. The agent answers from the RAG
+  document library (`docs`), loads past runs (`run`), and reads files you
+  reference by path (`file`).
+- Referencing a factory/FAT log makes the harness parse its failures and
+  surface prior verified fixes matched from the case store, right in the chat.
+- Target tools (`diagnose`/`probe`/`verify`) are unavailable: the agent says
+  so and points you at `harness debug` for live debugging.
+- Slash commands: `/help`, `/model`, `/context`, `/status`, `/stop`, `/runs`,
+  `/history`, `/resume`, `/docs`, `/quit` (debug-only commands are refused).
+
+### One-shot diagnose (CLI/automation)
 
 ```powershell
 harness diagnose --inventory inventory.yaml --host h1 --symptom "ECC errors"
@@ -172,8 +195,9 @@ harness diagnose --inventory inventory.yaml --address 10.0.0.50 --symptom "ECC e
 harness diagnose --inventory inventory.yaml --target d1 --symptom "ECC errors"
 ```
 
-Add `--approval` (y/N per action) or `--approve-all` (record all approved),
-`--context "note"` / `--context-file`, and `--max-turns` (default 6).
+Add `--approval` (y/N per action) or `--approve-all` (record all approved).
+`--context "note"` / `--context-file <file>` add operator-supplied context
+lines to the diagnosis prompt (Operator Context section).
 
 ### Test-log evidence (any target)
 
@@ -188,9 +212,10 @@ harness diagnose --inventory inventory.yaml --host h1 `
 #   --symptom is optional here: it derives from the log's first failure
 ```
 
-- Repeatable (`--test-log a.log --test-log b.log`), works in single-shot AND
-  session mode, and from the menu (the Diagnose step asks for a log path) or
-  the chat REPL (`/testlog <path>` queues one for the next run).
+- Repeatable (`--test-log a.log --test-log b.log`), works in one-shot
+  `diagnose` and in the debug REPL (`/testlog <path>` queues one for the next
+  run; a path pasted in chat is read by the `file` tool and matched against
+  the case store).
 - The raw log is copied into `harness_runs/<id>/test_logs/` for
   reproducibility; the audit `test_log_loaded` event records only metadata and
   failure codes. Cleartext passwords in logs (e.g. `sshpass -p '...'`) are
@@ -200,31 +225,12 @@ harness diagnose --inventory inventory.yaml --host h1 `
   [--taken "..."]`. A future run whose log shows the same failure code surfaces
   that verified fix as a Prior Verified Case — even before any probing.
 
-### FAT single tests (GB targets, session mode)
+### FAT single tests (not currently wired)
 
-The GB models expose a vendor single-test menu on the host:
-`/mnt/smbfs/single_rtp_l10.sh <ServerNumber>`. In session mode the agent can
-drive it: it lists the FAT tests, then runs the ones it decides will
-discriminate between suspects, and treats the results as evidence.
-
-```powershell
-harness diagnose --inventory inventory.yaml --host h1 --symptom "ECC errors" `
-    --interactive --server-number 3
-harness session --inventory inventory.yaml --host h1 --server-number 3
-```
-
-- Requires `--server-number` (positive integer, supplied by you; the lab doc
-  notes it can sometimes be derived from `ipmitool fru print 2`), an SSH target
-  (not `--console`), and session mode (`--interactive` / `--context*`).
-- The agent is instructed to `{"kind":"test","action":"list"}` first, then
-  `{"kind":"test","action":"run","test":"<exact label>"}` for tests on the
-  listed menu. Menu selections are always bare digits; no free text is ever
-  sent to the menu.
-- Results come back as `[test result]` messages in the transcript; a `FAIL` is
-  treated as strong current-state evidence. The full transcript is saved under
-  the run directory as `single_test_transcript.txt`.
-- Platform gating: only GB platform families (samoa/nvl72, incl. gb200) are
-  allowed; the live-detected model wins.
+The `engine/single_test.py` driver for the vendor GB single-test menu remains
+in the codebase (unit-tested, read-only menu interaction), but nothing
+exposes it since the multi-turn session engine was retired in favor of the
+debug REPL. It is a candidate future `test` tool for the debug agent.
 
 ## 5. Console path (serial/SOL, lab/QA only)
 
@@ -354,7 +360,7 @@ You can serve the reasoning model on a lab box (vLLM is natively
 OpenAI-compatible) and point the harness at it — including on the golden
 server itself, the same rack/cable target you are debugging. The simple path
 is the guided setup — `harness menu → model → local/harness-diag` (or
-`/model` in a session):
+`/model` in a chat/debug session):
 
 1. Provider and endpoint URL (Enter = `http://127.0.0.1:8000/v1`).
 2. Transport: **direct** if the workstation can reach the endpoint, or

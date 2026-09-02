@@ -64,6 +64,9 @@ class EngineContext:
     # FAT single-test driver (None = capability unavailable). Exposed to the
     # session engine's ``kind=test`` turn; the driver handles the vendor menu.
     single_test_driver: object | None = None
+    # Operator-supplied context lines (--context / --context-file): rendered
+    # verbatim into the prompt as an Operator Context section.
+    context_lines: list[str] | None = None
     # Operator-supplied test-log evidence (--test-log): pre-rendered prompt
     # lines, failure-derived doc-retrieval queries, and failure identity terms
     # appended to the case-library query.
@@ -289,6 +292,7 @@ class DiagnosticEngine:
             symptom=symptom,
             prior_cases=prior_cases,
             test_log_lines=self.ctx.test_log_lines,
+            context_lines=self.ctx.context_lines,
         )
         if self.ctx.prompt_callback is not None:
             self.ctx.prompt_callback(prompt)

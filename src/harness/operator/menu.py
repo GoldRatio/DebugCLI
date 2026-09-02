@@ -789,7 +789,7 @@ def _golden_server_tunnel(*, reader: LineReader | None = None, inv=None,
         # handshake, and the login handshake reuses it (sudo and login share
         # the user's own password). The capture happens here where the
         # terminal is sane.
-        node_user = ask_text("Node user on the golden server (e.g. yemankyaw)",
+        node_user = ask_text("Node user on the LLM server",
                              reader=reader).strip()
         if not node_user:
             return None

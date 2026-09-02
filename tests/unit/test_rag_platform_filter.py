@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 
-from harness.diagnosis.prompt import build_prompt, build_turn_evidence
+from harness.diagnosis.prompt import build_prompt
 from harness.diagnosis.summarize import EvidenceSummary
 from harness.docs.ingest.chunk import Chunk
 from harness.docs.ingest.library import DocLibrary
@@ -139,14 +139,13 @@ def test_library_reindex_preserves_platform(tmp_path: Path):
 
 
 def _prompt_lines(**kw):
-    return build_turn_evidence(
+    return build_prompt(
         model=kw.get("model"),
-        symptom="ECC",
         decoded=kw.get("decoded", []),
         summaries=EvidenceSummary(interesting=[], anomaly_count=0, total=0),
         doc_snippets=kw.get("doc_snippets", ["[doc p.1] a snippet"]),
         parts_refs=[],
-        conversation=[],
+        symptom="ECC",
     )
 
 

@@ -1,11 +1,18 @@
-"""Interactive session REPL: an agent chat over read-only debugging tools.
+"""Interactive REPL: an agent chat, in two modes.
 
-``harness session`` starts a Claude-Code-style REPL: you describe symptoms in
-plain English and a conversation agent (``operator.chat_agent``) explains what
-it is about to do, then calls the harness's read-only tools (diagnose / probe /
-docs / verify) *in the background* while you keep typing. Tool results feed
-back into the conversation, so the agent can chain steps and answer follow-up
-questions grounded in the evidence it gathered.
+``harness debug`` starts the DEBUG REPL on a picked target: you describe
+symptoms in plain English and a conversation agent (``operator.chat_agent``)
+explains what it is about to do, then calls the harness's read-only tools
+(diagnose / probe / docs / verify / run / file) *in the background* while you
+keep typing. Tool results feed back into the conversation, so the agent can
+chain steps and answer follow-up questions grounded in the evidence it
+gathered. Debugging is iterative, not one-shot: keep prompting, ask for
+re-checks, steer the agent while it works.
+
+``harness chat`` starts the CHAT REPL: no target, no connection. A pure
+reference assistant -- manual/docs lookups, past-run loading, and reading
+files you reference by path (e.g. a FAT log; factory-test logs also match
+prior verified fixes from the case library).
 
 Design:
 
@@ -19,13 +26,14 @@ Design:
   POSIX, msvcrt on Windows) so the REPL can redraw the in-progress input line
   around background output. When stdin is not a tty it falls back to blocking
   ``input()``.
-- Messages typed while a diagnosis is running are queued and seeded as context
-  (``--context``) into the next run -- the agent reads them once it winds down.
-- Session-mode agent questions block the worker on an answer event; the REPL
-  delivers the next typed line to the agent.
+- Messages typed while a tool runs are queued and fed to the agent's next
+  decision (debug mode additionally seeds them as ``--context`` into the next
+  diagnose run). Operator answers to agent questions block the worker on an
+  answer event; the REPL delivers the next typed line to the agent.
 
 Every turn and every run is persisted to ``--session-dir`` as ``session.json``
-(host, transcript, run dirs) so a session can be resumed with ``/resume``.
+(mode, host, transcript, run dirs) so a session can be resumed with
+``/resume``.
 """
 
 from __future__ import annotations
@@ -41,7 +49,7 @@ import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import TextIO
+from typing import ClassVar, TextIO
 
 from ..config.inventory_lint import load_inventory
 from ..config.vault import SecretStore
@@ -58,6 +66,7 @@ from .router import _keyword_route
 
 @dataclass
 class Session:
+    mode: str  # "debug" (target picked, full tool set) | "chat" (no target)
     inv_path: str
     inv: object
     host: object
@@ -72,15 +81,16 @@ class Session:
     parts_csv: str | None
     secret_dir: str | None
     console: bool
-    max_turns: int
-    server_number: int | None = None
+    max_tools: int  # tool calls per operator message (0 = mode default)
     llm_ident: str = ""
     llm_url: str | None = None
     llm_tunnel: str | None = None
     ask_parts: bool = False
+    cases_dir: str | None = None
     overrides: dict = field(default_factory=dict)
     target: TargetSpec = field(default_factory=TargetSpec)
     target_label: str = ""
+    target_kind: str = ""
     targets_file: str | None = None
     ssh_user: str = "diagbot"
     identity_vault_path: str | None = None
@@ -255,6 +265,7 @@ def _set_target(session: Session, spec: TargetSpec) -> bool:
     session.host = target.host
     session.target = spec
     session.target_label = target.label
+    session.target_kind = target.kind
     _print_line(session, ui.good(f"  active target: {target.label} ({target.kind})"))
     return True
 
@@ -264,8 +275,7 @@ def _diagnose_argv(session: Session, symptom: str, host_name: str | None) -> lis
     argv = ["diagnose", "--inventory", session.inv_path,
             "--symptom", symptom,
             "--out-dir", str(session.out_dir),
-            "--llm", session.llm_mode,
-            "--max-turns", str(session.max_turns)]
+            "--llm", session.llm_mode]
     if session.llm_ident:
         argv += ["--llm-model", session.llm_ident]
     if session.llm_url:
@@ -287,8 +297,6 @@ def _diagnose_argv(session: Session, symptom: str, host_name: str | None) -> lis
         argv.append("--ask-parts")
     if session.console:
         argv.append("--console")
-    if session.server_number:
-        argv += ["--server-number", str(session.server_number)]
     for context_line in session.pending:
         argv += ["--context", context_line]
     session.pending = []
@@ -459,6 +467,72 @@ def _tool_run(session: Session, turn: ChatTurn) -> str:
         {"role": "agent", "kind": "diagnosis",
          "content": f"{diag.diagnosis} (confidence {diag.confidence:.2f})"})
     return summary
+
+
+_MAX_FILE_CHARS = 200_000  # tail excerpt cap per file read (context budget)
+
+
+def _tool_file(session: Session, turn: ChatTurn) -> str:
+    """Read a file the operator referenced by path; READ-ONLY, local.
+
+    Factory-test (FAT) logs get structured parsing (``testlog.parse_test_log``)
+    plus prior verified fixes matched from the case library, so one observation
+    carries the log AND the fleet learning. Any other text file comes back as
+    a (tail) excerpt. Errors return observation strings, never raise.
+    """
+    from ..testlog.parse import parse_test_log
+
+    raw = (turn.path or "").strip().strip('"').strip("'")
+    if not raw:
+        return "(file path missing)"
+    path = Path(raw)
+    if not path.exists():
+        return f"(no such file: {path})"
+    if not path.is_file():
+        return f"(not a file: {path})"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"(could not read {path}: {exc})"
+    total = len(text)
+    lines = [f"file: {path} ({total:,} chars)"]
+    if total > _MAX_FILE_CHARS:
+        text = text[-_MAX_FILE_CHARS:]
+        lines.append(f"(showing the last {_MAX_FILE_CHARS:,} chars)")
+    try:
+        report = parse_test_log(text, source=str(path))
+    except Exception:  # noqa: BLE001 - parsing is best-effort
+        report = None
+    if report is not None and report.failures:
+        lines.append("parsed as a factory test log:")
+        lines += [f"  {line}" for line in report.summary_lines()]
+        cases = _match_prior_cases(session, report)
+        if cases:
+            lines.append("prior verified fixes matching these failures:")
+            lines += [f"  {line}" for line in cases]
+    else:
+        n_lines = text.count("\n") + (0 if text.endswith("\n") else 1)
+        lines.append(f"{n_lines} lines; content:")
+    lines.append(text)
+    return "\n".join(lines)
+
+
+def _match_prior_cases(session: Session, report) -> list[str]:
+    """Prior verified fixes whose recorded log failures match this report."""
+    from ..diagnosis.case_library import CaseLibrary, render
+    from ..diagnosis.case_store import CaseStore
+
+    cases_dir = session.cases_dir or str(session.out_dir / "cases")
+    try:
+        library = CaseLibrary(CaseStore(cases_dir))
+    except Exception:  # noqa: BLE001 - missing/unreadable case store: skip
+        return []
+    if not library.cases:
+        return []
+    query = " ".join(report.case_terms())
+    if not query:
+        return []
+    return render(library.similar(query, top_k=3))
 
 
 def _render_decode(d) -> str:
@@ -782,7 +856,10 @@ def _finish_task(session: Session, result: object | None,
             session.transcript.append(
                 {"role": "tool", "kind": "result", "content": str(result)})
     if session.pending:
-        _print_line(session, f"  {len(session.pending)} queued message(s) seed the next run")
+        if session.mode == "chat":
+            _print_line(session, f"  {len(session.pending)} queued message(s) go to the agent next")
+        else:
+            _print_line(session, f"  {len(session.pending)} queued message(s) seed the next run")
 
 
 # ---- line handling ----
@@ -802,7 +879,13 @@ def _status_line(session: Session) -> str:
 
 # ---- the conversation agent ----
 
-_AGENT_MAX_TOOLS = 4  # tool calls per operator message (the loop then stops)
+#: Default tool calls per operator message, by session mode (the loop then
+#: stops; the operator can always send another message to continue the chain).
+DEFAULT_TOOL_BUDGETS = {"debug": 8, "chat": 4}
+
+
+def _tool_budget(session: Session) -> int:
+    return session.max_tools or DEFAULT_TOOL_BUDGETS.get(session.mode, 4)
 
 
 def _say(session: Session, progress: Callable[[str], None], text: str) -> None:
@@ -823,6 +906,8 @@ def _action_text(turn: ChatTurn) -> str:
         return f"verify: {turn.metric}"
     if turn.tool == "run":
         return f"run: {turn.run}"
+    if turn.tool == "file":
+        return f"file: {turn.path}"
     return "none"
 
 
@@ -842,6 +927,7 @@ def _run_agent(session: Session, line: str,
     context_lines = list(session.pending)  # queued notes feed THIS turn
     first = True
     tool_calls = 0
+    max_tools = _tool_budget(session)
     final: str | None = None
     while True:
         if cancel.is_set():
@@ -853,9 +939,10 @@ def _run_agent(session: Session, line: str,
             evidence_digest=session.evidence,
             host_names=tuple(session.inv.host_names),
             target_label=session.target_label,
-            pending=context_lines if first else [])
+            pending=context_lines if first else [],
+            mode=session.mode)
         turn = decide(session.router_llm, messages,
-                      tuple(session.inv.host_names))
+                      tuple(session.inv.host_names), mode=session.mode)
         if turn is None:
             if not first:
                 break  # mid-chain LLM failure: stop with what we have
@@ -864,14 +951,14 @@ def _run_agent(session: Session, line: str,
                 progress(_status_line(session).strip())
                 return None
             if cmd.intent == "reply":
-                return fallback_turn(cmd, line).say
-            turn = fallback_turn(cmd, line)
+                return fallback_turn(cmd, line, mode=session.mode).say
+            turn = fallback_turn(cmd, line, mode=session.mode)
         first = False
         if turn.say:
             _say(session, progress, turn.say)
         if turn.tool in ("", "none"):
             return turn.say or final
-        if tool_calls >= _AGENT_MAX_TOOLS:
+        if tool_calls >= max_tools:
             progress("tool-call budget reached for this message; send another "
                      "message to continue")
             return final or turn.say
@@ -938,13 +1025,19 @@ def _run_one_tool(session: Session, turn: ChatTurn,
     if turn.tool == "run":
         progress(f"loading run: {turn.run}")
         return _tool_run(session, turn)
+    if turn.tool == "file":
+        progress(f"reading file: {turn.path}")
+        return _tool_file(session, turn)
     return "(no tool)"
 
 
 def _agent_task(session: Session, line: str) -> BackgroundTask:
     """Background task wrapper around one full agent turn (decide + tools)."""
-    label = session.target_label or (
-        session.host.name if session.host is not None else "agent")
+    if session.mode == "chat":
+        label = "chat agent"
+    else:
+        label = session.target_label or (
+            session.host.name if session.host is not None else "agent")
 
     def fn(progress: Callable[[str], None], cancel: threading.Event):
         return _run_agent(session, line, progress, cancel)
@@ -1229,7 +1322,30 @@ def _slash_model(session: Session, arg: str) -> None:
         _set_session_model(session, catalog, profile)
 
 
-_HELP = """\
+_HELP_CHAT = """\
+/help      this list
+/model [ident]  pick the LLM model (arrow keys, type to filter); guided setup
+                for a new endpoint; or set one directly
+/context   queue a note for the agent's next turn
+/status    what is running / what was done
+/stop      cancel the running task
+/runs      run directories of this session
+/history   saved sessions
+/resume    load a saved session dir
+/docs      ls | add <pdf...> | rm <name> | reindex  (RAG library)
+/quit      exit
+
+Anything else goes to the agent in natural language, e.g.
+  "look up the DIMM population rules in the manual"
+  "read fat_run.log and tell me what failed"
+  "load run bcf28c2b... and explain the verdict"
+
+This is CHAT mode: no machine is connected. The agent can search the manual
+library, load past runs, and read files you reference by path (factory-test
+logs are parsed and matched against prior verified fixes from the case
+library). For a live diagnosis, use "Debug a target" (harness debug)."""
+
+_HELP_DEBUG = """\
 /help      this list
 /hosts     list inventory hosts
 /use <h|rack cable n|ip|alias>   switch the active target
@@ -1256,27 +1372,34 @@ Anything else goes to the agent in natural language, e.g.
 
 The agent explains what it is about to do, then runs read-only tools in the
 background (diagnose / probe / docs / verify) and reports back with what it
-found; it may chain several tools for one message. Long actions run IN THE
-BACKGROUND: the agent keeps working while you keep typing, and its progress and
-statements stream in as they happen ("/status" shows what is running; lines
-typed while busy are queued and the agent reads them on its next turn
-("/context" queues a note explicitly)."""
+found; it may chain up to 8 tools for one message. Debugging is iterative:
+keep prompting, ask for re-checks, and steer while it works. Long actions run
+IN THE BACKGROUND: the agent keeps working while you keep typing, and its
+progress and statements stream in as they happen ("/status" shows what is
+running; lines typed while busy are queued and the agent reads them on its
+next turn ("/context" queues a note explicitly))."""
 
 
-def _print_help() -> None:
-    print(_HELP)
+def _print_help(mode: str) -> None:
+    print(_HELP_CHAT if mode == "chat" else _HELP_DEBUG)
 
 
 def _handle_slash(session: Session, line: str) -> None:
     parts = line.split(None, 1)
     cmd = parts[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
+    if session.mode == "chat" and cmd in (
+            "/hosts", "/use", "/testlog", "/tl", "/lint", "/targets",
+            "/askparts"):
+        _print_line(session, f"  {cmd} is debug-only: this is a chat session, "
+                             "no target is connected")
+        return
     if cmd in ("/quit", "/exit", "/q"):
         session.quit = True
         if session.task is not None:
             session.task.cancel.set()
     elif cmd == "/help":
-        _print_help()
+        _print_help(session.mode)
     elif cmd == "/hosts":
         for host in sorted(session.inv.hosts, key=lambda h: h.name):
             is_active = host.name == session.target_label
@@ -1303,7 +1426,10 @@ def _handle_slash(session: Session, line: str) -> None:
         else:
             session.pending.append(arg)
             session.transcript.append({"role": "user", "kind": "context", "content": arg})
-            _print_line(session, "  context queued for the next run")
+            if session.mode == "chat":
+                _print_line(session, "  context queued for the agent's next turn")
+            else:
+                _print_line(session, "  context queued for the next run")
     elif cmd in ("/testlog", "/tl"):
         if not arg:
             _print_line(session, "  usage: /testlog <path-to-harness-FAT-log>")
@@ -1364,8 +1490,10 @@ def _save_session(session: Session) -> None:
     try:
         session.session_dir.mkdir(parents=True, exist_ok=True)
         payload = {
+            "mode": session.mode,
             "host": session.host.name if session.host is not None else None,
             "target_label": session.target_label,
+            "target_kind": session.target_kind,
             "target": {k: v for k, v in asdict(session.target).items()
                        if v is not None},
             "llm_mode": session.llm_mode,
@@ -1416,6 +1544,15 @@ def _load_session(session: Session, path: Path) -> None:
             model_id=session.llm_ident, url=session.llm_url)
         session.llm = profile.build(session.store)
         session.router_llm = profile.build(session.store)
+    if session.mode == "chat":
+        # A chat session has no target: ignore any host/target state in the
+        # payload (e.g. when resuming a debug session's directory by hand).
+        _print_line(session, ui.good(f"  resumed (chat): "
+                                     f"{len(session.transcript)} transcript entr(ies)"))
+        for entry in session.transcript[-3:]:
+            _print_line(session, ui.dim(
+                f"    [{entry.get('role')}] {str(entry.get('content', ''))[:120]}"))
+        return
     host = payload.get("host")
     if host and host in session.inv.host_names:
         session.host = session.inv.get(host)
@@ -1424,6 +1561,7 @@ def _load_session(session: Session, path: Path) -> None:
         session.target = TargetSpec(**target_raw)
         session.target_label = payload.get("target_label") or (
             session.host.name if session.host is not None else "(target)")
+        session.target_kind = payload.get("target_kind") or ""
         try:
             resolve_target(session.target, session.inv, session.store,
                            targets_path=session.targets_file,
@@ -1467,8 +1605,94 @@ def _list_sessions(session: Session) -> None:
 # ---- entry point ----
 
 def run_session(args, overrides: dict | None = None) -> int:
-    """Start the interactive chat session. Returns the process exit code."""
-    overrides = overrides or {}
+    """Start the interactive REPL (``args.mode``: "debug" or "chat").
+
+    Debug: target picked up front, the agent drives read-only debugging tools.
+    Chat: no target, no inventory -- a pure docs/run/file reference assistant.
+    Returns the process exit code.
+    """
+    mode = getattr(args, "mode", "debug")
+    if mode == "chat":
+        return _run_chat(args, overrides or {})
+    return _run_debug(args, overrides or {})
+
+
+class _NoInventory:
+    """Stand-in inventory for chat mode: no hosts, nothing to resolve."""
+
+    hosts: ClassVar[list] = []
+    host_names: ClassVar[frozenset] = frozenset()
+    llm = None
+    console_defaults = None
+    llm_console = None
+
+    @staticmethod
+    def get(_name):
+        return None
+
+
+def _run_chat(args, overrides: dict) -> int:
+    """Chat-mode REPL: LLM + docs only; no inventory, no target resolution."""
+    from ..operator.cli import (
+        _llm_ident_for,
+        _make_store,
+        _prepare_llm_endpoint,
+        _resolve_llm,
+    )
+
+    inv = _NoInventory()
+    store = overrides.get("store") or _make_store(args)
+    # Tunnel / preflight before any adapter is built (same contract as
+    # debug): a dead --llm-url must fail here, not mid-conversation.
+    forward = overrides.get("llm_forward")
+    if forward is None:
+        forward = _prepare_llm_endpoint(args, inv, store)
+    llm = overrides.get("llm") or _resolve_llm(args, inv, store)
+    router_llm = overrides.get("router_llm") or _resolve_llm(args, inv, store)
+    llm_ident = _llm_ident_for(args, inv)
+    llm_mode = "stub" if llm_ident == "stub" else llm_ident.split("/")[0]
+
+    session = Session(
+        mode="chat",
+        inv_path="",
+        inv=inv,
+        host=None,
+        store=store,
+        out_dir=Path(args.out_dir),
+        session_dir=Path(args.session_dir) / f"chat-{int(time.time())}",
+        llm=llm,
+        router_llm=router_llm,
+        llm_mode=llm_mode,
+        docs_lib=getattr(args, "docs_lib", None),
+        docs_dir=getattr(args, "docs_dir", None),
+        parts_csv=None,
+        secret_dir=getattr(args, "secret_dir", None),
+        console=False,
+        max_tools=int(getattr(args, "max_tools", 0) or 0),
+        llm_ident=llm_ident,
+        llm_url=getattr(args, "llm_url", None),
+        llm_tunnel=getattr(args, "llm_tunnel", None),
+        cases_dir=getattr(args, "cases_dir", None),
+        overrides=overrides,
+    )
+    if getattr(args, "resume", None):
+        _load_session(session, Path(args.resume))
+
+    on_session = overrides.get("on_session")
+    if on_session is not None:
+        on_session(session)
+
+    reader = overrides.get("reader") or _LineReader()
+    session.reader = reader
+    prompter = getattr(store, "prompter", None)
+    if prompter is not None:
+        prompter.set_bridge(_credential_bridge(session))
+
+    return _repl_loop(session, reader, forward)
+
+
+def _run_debug(args, overrides: dict) -> int:
+    """Debug-mode REPL: picked target, the agent drives the debug tool set."""
     inv = load_inventory(args.inventory)
     if not inv.hosts and inv.console_defaults is None:
         print(f"error: inventory {args.inventory!r} has no hosts", file=sys.stderr)
@@ -1526,6 +1750,7 @@ def run_session(args, overrides: dict | None = None) -> int:
         apply_ssh_context(store, target, ssh_user=getattr(args, "ssh_user", "diagbot"))
 
     session = Session(
+        mode="debug",
         inv_path=args.inventory,
         inv=inv,
         host=target.host if target is not None else None,
@@ -1537,20 +1762,21 @@ def run_session(args, overrides: dict | None = None) -> int:
         llm=llm,
         router_llm=router_llm,
         llm_mode=llm_mode,
-        llm_ident=llm_ident,
-        llm_url=getattr(args, "llm_url", None),
-        llm_tunnel=getattr(args, "llm_tunnel", None),
         docs_lib=getattr(args, "docs_lib", None),
         docs_dir=getattr(args, "docs_dir", None),
         parts_csv=getattr(args, "parts_csv", None),
         ask_parts=bool(getattr(args, "ask_parts", False)),
         secret_dir=getattr(args, "secret_dir", None),
         console=bool(getattr(args, "console", False)),
-        max_turns=int(getattr(args, "max_turns", 6)),
-        server_number=getattr(args, "server_number", None),
+        max_tools=int(getattr(args, "max_tools", 0) or 0),
+        llm_ident=llm_ident,
+        llm_url=getattr(args, "llm_url", None),
+        llm_tunnel=getattr(args, "llm_tunnel", None),
+        cases_dir=getattr(args, "cases_dir", None),
         overrides=overrides,
         target=initial_spec,
         target_label=target.label if target is not None else "",
+        target_kind=target.kind if target is not None else "",
         targets_file=getattr(args, "targets_file", None),
         ssh_user=getattr(args, "ssh_user", "diagbot"),
         identity_vault_path=getattr(args, "identity_vault_path", None),
@@ -1569,22 +1795,32 @@ def run_session(args, overrides: dict | None = None) -> int:
     if prompter is not None:
         prompter.set_bridge(_credential_bridge(session))
 
+    return _repl_loop(session, reader, forward)
+
+
+def _repl_loop(session: Session, reader, forward) -> int:
+    """Shared REPL main loop: banner, event drain, busy/idle line routing."""
     ui.enable_vt()
     width = max(44, min(ui.terminal_width(), 78))
     print()
     print(ui.rule(width))
-    print(f"  {ui.title('harness session')}   "
-          f"{ui.dim(f'inventory: {args.inventory}')}")
+    print(f"  {ui.title(f'harness {session.mode}')}   "
+          f"{ui.dim('chat: docs - past runs - file reading (no target)') if session.mode == 'chat' else ui.dim(f'inventory: {session.inv_path}')}")
     print(ui.rule(width))
-    if target is not None:
-        active = ui.good(session.target_label) + " " + ui.dim(f"({target.kind})")
+    if session.mode == "chat":
+        print(ui.kv("target", ui.dim("(chat mode - no target connected)")))
+    elif session.target_label:
+        active = ui.good(session.target_label)
+        if session.target_kind:
+            active += " " + ui.dim(f"({session.target_kind})")
+        print(ui.kv("target", active))
     else:
-        active = ui.dim("(none yet - name a rack/cable/IP)")
-    print(ui.kv("target", active))
+        print(ui.kv("target", ui.dim("(none yet - name a rack/cable/IP)")))
     print(ui.kv("llm", session.llm_ident or session.llm_mode))
-    if hosts:
+    if session.mode == "debug" and session.inv is not None \
+            and getattr(session.inv, "hosts", None):
         print(ui.kv("hosts", ", ".join(
-            f"{h.name}{ui.dim(f'({h.trust_level})')}" for h in hosts)))
+            f"{h.name}{ui.dim(f'({h.trust_level})')}" for h in session.inv.hosts)))
     print()
     print(ui.dim("  Type /help for commands, or describe a symptom. /quit exits."))
     _save_session(session)

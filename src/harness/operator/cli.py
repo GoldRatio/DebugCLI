@@ -5,22 +5,19 @@ Subcommands:
 
 - ``menu``    interactive launcher (also the default when no subcommand is
               given): pick the inventory, pick a target, then run chat /
-              diagnose / verify / console / docs / targets / secrets / lint
+              debug / verify / console / docs / targets / secrets / lint
               without remembering any flags
 - ``lint``    validate an inventory (rejects inline secrets)
 - ``docs``      manage the RAG document library: ``add`` uploads PDFs, ``ls``/``rm``
                 list/remove them, ``reindex`` retries failed or dropped files
-- ``diagnose``  read-only diagnosis of one host. Default is a single pass
-                (symptom -> collect -> RAG -> LLM -> actions). With ``--interactive``
-                (or ``--context``/``--context-file``) it becomes a multi-turn session:
-                the agent may ask the operator questions (e.g. previous repair
-                actions) and request further read-only probes / doc lookups over
-                several turns before producing the diagnosis. ``--docs-lib`` points
-                at the library managed by ``docs``. Targeting needs NO per-server
-                YAML: ``--host <name>`` (inventory) or ``--rack R --cable N``
-                (fleet console_defaults) or ``--address <ip>`` (SSH, identity from
-                the secret store) or ``--target <alias>`` (harness targets).
-                ``--console`` dials the serial console instead of SSH, and
+- ``diagnose``  one-shot read-only diagnosis of one host (symptom -> collect ->
+                RAG -> LLM -> actions). For interactive, iterative debugging use
+                ``debug``. ``--docs-lib`` points at the library managed by
+                ``docs``. Targeting needs NO per-server YAML: ``--host <name>``
+                (inventory) or ``--rack R --cable N`` (fleet console_defaults)
+                or ``--address <ip>`` (SSH, identity from the secret store) or
+                ``--target <alias>`` (harness targets). ``--console`` dials the
+                serial console instead of SSH, and
                 ``--console-address``/``--rack``/``--cable``/``--port``/
                 ``--sudo-vault-path`` override the console target per launch.
 - ``console``   run read-only probes over the serial console (lab/qa only); per
@@ -29,12 +26,17 @@ Subcommands:
                 ``--sudo-vault-path``
 - ``verify``    re-run the collectors and compare against a stored baseline
                 (post-repair "did it change" check)
-- ``session``   interactive Claude-Code-style chat: describe symptoms in natural
-                language and the agent diagnoses read-only in the background
-                while you keep typing. Messages may name a target ("Diagnose the
-                server in Q61 Cable 8" / "Diagnose 10.0.0.10"). Slash commands
-                (``/help``, ``/use``, ``/status``, ``/stop``, ``/resume``, ...) and
-                queued context are supported; see ``operator.repl``.
+- ``debug``     interactive REPL on a picked target: describe symptoms in
+                natural language and the agent diagnoses read-only in the
+                background while you keep typing -- iterative, not one-shot.
+                Messages may name a target ("Diagnose the server in Q61
+                Cable 8" / "Diagnose 10.0.0.10"). Slash commands (``/help``,
+                ``/use``, ``/status``, ``/stop``, ``/resume``, ...) and queued
+                context are supported; see ``operator.repl``.
+- ``chat``      target-less REPL: a pure reference assistant -- manual/docs
+                lookups, past-run loading, and reading files you reference by
+                path (factory-test logs match prior verified fixes). No
+                machine is ever contacted.
 - ``secrets``   NON-AGENT credential CLI (never through the prompt): ``add-ssh``
                 (key from a FILE only), ``set-password`` (interactive), ``list``,
                 ``rm``, ``check``. Writes only into the secret store; every
@@ -44,8 +46,7 @@ Subcommands:
 
 The run directory holds: ``diagnosis.json`` (machine-readable action list),
 ``trace.json`` (session trace with command hashes), ``dumps/`` (raw register
-dumps), ``dumps.json`` (baseline for ``verify``), ``transcript.json`` (the
-multi-turn conversation, when in session mode), and ``audit.jsonl`` (WORM
+dumps), ``dumps.json`` (baseline for ``verify``), and ``audit.jsonl`` (WORM
 hash-chained log, secrets redacted).
 """
 
@@ -85,15 +86,12 @@ from ..diagnosis.llm import (
 from ..diagnosis.parts_validate import PartsValidator
 from ..diagnosis.schema import Diagnosis
 from ..diagnosis.scorer import evidence_fit_from_dumps, score_diagnosis
-from ..diagnosis.session import SessionEngine
 from ..diagnosis.verifier import Verifier
 from ..engine.allowlist import default_policy
 from ..engine.bmc import BmcRunner
-from ..engine.interactive import InteractiveShell
 from ..engine.redfish import RedfishClient
 from ..engine.runner import CommandResult, Runner
 from ..engine.session import SSHSession
-from ..engine.single_test import SingleTestDriver, SingleTestError
 from ..engine.sol import (
     ConsoleRunner,
     SerialConsole,
@@ -111,22 +109,12 @@ from ..inspect.registry import make_collector
 from ..operator.gate import ApprovalDecision, ApprovalGate
 from ..operator.supervisor import Escalation, RunSupervisor
 from ..plan.profile import plan_collection
-from ..platforms import family_for
 from ..targets import TargetError, TargetSpec, resolve_target
 from ..targets.aliases import AliasError, TargetAlias, load_targets, save_targets
 from . import ui
 from .credential_gate import apply_ssh_context
 
 # ---- helpers ----
-
-# Menu-driven diagnosis runs without asking for a symptom prompt: target first,
-# then diagnose straight from the live evidence (see SYSTEM_PREAMBLE in
-# diagnosis/prompt.py for how the LLM handles a generic symptom).
-_MENU_DIAGNOSE_SYMPTOM = (
-    "No specific symptom was reported by the operator. Diagnose this server "
-    "from the live evidence in this prompt (boot state, sensors, SEL, kernel "
-    "log). Report the current state and the most likely fault class or verdict."
-)
 
 def _make_store(args, *, prompt: bool | None = None) -> SecretStore:
     """Resolve the lab secret store; when running interactively, wrap it so a
@@ -433,7 +421,8 @@ def _build_docs_retriever(args):
 
 
 def _load_context(args) -> list[str]:
-    """Human-supplied context: --context strings plus --context-file contents."""
+    """Human-supplied context lines: --context strings plus --context-file
+    contents. Rendered into the diagnosis prompt as Operator Context."""
     answers: list[str] = list(getattr(args, "context", None) or [])
     for path in getattr(args, "context_file", None) or []:
         try:
@@ -465,27 +454,6 @@ def _load_test_logs(args) -> list:
         except (OSError, LogSourceError) as exc:
             print(f"  [test-log] skip {path}: {exc}", file=sys.stderr)
     return reports
-
-
-def _session_no_answer(_question: str) -> str:
-    """Non-interactive session: the agent is told no answer is available."""
-    return ""
-
-
-def _save_transcript(out: Path, transcript: list[dict], log: AuditLog,
-                     trace: SessionTrace, secrets: list[str]) -> None:
-    """Persist the session transcript and mirror it into the audit log (redacted)."""
-    redactor = Redactor(secrets)
-    redacted = []
-    for entry in transcript:
-        content = entry["content"]
-        redacted.append(dict(entry, content=redactor.redact(content)))
-        log.append(trace.session_id, "turn", {
-            "role": entry.get("role"), "kind": entry.get("kind"),
-            "content": redactor.redact(content)[:500],
-        })
-    (out / "transcript.json").write_text(
-        json.dumps(redacted, indent=2), encoding="utf-8")
 
 
 def _load_parts_graph(parts_csv: str | None):
@@ -598,22 +566,15 @@ def _save_dumps(out: Path, dump_sets) -> None:
         json.dumps([asdict(d) for d in all_dumps], indent=2), encoding="utf-8")
 
 
-def _save_prompt(out: Path, content: str, session_mode: bool) -> None:
+def _save_prompt(out: Path, content: str) -> None:
     """Persist the exact prompt(s) sent to the LLM for end-to-end audit.
 
-    Single-shot runs write ``prompt.txt``; session runs append one JSON object
-    per turn to ``prompt_turns.jsonl`` (turn number + full message list, so the
-    conversation and evidence view are reproducible turn by turn).
+    A run can emit more than one prompt (auto follow-up round): append,
+    separator-delimited, so the audit keeps every prompt verbatim.
     """
-    if session_mode:
-        with (out / "prompt_turns.jsonl").open("a", encoding="utf-8") as f:
-            f.write(content + "\n")
-    else:
-        # Single-shot runs can emit more than one prompt (auto follow-up round):
-        # append, separator-delimited, so the audit keeps every prompt verbatim.
-        with (out / "prompt.txt").open("a", encoding="utf-8") as f:
-            f.write(content)
-            f.write("\n\n==================== END PROMPT ====================\n\n")
+    with (out / "prompt.txt").open("a", encoding="utf-8") as f:
+        f.write(content)
+        f.write("\n\n==================== END PROMPT ====================\n\n")
 
 
 def _seat_pending_case(out: Path, diagnosis: Diagnosis, target_label: str,
@@ -846,11 +807,11 @@ def _build_case_retriever(out_dir: str | Path):
 
 
 def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
-    """Full read-only diagnosis; returns the scored, audited Diagnosis.
+    """One-shot read-only diagnosis; returns the scored, audited Diagnosis.
 
-    Single-shot mode (default) or multi-turn session mode (--interactive /
-    --context / --context-file): in session mode the agent may ask questions and
-    request further read-only probes across several turns before diagnosing.
+    For interactive, iterative debugging use ``harness debug`` (operator.repl).
+    ``--context``/``--context-file`` add operator-supplied context lines to the
+    diagnosis prompt (Operator Context section).
     """
     overrides = overrides or {}
     inv = load_inventory(args.inventory)
@@ -893,39 +854,16 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
     except KeyError:
         bmc_password = None  # BMC channel unavailable; ipmi collector skipped
 
-    max_turns = int(getattr(args, "max_turns", 6))
-    human_input = overrides.get("human_input")
-    session_mode = bool(getattr(args, "interactive", False) or
-                        getattr(args, "context", None) or
-                        getattr(args, "context_file", None) or
-                        human_input is not None)
-    if human_input is None:
-        human_input = input if getattr(args, "interactive", False) else _session_no_answer
-
     retriever = overrides.get("retriever")
     docs_lib_used = None
     if retriever is None:
         retriever, docs_lib_used = _build_docs_retriever(args)
 
-    # Optional operator fallback when model detection fails: only in
-    # interactive runs; one-shot/automated paths never block on the question.
-    model_ask = None
-    if getattr(args, "interactive", False):
-        def _ask_model() -> str | None:
-            try:
-                answer = input(
-                    "Model not detected. Enter product name "
-                    "(Enter to skip): ").strip()
-            except (EOFError, KeyboardInterrupt):
-                return None
-            return answer or None
-        model_ask = _ask_model
-
     log = AuditLog(out / "audit.jsonl", Redactor(secrets))
     log.append(trace.session_id, "run_start", {
         "host": target.label, "symptom": symptom, "trust_level": target.trust_level,
         "model": host.model, "collector_profile": host.collector_profile,
-        "mode": "session" if session_mode else "single", "max_turns": max_turns,
+        "mode": "single",
         "target": target.kind,
         **({"rack": target.console.rack, "cable": target.console.cable}
            if target.console is not None else {}),
@@ -1002,44 +940,11 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
     else:
         test_log_lines = test_log_queries = test_log_case_terms = None
 
-    def _open_interactive(client) -> InteractiveShell:
-        shell = InteractiveShell(client)
-        shell.open()
-        return shell
-
-    single_test_driver = overrides.get("single_test_driver")
-    owns_driver = False
-    server_number = getattr(args, "server_number", None)
-    if single_test_driver is None and server_number and session_mode \
-            and not use_console and host.ssh is not None:
-        hint = (target.model_hint or host.model or "").strip()
-        fam = family_for(hint) if hint else None
-        if fam not in (None, "samoa", "nvl72"):
-            progress(f"single tests skipped: hint {hint!r} is not a GB platform")
-        else:
-            client = getattr(runner, "client", None)
-            if client is not None:
-                try:
-                    single_test_driver = SingleTestDriver(
-                        server_number,
-                        shell_factory=lambda c=client: _open_interactive(c),
-                        progress=progress,
-                        artifact_dir=out,
-                    )
-                    owns_driver = True
-                    log.append(trace.session_id, "single_test_enabled", {
-                        "server_number": server_number,
-                        "target": target.label,
-                        "platform_hint": hint or None,
-                    })
-                except SingleTestError as exc:
-                    progress(f"single tests unavailable: {exc}")
-
     bmc_runner = overrides.get("bmc_runner")
     if bmc_runner is None and bmc_password is not None:
         bmc_runner = BmcRunner(host.bmc.address, host.bmc.username, bmc_password)
 
-    supervisor = RunSupervisor(max_steps=8 + max_turns,
+    supervisor = RunSupervisor(max_steps=8,
                                wall_s=float(getattr(args, "wall_s", 900.0)))
     cancel_event = overrides.get("cancel_event")
 
@@ -1122,7 +1027,7 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
         ),
         supervisor=_step,
         dump_callback=lambda dumps: _save_dumps(out, dumps),
-        prompt_callback=lambda content: _save_prompt(out, content, session_mode),
+        prompt_callback=lambda content: _save_prompt(out, content),
         progress=progress,
         model_hook=(
             lambda model, drifted: _audit_model(log, trace, model, drifted,
@@ -1132,31 +1037,16 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
             target.model_hint
             or (host.model if host.model not in ("", "unknown") else None)
         ),
-        model_ask=model_ask,
         llm_ident=lambda: ident,
         calibration_root=str(calibration_root),
         priors=_load_priors(args.out_dir),
-        single_test_driver=single_test_driver,
+        context_lines=_load_context(args) or None,
         test_log_lines=test_log_lines,
         test_log_queries=test_log_queries,
         test_log_case_terms=test_log_case_terms,
         extra_collectors=("redfish",) if redfish_collector is not None else (),
     )
-    if session_mode:
-        engine = SessionEngine(
-            ctx,
-            llm=llm,
-            human_input=human_input,
-            max_turns=max_turns,
-        )
-        try:
-            diagnosis = engine.run(symptom, initial_answers=_load_context(args))
-        finally:
-            if owns_driver and single_test_driver is not None:
-                single_test_driver.close()
-        _save_transcript(out, engine.transcript, log, trace, secrets)
-    else:
-        diagnosis = DiagnosticEngine(ctx).run(symptom)
+    diagnosis = DiagnosticEngine(ctx).run(symptom)
 
     _audit_commands(log, trace, runner)
     if bmc_runner is not None:
@@ -1720,8 +1610,8 @@ _BACK = "back"
 # Action KEYS are stable (tests and argv building depend on them); only the
 # display labels are user-facing copy.
 _MAIN_ACTIONS: list[tuple[str, str]] = [
-    ("chat", "Chat session        describe symptoms in plain English; the agent debugs"),
-    ("diagnose", "Debug a target       one-shot read-only diagnosis of one machine"),
+    ("chat", "Chat session        docs, past runs, or a referenced log file (no target)"),
+    ("diagnose", "Debug a target       interactive agent debugging on one machine (iterative)"),
     ("runs", "Inspect past runs    verdicts, commands, evidence from earlier diagnoses"),
     ("advanced", "Advanced             verify - console - model - docs - targets - secrets - setup - lint"),
     ("quit", "Quit"),
@@ -1754,9 +1644,11 @@ _WIZARD_FLAGS: dict[str, str] = {
 _ALLOWED_FLAGS: dict[str, tuple[str, ...]] = {
     "diagnose": ("--secret-dir", "--docs-lib", "--docs-dir", "--parts-csv",
                  "--parts-dir", "--out-dir", "--targets-file", "--test-log"),
-    "session": ("--secret-dir", "--docs-lib", "--docs-dir", "--parts-csv",
-                "--parts-dir", "--out-dir", "--session-dir", "--targets-file",
-                "--test-log"),
+    "debug": ("--secret-dir", "--docs-lib", "--docs-dir", "--parts-csv",
+              "--parts-dir", "--out-dir", "--session-dir", "--targets-file",
+              "--test-log"),
+    "chat": ("--secret-dir", "--docs-lib", "--docs-dir", "--out-dir",
+             "--session-dir"),
     "console": ("--secret-dir", "--out-dir", "--targets-file"),
     "verify": ("--secret-dir", "--targets-file"),
     "setup": ("--secret-dir",),
@@ -1911,10 +1803,11 @@ def _wizard_flags(args, subcommand: str) -> list[str]:
             values = value if isinstance(value, list) else [value]
             for v in values:
                 argv += [flag, str(v)]
-    if subcommand in ("diagnose", "session"):
+    if subcommand in ("diagnose", "debug", "chat"):
         llm = getattr(args, "llm", None)
         if llm:
             argv += ["--llm", llm]
+    if subcommand in ("diagnose", "debug"):
         if getattr(args, "console", False):
             argv.append("--console")
         if getattr(args, "ask_parts", False):
@@ -2685,13 +2578,12 @@ def _label_run(run_dir: Path, cases_dir: Path, *, outcome: str | None = None,
 
 
 def _should_prompt_label(args) -> bool:
-    """The post-diagnosis labeling prompt is opt-in so background chat runs
+    """The post-diagnosis labeling prompt is opt-in so background runs
     (REPL worker threads) never block on stdin: the interactive menu passes
-    ``--label-prompt`` and direct ``--interactive`` runs imply it."""
+    ``--label-prompt``."""
     if not sys.stdin.isatty() or os.environ.get("HARNESS_NO_PROMPT") == "1":
         return False
-    return bool(getattr(args, "label_prompt", False)
-                or getattr(args, "interactive", False))
+    return bool(getattr(args, "label_prompt", False))
 
 
 def _prompt_label_after_run(run_dir: Path, cases_dir: Path) -> None:
@@ -2805,43 +2697,20 @@ def run_menu(args) -> int:
             if key == "advanced":
                 _run_advanced()
             elif key == "chat":
-                spec = _pick_target(inv, store, args, console=console_default)
-                argv = ["session", "--inventory", str(inv_path)]
-                if spec is not None:
-                    argv += _target_argv(spec)
-                argv += _wizard_flags(args, "session")
+                # Chat mode is target-less: no inventory/target pick at all.
+                argv = ["chat"]
+                argv += _wizard_flags(args, "chat")
                 _run_wizard_sub(argv)
             elif key == "diagnose":
+                # "Debug a target": the interactive debug REPL on the picked
+                # target. The first message to the agent carries the symptom;
+                # test logs can be queued in-session (/testlog or a file path).
                 spec = _pick_target(inv, store, args, console=console_default)
                 if spec is None:
                     continue
-                symptom = ask_text(
-                    "Symptom (Enter to derive from the test log / live "
-                    "evidence)").strip()
-                test_log = ""
-                while True:
-                    candidate = _strip_surrounding_quotes(ask_text(
-                        "Test-harness/FAT log path (Enter to skip)"))
-                    if not candidate:
-                        break
-                    if Path(candidate).is_file():
-                        test_log = candidate
-                        break
-                    print(f"  no such file: {candidate}")
-                if symptom:
-                    argv = ["diagnose", "--inventory", str(inv_path),
-                            "--symptom", symptom]
-                elif test_log:
-                    argv = ["diagnose", "--inventory", str(inv_path)]
-                else:
-                    print("  (no symptom: diagnosing from live evidence)")
-                    argv = ["diagnose", "--inventory", str(inv_path),
-                            "--symptom", _MENU_DIAGNOSE_SYMPTOM]
-                if test_log:
-                    argv += ["--test-log", test_log]
+                argv = ["debug", "--inventory", str(inv_path)]
                 argv += _target_argv(spec)
-                argv += _wizard_flags(args, "diagnose")
-                argv.append("--label-prompt")
+                argv += _wizard_flags(args, "debug")
                 _run_wizard_sub(argv)
             elif key == "runs":
                 _menu_runs(args)
@@ -3154,24 +3023,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default: harness_docs/ if it exists)")
     p.add_argument("--docs-dir", help="directory of architecture PDFs used for RAG "
                                       "(legacy ad-hoc; prefer --docs-lib)")
-    p.add_argument("--interactive", action="store_true",
-                   help="multi-turn session: the agent may ask questions (e.g. previous "
-                        "repair actions) and request further read-only probes before "
-                        "diagnosing")
     p.add_argument("--label-prompt", action="store_true",
                    help="after the diagnosis, prompt to label the correct fix "
                         "(Enter defers; the interactive menu passes this)")
     p.add_argument("--context", action="append", default=None,
                    help="extra human-supplied context, e.g. 'DIMM was reseated, no "
-                        "change' (repeatable; implies session mode)")
+                        "change' (repeatable; rendered into the prompt as "
+                        "Operator Context)")
     p.add_argument("--context-file", action="append", default=None,
                    help="file whose contents are added as human-supplied context "
-                        "(repeatable; implies session mode)")
-    p.add_argument("--max-turns", type=int, default=6,
-                   help="session turn budget before a forced diagnosis (default: 6)")
-    p.add_argument("--server-number", type=int, default=None,
-                   help="server number for the vendor FAT single-test menu "
-                        "(GB targets, SSH/session mode only)")
+                        "(repeatable)")
     p.add_argument("--console", action="store_true",
                    help="run probes over the serial console (rack manager + cable) "
                         "instead of SSH (lab/qa only)")
@@ -3222,10 +3083,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--metric", default="ecc", help="error-counter keyword to compare")
     p.set_defaults(func=run_verify)
 
-    p = sub.add_parser("session",
-                       help="interactive chat session (Claude-Code-style REPL): "
-                            "type symptoms in natural language, the agent diagnoses "
-                            "read-only in the background")
+    p = sub.add_parser(
+        "debug", aliases=["session"],
+        help="interactive REPL on a target (Claude-Code-style): type symptoms "
+             "in natural language, the agent diagnoses read-only in the "
+             "background -- iterative, with your follow-ups steering it")
     p.add_argument("--inventory", required=True)
     _add_target_args(p, ssh=True)
     p.add_argument("--secret-dir", help="local dir mapping vault paths to files (lab use)")
@@ -3248,18 +3110,48 @@ def build_parser() -> argparse.ArgumentParser:
                    help="where chat sessions are saved (see /history, /resume)")
     p.add_argument("--resume", default=None,
                    help="resume a saved session directory at startup")
-    p.add_argument("--max-turns", type=int, default=6,
-                   help="agent turn budget per diagnosis run (default: 6)")
-    p.add_argument("--server-number", type=int, default=None,
-                   help="server number for the vendor FAT single-test menu "
-                        "(GB targets, SSH targets only)")
+    p.add_argument("--max-tools", type=int, default=0,
+                   help="tool calls per operator message (default: 8 for debug)")
+    p.add_argument("--cases-dir", default="harness_runs/cases",
+                   help="case store dir; prior verified fixes matched against "
+                        "referenced log files come from here")
     _add_llm_args(p)
     p.add_argument("--llm-model", default=None,
                    help="specific LLM model for conversation + reasoning, e.g. "
                         "gemini/gemini-2.5-pro, local/Qwen2.5-7B-Instruct or "
                         "gpt-4o; overrides --llm / inventory / the remembered "
                         "model (config/models.yaml)")
-    p.set_defaults(func=run_session)
+    p.set_defaults(func=run_session, mode="debug")
+
+    p = sub.add_parser(
+        "chat",
+        help="target-less chat REPL: docs/manual lookup, past-run loading, and "
+             "reading files you reference (e.g. a FAT log). No machine is "
+             "contacted -- for live debugging use 'debug'")
+    p.add_argument("--secret-dir", help="local dir mapping vault paths to files (lab use)")
+    p.add_argument("--docs-lib", default=None,
+                   help="RAG document library managed by 'harness docs'")
+    p.add_argument("--docs-dir", default=None,
+                   help="directory of architecture PDFs used for RAG "
+                       "(legacy ad-hoc; prefer --docs-lib)")
+    p.add_argument("--out-dir", default="harness_runs",
+                   help="where past runs are looked up (run tool) and case files live")
+    p.add_argument("--session-dir", default="harness_runs/sessions",
+                   help="where chat sessions are saved (see /history, /resume)")
+    p.add_argument("--resume", default=None,
+                   help="resume a saved session directory at startup")
+    p.add_argument("--max-tools", type=int, default=0,
+                   help="tool calls per operator message (default: 4 for chat)")
+    p.add_argument("--cases-dir", default="harness_runs/cases",
+                   help="case store dir; prior verified fixes matched against "
+                        "referenced log files come from here")
+    _add_llm_args(p)
+    p.add_argument("--llm-model", default=None,
+                   help="specific LLM model for conversation, e.g. "
+                        "gemini/gemini-2.5-pro, local/Qwen2.5-7B-Instruct or "
+                        "gpt-4o; overrides --llm / the remembered "
+                        "model (config/models.yaml)")
+    p.set_defaults(func=run_session, mode="chat")
 
     p = sub.add_parser("secrets",
                        help="NON-AGENT credential CLI: register SSH keys / passwords "

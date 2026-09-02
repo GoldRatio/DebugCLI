@@ -493,49 +493,53 @@ def test_diagnose_uses_docs_lib_for_rag(tmp_path, monkeypatch):
     assert diag.confidence_breakdown is not None  # scorer ran over retrieved snippets
 
 
-def test_diagnose_interactive_session(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr("builtins.input", lambda _q: "DIMM was reseated, no change")
+def test_diagnose_context_seeds_operator_context(tmp_path, monkeypatch):
+    """--context lines land in the prompt as an Operator Context section."""
+    monkeypatch.chdir(tmp_path)                # isolate config/models.yaml
+    prompts: list[str] = []
+
+    def _capturing_llm(prompt: str) -> Diagnosis:
+        prompts.append(prompt)
+        return _fake_llm(prompt)
+
     args = build_parser().parse_args([
         "diagnose", "--inventory", _inventory(tmp_path), "--host", "h1",
         "--symptom", "MCE uncorrectable ECC error", "--out-dir", str(tmp_path / "runs"),
-        "--llm", "stub", "--interactive", "--approve-all"])
-    diag = run_diagnose(args, overrides={"session": FakeSession()})
+        "--llm", "stub", "--context", "DIMM was reseated, no change",
+        "--approve-all"])
+    diag = run_diagnose(args, overrides={"session": FakeSession(),
+                                         "llm": _capturing_llm})
     assert diag.schema_version == "1.1.0"
+    assert prompts, "the pipeline must have called the LLM once"
+    assert "## Operator Context" in prompts[0]
+    assert "- DIMM was reseated, no change" in prompts[0]
 
     run_dir = next((tmp_path / "runs").iterdir())
-    transcript = json.loads((run_dir / "transcript.json").read_text(encoding="utf-8"))
-    kinds = [t["kind"] for t in transcript]
-    assert kinds == ["question", "answer", "diagnosis"]
-    assert any("reseated" in t["content"] for t in transcript)
-
     audit = AuditLog(run_dir / "audit.jsonl")
-    assert audit.verify() == []
-    kinds = [e.kind for e in audit.read()]
-    assert "turn" in kinds and "diagnosis" in kinds
     run_start = next(e.payload for e in audit.read() if e.kind == "run_start")
-    assert run_start["mode"] == "session"
-
-    out = capsys.readouterr().out
-    assert "repair action list" in out
+    assert run_start["mode"] == "single"
+    assert audit.verify() == []
 
 
-def test_diagnose_context_file_seeds_session(tmp_path):
+def test_diagnose_context_file_seeds_operator_context(tmp_path, monkeypatch):
+    """--context-file contents are added as Operator Context lines."""
+    monkeypatch.chdir(tmp_path)
+    prompts: list[str] = []
+
+    def _capturing_llm(prompt: str) -> Diagnosis:
+        prompts.append(prompt)
+        return _fake_llm(prompt)
+
     ctx_file = tmp_path / "context.txt"
     ctx_file.write_text("Replaced PSU last week; fans OK", encoding="utf-8")
     args = build_parser().parse_args([
         "diagnose", "--inventory", _inventory(tmp_path), "--host", "h1",
         "--symptom", "MCE uncorrectable ECC error", "--out-dir", str(tmp_path / "runs"),
         "--llm", "stub", "--context-file", str(ctx_file), "--approve-all"])
-    diag = run_diagnose(args, overrides={"session": FakeSession()})
-    assert diag.schema_version == "1.1.0"
-
-    run_dir = next((tmp_path / "runs").iterdir())
-    transcript = json.loads((run_dir / "transcript.json").read_text(encoding="utf-8"))
-    assert any(t["kind"] == "context" and "Replaced PSU" in t["content"]
-               for t in transcript)
-    # stub asks one question and gets "(no answer)" non-interactively, then diagnoses
-    assert any(t["kind"] == "question" for t in transcript)
-    assert any(t["kind"] == "answer" and t["content"] == "(no answer)" for t in transcript)
+    run_diagnose(args, overrides={"session": FakeSession(),
+                                  "llm": _capturing_llm})
+    assert "## Operator Context" in prompts[0]
+    assert "Replaced PSU last week; fans OK" in prompts[0]
 
 
 def test_diagnose_single_shot_has_no_transcript(tmp_path):
@@ -657,7 +661,9 @@ def test_resolve_llm_flag_precedence(tmp_path):
                       StubLLM)                      # flag -> stub
 
 
-def test_resolve_llm_from_inventory_block(tmp_path):
+def test_resolve_llm_from_inventory_block(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # isolate: a repo-level config/models.yaml
+    # would otherwise beat the inventory llm block (precedence: current > inv).
     inv_path = tmp_path / "inv.yaml"
     inv_path.write_text(
         "trust_level: lab\n"
@@ -724,7 +730,8 @@ def test_session_parser_accepts_llm_model(tmp_path):
     assert args.llm_model == "gemini/gemini-2.5-flash"
 
 
-def test_diagnose_llm_from_inventory(tmp_path):
+def test_diagnose_llm_from_inventory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # isolate config/models.yaml (tunnel profile)
     path = tmp_path / "inventory.yaml"
     path.write_text(_INVENTORY.replace(
         "trust_level: lab\nhosts:\n",

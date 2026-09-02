@@ -1,20 +1,13 @@
-"""FAT single-test driver + session-engine integration.
+"""FAT single-test driver unit tests.
 
-Unit tests only: the driver is exercised against a scripted interactive shell
-(no SSH), and the session engine against the scripted shell + canned LLM turns.
+The driver is exercised against a scripted interactive shell (no SSH). It is
+kept intact for a future debug-REPL ``test`` tool; nothing wires it into the
+one-shot pipeline anymore.
 """
-
-import json
-from typing import ClassVar
 
 import pytest
 
-from harness.diagnosis.engine import EngineContext
-from harness.diagnosis.schema import Action, Diagnosis, Risk
-from harness.diagnosis.session import SessionEngine
-from harness.engine.allowlist import AllowPolicy, AllowRule
 from harness.engine.interactive import normalize_terminal
-from harness.engine.runner import CommandResult, Runner
 from harness.engine.single_test import (
     SCRIPT_PATH,
     SingleTestDriver,
@@ -23,8 +16,6 @@ from harness.engine.single_test import (
     _verdict,
     validate_server_number,
 )
-from harness.inspect.decoder import Decoder
-from harness.inspect.registry import make_collector
 
 MAIN_MENU = """\
 === Single RTP L10 Main Menu ===
@@ -240,200 +231,3 @@ def test_run_test_empty_menu_raises():
     with pytest.raises(SingleTestError) as exc:
         driver.run_test("PCIE_LINK_TEST")
     assert "no FAT single tests" in str(exc.value)
-
-
-# ---- session engine integration ----
-
-FAKE_POLICY = AllowPolicy([
-    AllowRule("/usr/bin/rdmsr", ("-a",)),
-    AllowRule("/bin/dmesg", ("-l", "*")),
-    AllowRule("/bin/dmidecode", ()),
-    AllowRule("/usr/bin/lspci", ("-xxx",)),
-])
-
-
-class FakeRunner(Runner):
-    OUTPUT: ClassVar[dict[str, str]] = {
-        "/usr/bin/rdmsr -a": "IA32_MC0_STATUS = 0x8000000000000001\n",
-        "/bin/dmesg -l err": "MCE: memory error on DIMM_A2\n",
-        "/bin/dmidecode": "Product Name: model_x\nBIOS Vendor: Intel\nBIOS Version: 2.3\n",
-        "/usr/bin/lspci -xxx": "00:1f.2 PCIe link down\n",
-    }
-
-    def __init__(self) -> None:
-        super().__init__(FAKE_POLICY)
-
-    def _exec(self, argv, timeout=30.0):
-        return CommandResult(argv=list(argv), stdout=self.OUTPUT.get(" ".join(argv), ""),
-                             stderr="", exit_code=0, elapsed_ms=1)
-
-
-class ScriptedLLM:
-    """Returns canned chat_json answers in order; records the messages it saw."""
-
-    def __init__(self, *answers: dict):
-        self.answers = list(answers)
-        self.calls: list[list[dict]] = []
-
-    def chat_json(self, messages: list[dict]) -> dict:
-        self.calls.append(messages)
-        if not self.answers:
-            return {"kind": "diagnosis", "diagnosis": _stub_diagnosis().model_dump()}
-        return self.answers.pop(0)
-
-
-def _stub_diagnosis() -> Diagnosis:
-    return Diagnosis(
-        diagnosis="Memory ECC errors on DIMM_A2",
-        confidence=0.0,
-        actions=[Action(
-            step=1,
-            action="Reseat DIMM in slot A2",
-            rationale="Memory ECC uncorrectable errors; architecture doc page 78",
-            risk=Risk.LOW,
-            required_tool="Physical access",
-            impact="requires reboot",
-        )],
-    )
-
-
-def _ctx(driver=None) -> EngineContext:
-    return EngineContext(
-        runner=FakeRunner(),
-        decoder=Decoder(),
-        collector_factory=make_collector,
-        llm=_stub_diagnosis,
-        supervisor=lambda label: None,
-        single_test_driver=driver,
-    )
-
-
-def test_session_list_then_run_then_diagnosis():
-    driver, _shell = _driver([(LAUNCH, MAIN_MENU), ("2", FAT_MENU),
-                              ("2", TEST_PASS)])
-    llm = ScriptedLLM(
-        {"kind": "test", "single_test": {"action": "list"}},
-        {"kind": "test", "single_test": {"action": "run", "test": "PCIE_LINK_TEST"}},
-        {"kind": "diagnosis", "diagnosis": _stub_diagnosis().model_dump()},
-    )
-    engine = SessionEngine(_ctx(driver), llm=llm, max_turns=4)
-    diag = engine.run("MCE uncorrectable ECC error")
-
-    assert diag.diagnosis == "Memory ECC errors on DIMM_A2"
-    kinds = [t["kind"] for t in engine.transcript]
-    assert kinds == ["test", "test", "diagnosis"]
-    list_msg = engine.transcript[0]["content"]
-    assert "FAT single tests available" in list_msg
-    assert "PCIE_LINK_TEST" in list_msg
-    run_msg = engine.transcript[1]["content"]
-    assert "[test result] PCIE_LINK_TEST: pass" in run_msg
-    # the test list + result are visible in the next LLM call
-    assert "PCIE_LINK_TEST" in llm.calls[2][-1]["content"]
-    assert "FAT Single Tests" in llm.calls[2][-1]["content"]
-
-
-def test_session_tool_messages_use_test_prefix():
-    driver, _shell = _driver([(LAUNCH, MAIN_MENU), ("2", FAT_MENU),
-                              ("2", TEST_PASS)])
-    llm = ScriptedLLM(
-        {"kind": "test", "single_test": {"action": "run", "test": "PCIE_LINK_TEST"}},
-        {"kind": "diagnosis", "diagnosis": _stub_diagnosis().model_dump()},
-    )
-    engine = SessionEngine(_ctx(driver), llm=llm, max_turns=3)
-    engine.run("MCE uncorrectable ECC error")
-    rendered = [m["content"] for m in llm.calls[1]
-                if m["role"] == "user"]
-    assert any("[test result] PCIE_LINK_TEST: pass" in c for c in rendered)
-
-
-def test_session_driver_unavailable_is_soft():
-    llm = ScriptedLLM(
-        {"kind": "test", "single_test": {"action": "list"}},
-        {"kind": "diagnosis", "diagnosis": _stub_diagnosis().model_dump()},
-    )
-    engine = SessionEngine(_ctx(driver=None), llm=llm, max_turns=3)
-    engine.run("MCE uncorrectable ECC error")
-    assert engine.transcript[0]["content"] == (
-        "single tests unavailable (requires --server-number and an SSH target)")
-    assert engine.transcript[0]["kind"] == "test"
-
-
-def test_session_non_gb_platform_gated(monkeypatch):
-    from harness.diagnosis import session as session_mod
-
-    driver, _shell = _driver([(LAUNCH, MAIN_MENU), ("2", FAT_MENU)])
-    monkeypatch.setattr(session_mod, "family_for", lambda key: "spray")
-    llm = ScriptedLLM(
-        {"kind": "test", "single_test": {"action": "list"}},
-        {"kind": "diagnosis", "diagnosis": _stub_diagnosis().model_dump()},
-    )
-    engine = SessionEngine(_ctx(driver), llm=llm, max_turns=3)
-    engine.run("MCE uncorrectable ECC error")
-    contents = [t["content"] for t in engine.transcript]
-    assert any("single tests unavailable on platform 'spray'" in c
-               for c in contents)
-
-
-def test_session_malformed_test_turn_skipped():
-    driver, _shell = _driver([(LAUNCH, MAIN_MENU), ("2", FAT_MENU)])
-    llm = ScriptedLLM(
-        {"kind": "test"},  # no single_test payload
-        {"kind": "diagnosis", "diagnosis": _stub_diagnosis().model_dump()},
-    )
-    engine = SessionEngine(_ctx(driver), llm=llm, max_turns=3)
-    engine.run("MCE uncorrectable ECC error")
-    assert any("[note] malformed agent response" in t["content"]
-               for t in engine.transcript)
-
-
-# ---- CLI wiring ----
-
-_INVENTORY = (
-    "trust_level: lab\n"
-    "hosts:\n"
-    "  - name: h1\n"
-    "    address: 10.0.0.10\n"
-    "    model: model_x\n"
-    "    ssh:\n"
-    "      user: diagbot\n"
-    "      identity_vault_path: secret/harness/diagbot/id_ed25519\n"
-    "      known_hosts_path: config/known_hosts\n"
-    "    bmc:\n"
-    "      address: 10.0.0.11\n"
-    "      username: bmc-ro\n"
-    "      password_vault_path: secret/harness/bmc/bmc-ro\n"
-)
-
-
-def test_run_diagnose_session_uses_override_driver(tmp_path):
-    from harness.operator.cli import build_parser, run_diagnose
-
-    inv = tmp_path / "inventory.yaml"
-    inv.write_text(_INVENTORY, encoding="utf-8")
-
-    driver, _shell = _driver([(LAUNCH, MAIN_MENU), ("2", FAT_MENU),
-                              ("2", TEST_PASS)])
-    llm = ScriptedLLM(
-        {"kind": "test", "single_test": {"action": "run", "test": "PCIE_LINK_TEST"}},
-        {"kind": "diagnosis", "diagnosis": _stub_diagnosis().model_dump()},
-    )
-    args = build_parser().parse_args([
-        "diagnose", "--inventory", str(inv), "--host", "h1",
-        "--symptom", "MCE uncorrectable ECC error",
-        "--out-dir", str(tmp_path / "runs"), "--llm", "stub",
-        "--interactive", "--server-number", "3",
-    ])
-    diag = run_diagnose(args, overrides={
-        "session": FakeRunner(),
-        "llm": llm,
-        "human_input": lambda q: "",
-        "single_test_driver": driver,
-    })
-
-    assert diag.diagnosis == "Memory ECC errors on DIMM_A2"
-    run_dir = next((tmp_path / "runs").iterdir())
-    transcript = json.loads(
-        (run_dir / "transcript.json").read_text(encoding="utf-8"))
-    test_msgs = [t for t in transcript if t.get("kind") == "test"]
-    assert any("[test result] PCIE_LINK_TEST: pass" in t["content"]
-               for t in test_msgs)

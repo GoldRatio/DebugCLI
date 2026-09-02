@@ -4,6 +4,10 @@ from harness.diagnosis.schema import Action, Diagnosis, FailurePoint, Risk, Serv
 from harness.operator.chat_agent import (
     CHAT_CONTRACT,
     CHAT_SYSTEM,
+    CHAT_TOOLS,
+    DEBUG_CONTRACT,
+    DEBUG_SYSTEM,
+    DEBUG_TOOLS,
     ChatTurn,
     build_evidence,
     build_messages,
@@ -115,11 +119,79 @@ def test_decide_rejects_run_without_reference():
     assert decide(_ChatLLM({"say": "x", "tool": "run", "run": "  "}), []) is None
 
 
+def test_decide_accepts_file_turn():
+    llm = _ChatLLM({"say": "Reading the log.", "tool": "file",
+                    "path": "logs/fat_run.log"})
+    turn = decide(llm, [])
+    assert turn is not None
+    assert turn.tool == "file"
+    assert turn.path == "logs/fat_run.log"
+
+
+def test_decide_rejects_file_without_path():
+    assert decide(_ChatLLM({"say": "x", "tool": "file"}), []) is None
+    assert decide(_ChatLLM({"say": "x", "tool": "file", "path": " "}), []) is None
+
+
+# ---- chat mode ----
+
+def test_decide_chat_mode_rejects_target_tools():
+    for payload in (
+        {"say": "x", "tool": "diagnose", "symptom": "ECC"},
+        {"say": "x", "tool": "probe", "subsystems": ["memory"]},
+        {"say": "x", "tool": "verify", "metric": "ecc"},
+    ):
+        assert decide(_ChatLLM(payload), [], mode="chat") is None
+
+
+def test_decide_chat_mode_accepts_reference_tools():
+    for payload in (
+        {"say": "x", "tool": "docs", "query": "DIMM rules"},
+        {"say": "x", "tool": "run", "run": "abc"},
+        {"say": "x", "tool": "file", "path": "log.txt"},
+        {"say": "x", "tool": "none"},
+    ):
+        turn = decide(_ChatLLM(payload), [], mode="chat")
+        assert turn is not None and turn.tool == payload["tool"]
+
+
+def test_decide_chat_mode_skips_target_extraction():
+    # chat mode has no active target and no diagnose tool: a plain turn
+    # comes back untouched (no host/target rewriting).
+    turn = decide(_ChatLLM({"say": "x", "tool": "none"}), [], mode="chat")
+    assert turn is not None
+    assert turn.tool == "none"
+    assert turn.host is None and turn.rack is None
+
+
+def test_fallback_turn_chat_mode_is_reference_only():
+    docs = fallback_turn(_keyword_route("look up DIMM in the manual"), "",
+                         mode="chat")
+    assert docs.tool == "docs"
+
+    diag = fallback_turn(_keyword_route("diagnose the ECC error"), "", mode="chat")
+    assert diag.tool == "none"
+    assert "chat" in diag.say.lower()
+    assert "debug" in diag.say.lower()
+
+    probe = fallback_turn(_keyword_route("probe the memory controller"), "",
+                          mode="chat")
+    assert probe.tool == "none"
+
+
 def test_chat_contract_documents_run_and_crisp_symptoms():
+    assert '"run"' in DEBUG_CONTRACT
+    assert "run (required" in DEBUG_CONTRACT
+    assert "crisp symptom" in DEBUG_CONTRACT
+    assert "run id" in DEBUG_CONTRACT
+    # chat mode: docs/run/file only, never a target tool
     assert '"run"' in CHAT_CONTRACT
-    assert "run (required" in CHAT_CONTRACT
-    assert "crisp symptom" in CHAT_CONTRACT
-    assert "run id" in CHAT_CONTRACT
+    assert '"file"' in CHAT_CONTRACT
+    assert "diagnose" not in CHAT_CONTRACT
+    assert "probe" not in CHAT_CONTRACT
+    assert "verify" not in CHAT_CONTRACT
+    assert set(CHAT_TOOLS) == {"docs", "run", "file"}
+    assert "diagnose" in DEBUG_TOOLS and "file" in DEBUG_TOOLS
 
 
 # ---- fallback_turn ----
@@ -164,7 +236,7 @@ def test_build_messages_structure():
         pending=["Replaced PSU last week"],
     )
     assert messages[0]["role"] == "system"
-    assert CHAT_SYSTEM in messages[0]["content"]
+    assert DEBUG_SYSTEM in messages[0]["content"]
     assert messages[1]["content"] == "diagnose it"           # user message verbatim
     assert messages[2]["role"] == "assistant"                # agent say
     assert messages[2]["content"] == "checking"
@@ -174,6 +246,19 @@ def test_build_messages_structure():
     assert "Replaced PSU last week" in final
     assert "## Active Target\nh1" in final
     assert "## Available Hosts\nh1" in final
+    assert final.endswith(DEBUG_CONTRACT)
+
+
+def test_build_messages_chat_mode_has_no_target_blocks():
+    """Chat mode uses the chat system prompt and omits target/host blocks."""
+    messages = build_messages(
+        transcript=[], user_text="hi", evidence_digest="",
+        host_names=("h1",), target_label="h1", mode="chat",
+    )
+    assert CHAT_SYSTEM in messages[0]["content"]
+    final = messages[-1]["content"]
+    assert "## Available Hosts" not in final
+    assert "## Active Target" not in final
     assert final.endswith(CHAT_CONTRACT)
 
 

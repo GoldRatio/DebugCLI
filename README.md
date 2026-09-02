@@ -50,11 +50,54 @@ approves — any actual repair.
 ## Install
 
 ```powershell
-pip install -e ".[test,docs]"
+python -m pip install -e ".[test,docs]"
 ```
 
 This installs the `harness` command plus the optional extras used for document
-indexing (RAG) and testing.
+indexing (RAG) and testing. Prefer `python -m pip` over a bare `pip`: with
+multiple Python installations, bare `pip` can be wired to a different
+interpreter than the `python` you run, which puts the command where you will
+not find it.
+
+### Windows: `harness` is not found after install
+
+The command ships as `harness.exe` inside the Python environment's
+`Scripts\` directory. It is only discoverable while that directory is on
+`PATH` — and editing `PATH` never affects terminals that are already open,
+so open a new one after any change.
+
+Find where pip put it:
+
+```powershell
+python -m pip show -f harness   # "Location:" plus a ..\..\Scripts\harness.exe entry
+python -c "import sys, sysconfig; print(sysconfig.get_path('scripts'))"
+where.exe harness               # no output means it is not on PATH
+```
+
+A pip warning during install ("The script harness.exe is installed in
+'...' which is not on PATH") confirms the case. Common causes and fixes:
+
+- **User-site fallback / Microsoft Store Python** — scripts land under
+  `%APPDATA%\Python\Python3XX\Scripts\` or
+  `%LOCALAPPDATA%\Packages\PythonSoftwareFoundation...\LocalCache\local-packages\...\Scripts\`,
+  neither of which is on `PATH`. Add the reported directory to your user
+  `PATH`, then open a new terminal:
+
+  ```powershell
+  $scripts = "<the Scripts directory reported above>"
+  $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+  [Environment]::SetEnvironmentVariable('Path', "$userPath;$scripts", 'User')
+  ```
+
+- **Installed into a venv** — activate it before running the command:
+  `.\.venv\Scripts\Activate.ps1`.
+
+- **Multiple Python installations** — reinstall with the interpreter you
+  actually invoke: `python -m pip install -e ".[test,docs]"`.
+
+Sanity check: `where.exe harness` prints one path, and you start `harness`
+from the repository root so it auto-discovers `inventory.yaml`, `config/`,
+and `secrets/`.
 
 ## Your first diagnosis (no configuration files required)
 
@@ -72,9 +115,11 @@ indexing (RAG) and testing.
    manager) and enter the rack id and cable number, e.g. `Q67` and `8`. Or
    pick **SSH address** for a machine you reach over the network.
 
-3. The **symptom** question is optional — enter something like
-   `uncorrectable ECC errors`, or press Enter to diagnose from live evidence
-   alone. You can also hand it a factory/test log path here.
+3. Describe the symptom in plain English when the debug REPL opens, e.g.
+   `uncorrectable ECC errors` — the agent runs the read-only diagnosis in the
+   background and you can keep chatting: ask follow-up questions, request
+   re-checks, or queue a factory/test log with `/testlog <path>` while it
+   works. Debugging is iterative, not one-shot.
 
 4. If a password or key is needed, the harness asks at that exact moment and
    stores it locally (`secrets/`). It is redacted from every log and never
@@ -153,8 +198,11 @@ harness diagnose --inventory inventory.yaml --rack Q61 --cable 8 --symptom "ECC 
 # SSH by IP
 harness diagnose --inventory inventory.yaml --address 10.0.0.50 --symptom "ECC errors"
 
-# Chat session against the same targets
-harness session --inventory inventory.yaml --rack Q61 --cable 8
+# Interactive debug session against the same targets
+harness debug --inventory inventory.yaml --rack Q61 --cable 8
+
+# Target-less chat: manuals, past runs, or a referenced log file
+harness chat
 ```
 
 Resolution order: `--host` > `--target <alias>` > `--rack/--cable` > `--address`.
@@ -192,7 +240,9 @@ harness diagnose --inventory inventory.yaml --host h1 --test-log quanta_qmf_fat_
 #  (--symptom is optional here; it derives from the log's first failure)
 ```
 
-Works in chat sessions too (`/testlog <path>`). The raw log is archived with
+Works in debug sessions too (`/testlog <path>`). In `harness chat` you can
+simply paste a log file's path — the agent reads it and matches its failures
+against prior verified fixes. The raw log is archived with
 the run (passwords in it are redacted before anything reaches a prompt), and
 its failure codes feed the learning loop below.
 
@@ -229,8 +279,9 @@ harness calibrate                      # rebuild per-model fix-rate calibration
 |---|---|
 | `harness` / `harness menu` | Interactive menu: debug a target, inspect past runs, pick the model |
 | `harness setup` | Guided first-run wizard: inventory + credentials + LLM access |
-| `harness session` | Chat REPL; background runs, slash commands (`/model`, `/testlog`, `/quit`) |
-| `harness diagnose` | One-shot read-only diagnosis of a target |
+| `harness debug` (alias `session`) | Interactive debug REPL on a target; background runs, slash commands (`/model`, `/testlog`, `/quit`) |
+| `harness chat` | Target-less chat REPL: manuals, past runs, referenced files — no machine is contacted |
+| `harness diagnose` | One-shot read-only diagnosis of a target (CLI/automation) |
 | `harness console` | Run read-only probes over the serial console (lab/QA only) |
 | `harness verify --baseline <dumps.json>` | Re-run collectors, compare error counters |
 | `harness llm check` | Staged AI-endpoint test: ssh → forward → /models → chat |
@@ -244,11 +295,12 @@ harness calibrate                      # rebuild per-model fix-rate calibration
 | `harness calibrate` / `harness priors update` | Rebuild calibration / subsystem priors |
 | `harness eval` | Offline regression replay against the case baseline |
 
-Common `diagnose`/`session` flags: `--inventory`, `--secret-dir`,
-`--docs-lib`, `--docs-dir`, `--parts-csv`, `--out-dir`,
+Common `diagnose`/`debug`/`chat` flags: `--inventory` (diagnose/debug),
+`--secret-dir`, `--docs-lib`, `--docs-dir`, `--parts-csv`, `--out-dir`,
 `--llm {openai,gemini,local,stub}`, `--llm-model <ident>`,
-`--llm-url`, `--llm-tunnel HOST:PORT`, `--approval` / `--approve-all`,
-`--max-turns`, `--test-log`.
+`--llm-url`, `--llm-tunnel HOST:PORT`, `--approval` / `--approve-all`
+(diagnose), `--max-tools` (chat/debug: tool calls per message), `--test-log`
+(diagnose/debug).
 
 ## Troubleshooting
 
@@ -278,10 +330,13 @@ Common `diagnose`/`session` flags: `--inventory`, `--secret-dir`,
 ## Development
 
 ```powershell
-pip install -e ".[test,docs]"
+python -m pip install -e ".[test,docs]"
 pytest            # 750+ unit tests, no hardware needed
 ruff check .
 ```
+
+On Windows, if the `harness` command is not found after installing, see
+[Windows: `harness` is not found after install](#windows-harness-is-not-found-after-install).
 
 ## Repository hygiene
 

@@ -539,7 +539,9 @@ def test_run_menu_advanced_round_trip(tmp_path, monkeypatch, capsys):
     assert "harness menu" in out
 
 
-def test_run_menu_diagnose_builds_argv(tmp_path, monkeypatch, capsys):
+def test_run_menu_diagnose_builds_debug_argv(tmp_path, monkeypatch, capsys):
+    """\"Debug a target\" launches the interactive debug REPL on the picked
+    target; no symptom is prompted (the agent takes it as the first message)."""
     _write_inventory(tmp_path)
     monkeypatch.chdir(tmp_path)
     from harness.operator import menu as menu_mod
@@ -554,21 +556,21 @@ def test_run_menu_diagnose_builds_argv(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(menu_mod, "select",
                         _scripted_select([main_keys.index("diagnose"), 0,
                                           main_keys.index("quit")]))
-    # The symptom prompt is optional: an empty answer falls back to the
-    # default evidence-driven symptom.
-    monkeypatch.setattr(menu_mod, "ask_text", lambda prompt, **kw: "")
+    asked = []
+    monkeypatch.setattr(menu_mod, "ask_text",
+                        lambda prompt, **kw: asked.append(prompt) or "")
     monkeypatch.setattr(cli_mod, "_run_wizard_sub", fake_sub)
 
     assert run_menu(_menu_args()) == 0
-    assert built and built[0][:4] == ["diagnose", "--inventory", "inventory.yaml",
-                                      "--symptom"]
+    assert built and built[0][0] == "debug"
+    assert built[0][1:3] == ["--inventory", "inventory.yaml"]
     assert built[0][built[0].index("--host") + 1] == "h1"
-    # empty symptom -> the default evidence-driven symptom is supplied
-    assert built[0][built[0].index("--symptom") + 1] == cli_mod._MENU_DIAGNOSE_SYMPTOM
-    assert "diagnosing from live evidence" in capsys.readouterr().out
+    assert "--symptom" not in built[0]
+    assert not asked  # no symptom / test-log prompting in the debug flow
 
 
-def test_run_menu_diagnose_uses_typed_symptom(tmp_path, monkeypatch):
+def test_run_menu_chat_builds_argv_without_target(tmp_path, monkeypatch):
+    """The Chat entry is target-less: no _pick_target, `chat` argv."""
     _write_inventory(tmp_path)
     monkeypatch.chdir(tmp_path)
     from harness.operator import menu as menu_mod
@@ -580,16 +582,14 @@ def test_run_menu_diagnose_uses_typed_symptom(tmp_path, monkeypatch):
 
     main_keys = [k for k, _ in cli_mod._MAIN_ACTIONS]
     monkeypatch.setattr(menu_mod, "select",
-                        _scripted_select([main_keys.index("diagnose"), 0,
+                        _scripted_select([main_keys.index("chat"),
                                           main_keys.index("quit")]))
-    monkeypatch.setattr(menu_mod, "ask_text",
-                        lambda prompt, **kw: ("amber light on power rail"
-                                              if "Symptom" in prompt else ""))
     monkeypatch.setattr(cli_mod, "_run_wizard_sub", fake_sub)
 
     assert run_menu(_menu_args()) == 0
-    idx = built[0].index("--symptom")
-    assert built[0][idx + 1] == "amber light on power rail"
+    assert built and built[0][0] == "chat"
+    assert "--inventory" not in built[0]
+    assert "--host" not in built[0]
 
 
 # ---- runs inspection menu ----
@@ -878,9 +878,9 @@ def test_label_run_defers_on_blank_outcome(tmp_path, monkeypatch, capsys):
 def test_should_prompt_label_gating(monkeypatch):
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     assert cli_mod._should_prompt_label(
-        SimpleNamespace(label_prompt=True, interactive=False))
-    assert cli_mod._should_prompt_label(
-        SimpleNamespace(label_prompt=False, interactive=True))
+        SimpleNamespace(label_prompt=True))
+    assert not cli_mod._should_prompt_label(
+        SimpleNamespace(label_prompt=False))
     assert not cli_mod._should_prompt_label(
         SimpleNamespace(label_prompt=False, interactive=False))
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
