@@ -10,6 +10,7 @@ Env config: ``HARNESS_LLM_URL`` (default http://127.0.0.1:8000/v1),
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -21,6 +22,15 @@ from .schema import Diagnosis
 
 class LLMError(RuntimeError):
     pass
+
+
+CAPTION_PROMPT = (
+    "Transcribe every piece of text visible in this image verbatim (labels, "
+    "headings, table cells, callouts, legend entries, axis names), preserving "
+    "reading order. Then add one short paragraph describing what the image "
+    "shows (diagram type, components, connections, states). Output plain text "
+    "only, no markdown fences."
+)
 
 
 class OpenAICompatLLM:
@@ -51,7 +61,9 @@ class OpenAICompatLLM:
 
         Used by the multi-turn session engine where the agent answers with
         ``{kind: question|probe|diagnosis, ...}``. ``messages`` are
-        ``[{"role": "system"|"user"|"assistant", "content": str}]``.
+        ``[{"role": ..., "content": str | parts}]``; ``content`` may be a
+        plain string or an OpenAI-style parts list (text + base64 image parts)
+        for vision-capable endpoints.
         """
         if not any(m.get("role") == "user" for m in messages):
             # Several OpenAI-compatible layers (Gemini's, strict local
@@ -68,6 +80,44 @@ class OpenAICompatLLM:
         }
         if self.json_mode:
             body["response_format"] = {"type": "json_object"}
+        data = self._post_chat(body)
+        content = data["choices"][0]["message"]["content"]
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            cleaned = _coerce_json_text(content)
+            if cleaned is not None:
+                try:
+                    return json.loads(cleaned)
+                except json.JSONDecodeError:
+                    pass
+            raise LLMError(f"LLM returned non-JSON: {content[:200]!r}") from None
+
+    def caption_image(self, png_bytes: bytes, prompt: str | None = None) -> str:
+        """Vision captioning: describe/transcribe a PNG via a multimodal turn.
+
+        Sends the image as a base64 data URL part (OpenAI wire format, honored
+        by Gemini's OpenAI-compat layer and vLLM vision models) and returns the
+        model's plain-text reply. Raises :class:`LLMError` on transport or
+        malformed-reply failure so callers can degrade to text-only ingest.
+        """
+        b64 = base64.b64encode(png_bytes).decode("ascii")
+        messages = [{"role": "user", "content": [
+            {"type": "text", "text": prompt or CAPTION_PROMPT},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+        ]}]
+        body = {"model": self.model, "messages": messages, "temperature": 0.0}
+        data = self._post_chat(body)
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise LLMError(f"LLM caption reply malformed: {exc}") from exc
+        if not isinstance(content, str) or not content.strip():
+            raise LLMError("LLM caption reply was empty")
+        return content.strip()
+
+    def _post_chat(self, body: dict) -> dict:
+        """POST a chat-completions body, returning the parsed reply envelope."""
         request = urllib.request.Request(
             f"{self.url}/chat/completions",
             data=json.dumps(body).encode("utf-8"),
@@ -78,7 +128,7 @@ class OpenAICompatLLM:
             request.add_header("Authorization", f"Bearer {self.api_key}")
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+                return json.loads(resp.read().decode("utf-8"))
         except urllib_error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:300]
             raise LLMError(f"LLM HTTP {exc.code}: {detail!r}") from exc
@@ -93,17 +143,8 @@ class OpenAICompatLLM:
             raise LLMError(_timeout_message(self.timeout)) from exc
         except OSError as exc:
             raise LLMError(f"LLM connection failed: {exc}") from exc
-        content = data["choices"][0]["message"]["content"]
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            cleaned = _coerce_json_text(content)
-            if cleaned is not None:
-                try:
-                    return json.loads(cleaned)
-                except json.JSONDecodeError:
-                    pass
-            raise LLMError(f"LLM returned non-JSON: {content[:200]!r}") from None
+        except json.JSONDecodeError as exc:
+            raise LLMError("LLM returned non-JSON reply envelope") from exc
 
     @staticmethod
     def _parse(content: str) -> Diagnosis:
@@ -300,3 +341,7 @@ class StubLLM:
                    "decide on tools.",
             "tool": "none",
         }
+
+    def caption_image(self, png_bytes: bytes, prompt: str | None = None) -> str:
+        """Deterministic offline caption so vision paths run (and test) without infra."""
+        return "(stub caption) no vision LLM configured; image content unavailable."

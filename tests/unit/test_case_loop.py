@@ -267,3 +267,25 @@ def test_case_text_indexes_test_log_failures():
     text = _case_text(_fat_log_case("pcie-1"))
     assert "P02002001@PCIe Test Fail" in text
     assert "pcie_cmp_chk" in text
+
+
+def test_case_store_delete_removes_record_and_rebuilds_index(tmp_path):
+    import json
+
+    store = CaseStore(tmp_path / "cases")
+    store.record(_case("run-1"))
+    store.record(_case("run-2"))
+    assert store.delete("run-1") is True
+    assert store.get("run-1") is None
+    assert store.get("run-2") is not None
+    index = json.loads(
+        (tmp_path / "cases" / "index.json").read_text(encoding="utf-8"))
+    assert "run-1" not in index
+    assert "run-2" in index
+
+
+def test_case_store_delete_unknown_id_is_noop(tmp_path):
+    store = CaseStore(tmp_path / "cases")
+    store.record(_case("run-1"))
+    assert store.delete("nope") is False
+    assert store.get("run-1") is not None

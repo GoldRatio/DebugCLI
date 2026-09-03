@@ -446,6 +446,9 @@ def test_diagnose_console_requires_console_block(tmp_path):
 
 
 class _FakePdfParser:
+    def __init__(self, ocr=None):  # ocr: vision captioner passed by DocLibrary
+        self.ocr = ocr
+
     def parse(self, path):
         from harness.docs.ingest.pdf_parser import PageText
         return [PageText(page=1, text="memory ECC uncorrectable DIMM error IA32_MC0_STATUS")]
@@ -480,6 +483,28 @@ def test_docs_cli_rm_missing_returns_error(tmp_path, monkeypatch, capsys):
     code = run_docs(build_parser().parse_args(["docs", "--lib", lib, "rm", "nope.pdf"]))
     assert code == 2
     assert "not in library" in capsys.readouterr().err
+
+
+def test_docs_add_wires_env_captioner(tmp_path, monkeypatch):
+    """``docs add`` passes the env-configured vision captioner into the PDF
+    parser, so scanned pages/diagrams are captioned at ingest."""
+    import harness.docs.ingest.library as lib_mod
+    import harness.docs.ingest.vision as vision_mod
+
+    captured = {}
+
+    class _SpyParser(_FakePdfParser):
+        def __init__(self, ocr=None):
+            super().__init__(ocr=ocr)
+            captured["ocr"] = ocr
+
+    monkeypatch.setattr(lib_mod, "PdfParser", _SpyParser)
+    monkeypatch.setenv("HARNESS_LLM_PROVIDER", "stub")
+    pdf = tmp_path / "arch.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+    assert run_docs(build_parser().parse_args(
+        ["docs", "--lib", str(tmp_path / "lib"), "add", str(pdf)])) == 0
+    assert isinstance(captured["ocr"], vision_mod.VisionCaptioner)
 
 
 def test_diagnose_uses_docs_lib_for_rag(tmp_path, monkeypatch):
@@ -1351,3 +1376,118 @@ def test_llm_check_forward_refusal_prints_reverse_recipe(tmp_path, capsys,
     captured = capsys.readouterr()
     assert "[FAIL] forward" in captured.out
     assert "reverse tunnel" in captured.err    # fallback recipe surfaced
+
+
+# ---- aborted-run cleanup (no artifacts -> nothing left behind) ----
+
+def test_diagnose_abort_discards_artifact_free_run_dir(tmp_path, monkeypatch,
+                                                       capsys):
+    args = _diagnose_args(tmp_path)
+
+    class BoomSSH:
+        def __init__(self, *a, **k):
+            pass
+
+        def open(self):
+            raise RuntimeError("unreachable host")
+
+    monkeypatch.setattr(cli_mod, "SSHSession", BoomSSH)
+    with pytest.raises(RuntimeError, match="unreachable host"):
+        run_diagnose(args, overrides={})
+    assert list((tmp_path / "runs").iterdir()) == []
+    assert "discarded aborted run" in capsys.readouterr().err
+
+
+def test_diagnose_without_symptom_leaves_no_run_dir(tmp_path):
+    args = build_parser().parse_args([
+        "diagnose", "--inventory", _inventory(tmp_path), "--host", "h1",
+        "--out-dir", str(tmp_path / "runs"), "--llm", "stub"])
+    with pytest.raises(SystemExit):
+        run_diagnose(args, overrides={})
+    assert not (tmp_path / "runs").exists()
+
+
+# ---- harness runs delete ----
+
+def _run_with_case(tmp_path, run_id="abc123"):
+    from harness.diagnosis.case_store import CaseStore
+    from harness.diagnosis.schema import CaseOutcome
+
+    base = tmp_path / "runs"
+    run = base / run_id
+    run.mkdir(parents=True)
+    (run / "diagnosis.json").write_text('{"state": "healthy"}', encoding="utf-8")
+    cases = base / "cases"
+    CaseStore(cases).record(CaseOutcome(
+        run_id=run_id, target_id="t", symptom="s", model_key="m",
+        outcome="fixed", actions_recommended=[], actions_taken=[],
+        llm_ident="stub", evidence_summary=[]))
+    return base, run, cases
+
+
+def test_parser_runs_delete():
+    args = build_parser().parse_args(
+        ["runs", "delete", "abc123", "--drop-case", "--yes"])
+    assert args.run == "abc123"
+    assert args.drop_case and args.yes
+    assert callable(args.func)
+
+
+def test_runs_delete_removes_run_keeps_case(tmp_path, capsys):
+    base, run, cases = _run_with_case(tmp_path)
+    args = SimpleNamespace(run="abc123", drop_case=False, yes=True,
+                           out_dir=str(base))
+    assert cli_mod.run_runs_delete(args) == 0
+    assert not run.exists()
+    assert (cases / "abc123.json").exists()
+    assert "deleted run abc123" in capsys.readouterr().out
+
+
+def test_runs_delete_drop_case_rebuilds_index(tmp_path):
+    base, run, cases = _run_with_case(tmp_path)
+    args = SimpleNamespace(run=str(run), drop_case=True, yes=True,
+                           out_dir=str(base))
+    assert cli_mod.run_runs_delete(args) == 0
+    assert not run.exists()
+    assert not (cases / "abc123.json").exists()
+    index = json.loads((cases / "index.json").read_text(encoding="utf-8"))
+    assert "abc123" not in index
+
+
+def test_runs_delete_requires_confirmation(tmp_path, monkeypatch):
+    from harness.operator import menu as menu_mod
+
+    base, run, _cases = _run_with_case(tmp_path)
+    args = SimpleNamespace(run="abc123", drop_case=False, yes=False,
+                           out_dir=str(base))
+    monkeypatch.setattr(menu_mod, "confirm", lambda prompt, default=False: False)
+    assert cli_mod.run_runs_delete(args) == 1
+    assert run.exists()
+
+    monkeypatch.setattr(menu_mod, "confirm", lambda prompt, default=False: True)
+    assert cli_mod.run_runs_delete(args) == 0
+    assert not run.exists()
+
+
+def test_runs_delete_refuses_non_run_and_missing(tmp_path):
+    base = tmp_path / "runs"
+    (base / "cases").mkdir(parents=True)
+    reserved = SimpleNamespace(run="cases", drop_case=False, yes=True,
+                               out_dir=str(base))
+    assert cli_mod.run_runs_delete(reserved) == 1
+
+    missing = SimpleNamespace(run="nope", drop_case=False, yes=True,
+                              out_dir=str(base))
+    assert cli_mod.run_runs_delete(missing) == 1
+
+
+def test_runs_delete_refuses_outside_out_dir(tmp_path):
+    outside = tmp_path / "elsewhere" / "abc123"
+    outside.mkdir(parents=True)
+    (outside / "diagnosis.json").write_text("{}", encoding="utf-8")
+    base = tmp_path / "runs"
+    base.mkdir()
+    args = SimpleNamespace(run=str(outside), drop_case=False, yes=True,
+                           out_dir=str(base))
+    assert cli_mod.run_runs_delete(args) == 1
+    assert outside.exists()

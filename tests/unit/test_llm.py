@@ -410,3 +410,83 @@ def test_chat_read_timeout_is_staged_with_actionable_hint(monkeypatch):
     monkeypatch.setattr(llm_mod.urllib.request, "urlopen", stall_during_connect)
     with pytest.raises(LLMError, match="timed out after 600s"):
         llm.chat_json([{"role": "user", "content": "hi"}])
+
+
+# ---- vision captioning: multimodal wire shape + failure surfacing ----
+
+def test_caption_image_sends_multimodal_parts(monkeypatch):
+    """``caption_image`` wraps the PNG as a base64 data-url image part (the
+    OpenAI vision wire shape honored by Gemini's compat layer and vLLM) and
+    requests plain text, not JSON mode."""
+    import base64
+    import json
+
+    import harness.diagnosis.llm as llm_mod
+
+    seen = {}
+
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {"choices": [{"message": {"content": "DIMM slot map"}}]}).encode()
+
+    def fake_urlopen(request, timeout):
+        seen["body"] = json.loads(request.data)
+        return _FakeResp()
+
+    monkeypatch.setattr(llm_mod.urllib.request, "urlopen", fake_urlopen)
+    llm = OpenAICompatLLM(url="http://127.0.0.1:9/v1", api_key="k", timeout=1.0)
+    assert llm.caption_image(b"\x89PNG-fake") == "DIMM slot map"
+
+    body = seen["body"]
+    assert "response_format" not in body  # plain-text request, not json_object
+    content = body["messages"][0]["content"]
+    assert content[0]["type"] == "text"
+    assert "Transcribe" in content[0]["text"]
+    part = content[1]
+    assert part["type"] == "image_url"
+    url = part["image_url"]["url"]
+    assert url.startswith("data:image/png;base64,")
+    assert base64.b64decode(url.split(",", 1)[1]) == b"\x89PNG-fake"
+
+
+def test_caption_image_custom_prompt_and_empty_reply(monkeypatch):
+    import json
+
+    import harness.diagnosis.llm as llm_mod
+
+    class _FakeResp:
+        def __init__(self, content):
+            self._content = content
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {"choices": [{"message": {"content": self._content}}]}).encode()
+
+    seen = {}
+
+    def fake_urlopen(request, timeout):
+        seen["body"] = json.loads(request.data)
+        return _FakeResp("   ")
+
+    monkeypatch.setattr(llm_mod.urllib.request, "urlopen", fake_urlopen)
+    llm = OpenAICompatLLM(url="http://127.0.0.1:9/v1", timeout=1.0)
+    with pytest.raises(LLMError, match="empty"):
+        llm.caption_image(b"png", prompt="Describe the connectors.")
+    assert seen["body"]["messages"][0]["content"][0]["text"] == "Describe the connectors."
+
+
+def test_stub_caption_image_deterministic():
+    assert "(stub caption)" in StubLLM().caption_image(b"png")

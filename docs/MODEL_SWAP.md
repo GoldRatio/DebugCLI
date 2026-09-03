@@ -35,7 +35,9 @@ concrete model name comes from the `HARNESS_LLM_MODEL` environment variable
 `--llm-tunnel HOST:PORT` when that server sits behind a rack-manager hop. The
 report's `llm_ident` records exactly what was replayed (`local/<model>` for
 self-hosted), so old- vs new-model runs are distinguishable and a *temporary*
-debug model never inherits another backend's calibration bins.
+debug model never inherits another backend's calibration bins. A tunnel-backed
+remembered model is honored in `harness chat` too: chat opens the same hop
+(a single inventory under `config/` is auto-used, or pass `--inventory`).
 
 1. Freeze the OLD model's numbers as the reference baseline:
    ```powershell

@@ -120,13 +120,22 @@ transcripts, or the redacted audit log — during the run or afterwards. Set
 `HARNESS_NO_PROMPT=1` (or run with non-tty stdin, e.g. automation/CI) to disable
 prompting and keep the plain `KeyError` / `TargetError` messages instead.
 
-## 3. Add architecture PDFs to the RAG library
+## 3. Add architecture documents to the RAG library
 
 ```powershell
 harness docs add .\docs\*.pdf        # chunk + index
 harness docs ls
 harness docs reindex                 # rebuild index, retries failures
 ```
+
+Supported formats: PDF, Markdown, plain text, CSV, JSON, `.log`, and DOCX
+(`.docx` needs the `docs` extra's python-docx dependency). PDF image content is
+not lost: pages are run through the configured vision LLM (scanned pages and
+embedded diagrams/callouts are transcribed into searchable text). Captioning
+uses the same endpoint config as the diagnosis LLM (`HARNESS_LLM_URL`,
+`HARNESS_LLM_MODEL`, `HARNESS_LLM_API_KEY`; `HARNESS_LLM_PROVIDER=none` disables
+it) and degrades to text-only when the endpoint is unreachable -- `docs reindex`
+retries the images once it is back.
 
 Vendor PDFs are git-ignored; they live on your machine only.
 
@@ -176,11 +185,17 @@ harness chat
 harness chat> what does the manual say about DIMM population rules?
 ```
 
-- No inventory, no machine is contacted. The agent answers from the RAG
-  document library (`docs`), loads past runs (`run`), and reads files you
-  reference by path (`file`).
+- Target-less: no machine is contacted and no target is ever resolved. The
+  agent answers from the RAG document library (`docs`), loads past runs
+  (`run`), and reads files you reference by path (`file`).
 - Referencing a factory/FAT log makes the harness parse its failures and
   surface prior verified fixes matched from the case store, right in the chat.
+- Tunnel-backed remembered models work here too: when the current model
+  (`config/models.yaml`) carries `tunnel:` (a vLLM on the golden server, set
+  up by the model wizard), chat opens the same rack-manager SSH forward
+  `debug` uses -- pass `--inventory <file>` explicitly, or a single inventory
+  under `config/` is auto-used. An explicit `--llm-url` (workstation-reachable
+  endpoint) or a non-tunnel model (`--llm-model`) skips the hop entirely.
 - Target tools (`diagnose`/`probe`/`verify`) are unavailable: the agent says
   so and points you at `harness debug` for live debugging.
 - Slash commands: `/help`, `/model`, `/context`, `/status`, `/stop`, `/runs`,
@@ -224,6 +239,33 @@ harness diagnose --inventory inventory.yaml --host h1 `
   After the repair, confirm with `harness report --run <id> --outcome fixed
   [--taken "..."]`. A future run whose log shows the same failure code surfaces
   that verified fix as a Prior Verified Case — even before any probing.
+
+### Sharing the learning between devices
+
+Everything the learning loop produced on one workstation — verified fixes,
+priors, calibration and the full run artifacts — packs into one zip bundle
+that another device can import:
+
+```powershell
+harness learning export                    # harness-learning-<timestamp>.zip
+harness learning export --list             # preview what would be exported
+harness learning export --no-runs          # cases + derived only (small bundle)
+
+# on the other device:
+harness learning import harness-learning-20260902-101500.zip --dry-run
+harness learning import harness-learning-20260902-101500.zip
+```
+
+- Import is conservative: run ids already known on the device are **skipped**
+  (the case store is append-only); `--revise` replaces them with the bundle's
+  versions (case changes audited as `case_revised`).
+- Integrity + schema checks run before anything is written; a tampered or
+  foreign bundle is rejected whole. The case index is rebuilt on import.
+- **Bundles are unredacted** — they contain hostnames, serials and evidence
+  text, and never credentials (secret references are rejected). Share between
+  your own devices only.
+- Menu: `Advanced → learning` does the same interactively (import previews
+  first and confirms before writing).
 
 ### FAT single tests (not currently wired)
 
@@ -353,6 +395,17 @@ Under `harness_runs/<run-id>/`:
 - `trace.json` — what was planned, collected, decoded, and concluded.
 - `audit.jsonl` — append-only audit chain (redacted).
 - `dumps/*.txt` — raw collector output for manual cross-checking.
+
+### Deleting runs
+
+- Runs menu: pick a run → `delete` — shows its size and whether a verified
+  case exists, then confirms. The verified case (the learned fix) is **kept**
+  by default; a second confirm removes the learning too.
+- CLI: `harness runs delete <run-id> [--drop-case] [--yes]`.
+- A diagnosis that aborts before producing any artifact (unreachable host,
+  refused credential, Ctrl-C during collection) leaves nothing behind — the
+  empty run directory is discarded automatically, so `harness_runs/` does not
+  fill up with audit-only leftovers.
 
 ## 9. Locally hosted model (temporary debug agent)
 

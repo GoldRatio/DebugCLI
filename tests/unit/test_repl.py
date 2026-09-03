@@ -31,6 +31,8 @@ FAKE_POLICY = AllowPolicy([
     AllowRule("/bin/dmesg", ("-l", "*")),
     AllowRule("/bin/dmidecode", ()),
     AllowRule("/usr/bin/lspci", ("-xxx",)),
+    AllowRule("/bin/smartctl", ("-a", "*")),
+    AllowRule("/bin/smartctl", ("-x", "*")),
 ])
 
 OUTPUT = {
@@ -1531,3 +1533,135 @@ def test_chat_session_persists_mode(tmp_path):
     payload = json.loads((session_dir / "session.json").read_text(encoding="utf-8"))
     assert payload["mode"] == "chat"
     assert "hello there" in [e.get("content") for e in payload["transcript"]]
+
+
+# ---- chat mode: tunnel-backed models (rack-manager hop) ----
+
+_TUNNEL_MODELS = {
+    "current": {"provider": "local", "model": "Qwen/Qwen3.8-27B",
+                "tunnel": "10.0.126.15:8000"},
+}
+
+_HOP_INVENTORY = (
+    "trust_level: lab\n"
+    "console_defaults:\n"
+    "  address: 192.168.202.51\n"
+    "  user: log\n"
+    "  identity_vault_path: secret/harness/rackmgr/id_ed25519\n"
+    "hosts: []\n"
+)
+
+
+def _chat_hop_env(tmp_path, monkeypatch) -> None:
+    """cwd with a persisted tunnel-backed current model (ModelCatalog reads
+    ``config/models.yaml`` from the working directory)."""
+    monkeypatch.chdir(tmp_path)
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "models.yaml").write_text(json.dumps(_TUNNEL_MODELS), encoding="utf-8")
+
+
+def _chat_args_in(tmp_path, *extra):
+    return build_parser().parse_args([
+        "chat",
+        "--out-dir", str(tmp_path / "runs"),
+        "--session-dir", str(tmp_path / "sessions"),
+        *extra,
+    ])
+
+
+class _FakeForward:
+    """Forward stand-in: _repl_loop closes it when the session ends."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_chat_tunnel_profile_loads_inventory_for_hop(tmp_path, monkeypatch, capsys):
+    """A tunnel-backed remembered model: chat loads the inventory (explicit
+    --inventory) so the rack-manager hop can open, while the session itself
+    stays target-less."""
+    _chat_hop_env(tmp_path, monkeypatch)
+    inv_path = tmp_path / "inv.yaml"
+    inv_path.write_text(_HOP_INVENTORY, encoding="utf-8")
+    captured: dict = {}
+
+    def fake_prepare(args, inv, store):
+        captured["inv"] = inv
+        return _FakeForward()
+
+    monkeypatch.setattr("harness.operator.cli._prepare_llm_endpoint", fake_prepare)
+    code = run_session(_chat_args_in(tmp_path, "--inventory", str(inv_path)),
+                       overrides={"reader": _ScriptedReader(["/quit"]),
+                                  "llm": StubLLM(), "router_llm": _NoChatLLM()})
+    assert code == 0
+    assert captured["inv"].console_defaults.address == "192.168.202.51"
+    assert "no target connected" in capsys.readouterr().out
+
+
+def test_chat_tunnel_profile_without_inventory_prints_guidance(
+        tmp_path, monkeypatch, capsys):
+    """No inventory anywhere: chat fails fast with actionable guidance, not
+    the raw --llm-tunnel inventory error."""
+    _chat_hop_env(tmp_path, monkeypatch)
+    code = run_session(_chat_args_in(tmp_path),
+                       overrides={"reader": _ScriptedReader(["/quit"])})
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "--inventory" in err
+    assert "harness debug" in err
+    assert "rack-manager tunnel" in err
+
+
+def test_chat_tunnel_profile_ambiguous_inventory_lists_candidates(
+        tmp_path, monkeypatch, capsys):
+    """Several inventories under config/: chat lists them and asks for an
+    explicit --inventory instead of guessing."""
+    _chat_hop_env(tmp_path, monkeypatch)
+    for name in ("a.yaml", "b.yaml"):
+        (tmp_path / "config" / name).write_text("trust_level: lab\nhosts: []\n",
+                                                encoding="utf-8")
+    code = run_session(_chat_args_in(tmp_path),
+                       overrides={"reader": _ScriptedReader(["/quit"])})
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "a.yaml" in err and "b.yaml" in err
+    assert "--inventory" in err
+
+
+def test_chat_tunnel_inventory_without_console_block_guidance(
+        tmp_path, monkeypatch, capsys):
+    """An inventory without llm_console/console_defaults cannot supply the
+    rack-manager hop: fail fast with guidance."""
+    _chat_hop_env(tmp_path, monkeypatch)
+    inv_path = tmp_path / "inv.yaml"
+    inv_path.write_text("trust_level: lab\nhosts: []\n", encoding="utf-8")
+    code = run_session(_chat_args_in(tmp_path, "--inventory", str(inv_path)),
+                       overrides={"reader": _ScriptedReader(["/quit"])})
+    assert code == 2
+    assert "no llm_console (or console_defaults)" in capsys.readouterr().err
+
+
+def test_chat_llm_url_overrides_tunnel_profile_without_hop(
+        tmp_path, monkeypatch, capsys):
+    """--llm-url is authoritative: the profile tunnel is dropped, no inventory
+    is loaded, and the session stays target-less."""
+    _chat_hop_env(tmp_path, monkeypatch)
+    monkeypatch.setattr("harness.operator.cli.list_models", lambda *a, **k: [])
+    captured: dict = {}
+
+    def fake_prepare(args, inv, store):
+        captured["inv"] = inv
+        return _FakeForward()
+
+    monkeypatch.setattr("harness.operator.cli._prepare_llm_endpoint", fake_prepare)
+    code = run_session(
+        _chat_args_in(tmp_path, "--llm-url", "http://127.0.0.1:8000/v1"),
+        overrides={"reader": _ScriptedReader(["/quit"]), "llm": StubLLM(),
+                   "router_llm": _NoChatLLM()})
+    assert code == 0
+    from harness.operator.repl import _NoInventory
+    assert isinstance(captured["inv"], _NoInventory)

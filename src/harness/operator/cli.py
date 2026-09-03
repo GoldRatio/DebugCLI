@@ -8,8 +8,10 @@ Subcommands:
               debug / verify / console / docs / targets / secrets / lint
               without remembering any flags
 - ``lint``    validate an inventory (rejects inline secrets)
-- ``docs``      manage the RAG document library: ``add`` uploads PDFs, ``ls``/``rm``
-                list/remove them, ``reindex`` retries failed or dropped files
+- ``docs``      manage the RAG document library: ``add`` uploads documents
+                (PDF with image captioning, markdown, text, CSV, JSON, logs,
+                DOCX), ``ls``/``rm`` list/remove them, ``reindex`` retries
+                failed or dropped files
 - ``diagnose``  one-shot read-only diagnosis of one host (symptom -> collect ->
                 RAG -> LLM -> actions). For interactive, iterative debugging use
                 ``debug``. ``--docs-lib`` points at the library managed by
@@ -59,7 +61,9 @@ import json
 import os
 import re
 import shlex
+import shutil
 import sys
+import zipfile
 from collections.abc import Callable
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
@@ -113,6 +117,7 @@ from ..targets import TargetError, TargetSpec, resolve_target
 from ..targets.aliases import AliasError, TargetAlias, load_targets, save_targets
 from . import ui
 from .credential_gate import apply_ssh_context
+from .learning_transfer import is_run_dir as _is_run_dir
 
 # ---- helpers ----
 
@@ -355,24 +360,27 @@ def _build_redfish_collector(domain: ConsoleDomain, store: SecretStore,
 
 def _build_retriever(docs_dir: str | None):
     """Build a RAG retriever over a directory of supported documents (PDF /
-    markdown / text / CSV). Returns None when absent."""
+    markdown / text / CSV / JSON / logs / DOCX). Returns None when absent."""
     if not docs_dir:
         return None
     try:
         from ..docs.ingest.chunk import CharTokenizer, Chunker
         from ..docs.ingest.library import SUPPORTED_SUFFIXES, parse_pages
+        from ..docs.ingest.pdf_parser import PdfParser
+        from ..docs.ingest.vision import vision_captioner
         from ..docs.retrieval.hybrid_search import HybridRetriever
         from ..docs.retrieval.rag import RagPipeline
     except ImportError:
         print("  [docs] extras not installed; install harness[docs] for --docs-dir",
               file=sys.stderr)
         return None
+    parser = PdfParser(ocr=vision_captioner())
     chunks = []
     for pdf in sorted(Path(docs_dir).iterdir()):
         if not pdf.is_file() or pdf.suffix.lower() not in SUPPORTED_SUFFIXES:
             continue
         try:
-            parsed = parse_pages(pdf)
+            parsed = parse_pages(pdf, pdf_parser=parser if pdf.suffix.lower() == ".pdf" else None)
         except Exception as exc:  # noqa: BLE001 - unreadable docs skipped, never fatal
             print(f"  [docs] skip {pdf.name}: {exc}", file=sys.stderr)
             continue
@@ -407,7 +415,7 @@ def _build_docs_retriever(args):
             return None, None
         if rag is None:
             print(f"  [docs] doc library {lib_dir!r} is empty; run 'harness docs add' "
-                  "to upload PDFs", file=sys.stderr)
+                  "to upload documents", file=sys.stderr)
             return None, None
         total = sum(e.chunks for e in library.entries())
         print(f"  [docs] using library {lib_dir!r}: {total} chunk(s)", file=sys.stderr)
@@ -717,10 +725,25 @@ def run_lint(args) -> int:
     return 0
 
 
+def _ingest_captioner():
+    """Vision captioner for docs ingest (PDF images -> searchable text).
+
+    Built from env config (``HARNESS_LLM_PROVIDER``/``HARNESS_LLM_URL``/...);
+    None when no LLM is configured or the docs extras are absent. Caption
+    failures latch off inside the captioner, so a dead endpoint costs one
+    attempt per ingest run and the library surfaces a warn line.
+    """
+    try:
+        from ..docs.ingest.vision import vision_captioner
+    except ImportError:
+        return None
+    return vision_captioner()
+
+
 def run_docs(args) -> int:
     """Manage the RAG document library: upload (add), list, remove, reindex."""
     from ..docs.ingest.library import DocLibrary
-    lib = DocLibrary(args.lib)
+    lib = DocLibrary(args.lib, ocr=_ingest_captioner())
     action = args.docs_action
     if action == "add":
         platform = getattr(args, "platform", None)
@@ -809,6 +832,27 @@ def _build_case_retriever(out_dir: str | Path):
 def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
     """One-shot read-only diagnosis; returns the scored, audited Diagnosis.
 
+    A run that aborts before producing ANY artifact (unreachable host,
+    credential refusal, Ctrl-C during collection, ...) leaves nothing behind:
+    the run dir is discarded unless it carries real evidence (dumps, prompt,
+    diagnosis, trace, test logs).
+    """
+    overrides = dict(overrides or {})
+    overrides.setdefault("trace", SessionTrace())
+    try:
+        return _diagnose_pipeline(args, overrides)
+    except BaseException:
+        out = Path(args.out_dir) / overrides["trace"].session_id
+        if _is_aborted_run(out):
+            shutil.rmtree(out, ignore_errors=True)
+            print(f"  discarded aborted run {out.name} (no artifacts)",
+                  file=sys.stderr)
+        raise
+
+
+def _diagnose_pipeline(args, overrides: dict) -> Diagnosis:
+    """One-shot read-only diagnosis; returns the scored, audited Diagnosis.
+
     For interactive, iterative debugging use ``harness debug`` (operator.repl).
     ``--context``/``--context-file`` add operator-supplied context lines to the
     diagnosis prompt (Operator Context section).
@@ -825,9 +869,8 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
     apply_ssh_context(store, target, ssh_user=getattr(args, "ssh_user", "diagbot"))
     host: Host = target.host
 
-    trace = SessionTrace()
+    trace: SessionTrace = overrides.get("trace") or SessionTrace()
     out = Path(args.out_dir) / trace.session_id
-    out.mkdir(parents=True, exist_ok=True)
 
     # Operator-supplied test logs: loaded BEFORE the retriever/audit so the
     # derived symptom, run_start event, doc retrieval, and case seeding all see
@@ -845,6 +888,11 @@ def run_diagnose(args, overrides: dict | None = None) -> Diagnosis:
         print("  error: a --symptom or --test-log is required to diagnose",
               file=sys.stderr)
         raise SystemExit(2)
+
+    # The run dir exists only from here on: a symptom-less invocation never
+    # leaves an empty dir, and the abort guard above discards dirs that never
+    # got past run_start.
+    out.mkdir(parents=True, exist_ok=True)
 
     bmc_password: str | None = None
     secrets: list[str] = []
@@ -1111,10 +1159,10 @@ def run_console(args) -> int:
                   file=sys.stderr)
             return 2
 
-    out = Path(args.out_dir) / SessionTrace().session_id if args.out_dir else None
+    trace = SessionTrace()
+    out = Path(args.out_dir) / trace.session_id if args.out_dir else None
     if out is not None:
         out.mkdir(parents=True, exist_ok=True)
-    trace = SessionTrace()
     log = AuditLog(out / "audit.jsonl", Redactor(secrets)) if out is not None else None
     if log is not None:
         log.append(trace.session_id, "console_start", {
@@ -1123,8 +1171,9 @@ def run_console(args) -> int:
             "trust_level": domain.trust_level, "probes": list(args.probe),
         })
 
-    console = SerialConsole(domain, store)
+    console = None
     try:
+        console = SerialConsole(domain, store)
         wire = [_absolutize_bmc_i2c_tools(c) for c in args.probe]
         result = console.run_probes(wire)
         redactor = Redactor(secrets)
@@ -1145,8 +1194,15 @@ def run_console(args) -> int:
             (out / "trace.json").write_text(
                 json.dumps(asdict(trace), indent=2), encoding="utf-8")
             (out / "console.txt").write_text(rendered, encoding="utf-8")
+    except BaseException:
+        if out is not None and _is_aborted_run(out):
+            shutil.rmtree(out, ignore_errors=True)
+            print(f"  discarded aborted run {out.name} (no artifacts)",
+                  file=sys.stderr)
+        raise
     finally:
-        console.close()
+        if console is not None:
+            console.close()
     return 0
 
 
@@ -1463,6 +1519,102 @@ def run_priors_update(args) -> int:
     return 0
 
 
+def run_learning_export(args) -> int:
+    """Bundle the learning factor (verified cases + priors + calibration +
+    full run dirs) into one zip to share with another device.
+
+    ``harness learning export [--out <zip>] [--out-dir harness_runs]
+    [--runs id,id] [--no-runs] [--no-calibration] [--no-priors] [--list]`` --
+    bundles are unredacted (hostnames, serials and evidence text): share
+    between YOUR devices only. ``--list`` previews without writing.
+    """
+    from .learning_transfer import export_bundle
+
+    out = Path(args.out) if args.out else Path(
+        "harness-learning-"
+        + datetime.now(UTC).strftime("%Y%m%d-%H%M%S") + ".zip")
+    run_ids = [s.strip() for s in (args.runs or "").split(",") if s.strip()]
+    try:
+        result = export_bundle(
+            out, Path(args.out_dir), cases_dir=args.cases, run_ids=run_ids,
+            include_runs=not args.no_runs,
+            include_calibration=not args.no_calibration,
+            include_priors=not args.no_priors, dry_run=args.list)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if result.unknown_runs:
+        print(f"warning: unknown run id(s): {', '.join(result.unknown_runs)}",
+              file=sys.stderr)
+    verb = "would export" if args.list else "exported"
+    print(f"{verb} {len(result.cases)} case(s), {len(result.runs)} run dir(s), "
+          f"{len(result.calibration)} calibration file(s), "
+          f"priors={'yes' if result.priors else 'no'}"
+          + ("" if args.list else f": {result.bundle}"))
+    if not (result.cases or result.runs or result.calibration or result.priors):
+        print("nothing to export (no cases, runs, calibration or priors yet)",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+def run_learning_import(args) -> int:
+    """Import a learning bundle into this device's run root.
+
+    ``harness learning import <bundle.zip> [--out-dir harness_runs]
+    [--revise] [--dry-run]`` -- existing run ids are SKIPPED (the case store
+    is append-only) unless ``--revise``, which replaces the bundle's versions
+    (audited as ``case_revised``). Integrity + schema checks run before
+    anything is written; ``--dry-run`` reports without writing.
+    """
+    from .learning_transfer import BundleError, import_bundle
+
+    try:
+        result = import_bundle(Path(args.bundle), Path(args.out_dir),
+                               cases_dir=args.cases, revise=args.revise,
+                               dry_run=args.dry_run)
+    except (BundleError, zipfile.BadZipFile, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    for rid, err in sorted(result.cases_failed.items()):
+        print(f"  failed case {rid}: {err}", file=sys.stderr)
+    print(("would import" if args.dry_run else "import:") + f" {result.summary()}")
+    return 0 if result.ok else 1
+
+
+def run_runs_delete(args) -> int:
+    """Delete one run's artifacts from the run root (housekeeping).
+
+    ``harness runs delete <run-id> [--drop-case] [--yes]`` -- refuses
+    anything that is not a run directory (reserved dirs such as cases/,
+    secrets/, sessions/, calibration/ can never be deleted this way). The
+    run's verified case (the learned fix) is KEPT unless ``--drop-case``.
+    """
+    from .menu import confirm
+
+    out_dir = Path(args.out_dir)
+    run_arg = Path(args.run)
+    run_dir = run_arg if run_arg.is_dir() else out_dir / args.run
+    if not _is_run_dir(run_dir) or run_dir.parent != out_dir:
+        print(f"error: not a run directory under {out_dir}: {run_dir}",
+              file=sys.stderr)
+        return 1
+    cases_dir = out_dir / "cases"
+    size = sum(f.stat().st_size for f in run_dir.rglob("*") if f.is_file())
+    has_case = (cases_dir / f"{run_dir.name}.json").exists()
+    print(f"  run {run_dir.name}: {_fmt_size(size)}, "
+          + ("has a verified case (the learned fix)" if has_case
+             else "no verified case"))
+    if not args.yes and not confirm(f"Permanently delete run {run_dir.name}?"):
+        print("  cancelled")
+        return 1
+    _remove_run(run_dir, cases_dir, drop_case=bool(args.drop_case))
+    if args.drop_case and has_case:
+        print(f"  verified case deleted: {cases_dir / (run_dir.name + '.json')}")
+    print(f"  deleted run {run_dir.name}")
+    return 0
+
+
 def _eval_llm(args) -> tuple:
     """LLM backend for eval replay: ``--llm {stub,openai,local,gemini}``.
 
@@ -1613,7 +1765,7 @@ _MAIN_ACTIONS: list[tuple[str, str]] = [
     ("chat", "Chat session        docs, past runs, or a referenced log file (no target)"),
     ("diagnose", "Debug a target       interactive agent debugging on one machine (iterative)"),
     ("runs", "Inspect past runs    verdicts, commands, evidence from earlier diagnoses"),
-    ("advanced", "Advanced             verify - console - model - docs - targets - secrets - setup - lint"),
+    ("advanced", "Advanced             verify - console - model - docs - targets - secrets - learning - setup - lint"),
     ("quit", "Quit"),
 ]
 
@@ -1624,6 +1776,7 @@ _ADVANCED_ACTIONS: list[tuple[str, str]] = [
     ("docs", "docs           manage the RAG document library"),
     ("targets", "targets        manage short target aliases"),
     ("secrets", "secrets        register credentials (non-agent, never in prompts)"),
+    ("learning", "learning       share verified fixes + runs (export/import bundle)"),
     ("setup", "setup          one-time wizard: API key, SSH key, inventory (first machine setup)"),
     ("lint", "lint           validate this inventory"),
     (_BACK, "Back to main menu"),
@@ -1651,6 +1804,7 @@ _ALLOWED_FLAGS: dict[str, tuple[str, ...]] = {
              "--session-dir"),
     "console": ("--secret-dir", "--out-dir", "--targets-file"),
     "verify": ("--secret-dir", "--targets-file"),
+    "learning": ("--out-dir",),
     "setup": ("--secret-dir",),
 }
 
@@ -1890,8 +2044,8 @@ def _menu_docs(args) -> int:
     from .menu import ask_text, select
 
     lib = getattr(args, "docs_lib", None) or "harness_docs"
-    actions = [("add", "add PDF(s)"), ("list", "list documents"),
-               ("rm", "remove a document"), ("reindex", "re-index all PDFs"),
+    actions = [("add", "add document(s)"), ("list", "list documents"),
+               ("rm", "remove a document"), ("reindex", "re-index all documents"),
                (_BACK, _BACK)]
     while True:
         idx = select("Doc library", [label for _, label in actions])
@@ -1901,7 +2055,7 @@ def _menu_docs(args) -> int:
         if key == _BACK:
             return 0
         if key == "add":
-            raw = ask_text("PDF path(s), space-separated").strip()
+            raw = ask_text("Document path(s), space-separated").strip()
             files = shlex.split(raw) if raw else []
             if files:
                 _run_wizard_sub(["docs", "--lib", lib, "add", *files])
@@ -1964,6 +2118,47 @@ def _menu_targets(args) -> int:
     return 0
 
 
+def _menu_learning(args) -> int:
+    """Export/import learning bundles from the Advanced menu. Export asks for
+    an optional bundle path; import always previews (``--dry-run``) first and
+    confirms before writing (and again before ``--revise``)."""
+    from .menu import ask_text, confirm, select
+
+    actions = [("export", "export - bundle this device's fixes + runs to share"),
+               ("import", "import - load a shared bundle into this device"),
+               (_BACK, _BACK)]
+    while True:
+        idx = select("Learning transfer", [label for _, label in actions])
+        if idx is None:
+            return 0
+        key = actions[idx][0]
+        if key == _BACK:
+            return 0
+        if key == "export":
+            out = ask_text(
+                "Bundle path (Enter = harness-learning-<timestamp>.zip)").strip()
+            argv = ["learning", "export"]
+            if out:
+                argv += ["--out", out]
+            _run_wizard_sub(argv + _wizard_flags(args, "learning"))
+        else:
+            bundle = ask_text("Bundle path").strip()
+            if not bundle:
+                print("  cancelled: no bundle path")
+                continue
+            preview = ["learning", "import", bundle, "--dry-run"]
+            if _run_wizard_sub(preview + _wizard_flags(args, "learning")) != 0:
+                continue
+            if not confirm("Proceed with import?"):
+                print("  cancelled")
+                continue
+            argv = ["learning", "import", bundle]
+            if confirm("Replace existing records (--revise)?"):
+                argv.append("--revise")
+            _run_wizard_sub(argv + _wizard_flags(args, "learning"))
+    return 0
+
+
 def _menu_secrets(args) -> int:
     from .menu import ask_text, select
 
@@ -2022,23 +2217,11 @@ def _menu_secrets(args) -> int:
 
 # ---- past-run inspection (runs menu) ----
 
-#: A directory must contain at least one of these to be a diagnosable run
-#: (``dumps/`` alone also qualifies). Reserved harness_runs subdirectories are
-#: never runs regardless of contents.
-_RUN_ARTIFACTS = ("audit.jsonl", "diagnosis.json", "trace.json",
-                  "pending_case.json", "run_meta.json", "prompt.txt",
-                  "prompt_turns.jsonl", "dumps.json")
-_RUN_RESERVED_DIRS = frozenset({"sessions", "cases", "secrets", "calibration"})
+# Run-dir detection (_is_run_dir) lives in learning_transfer so bundle export
+# and the runs menu agree on what a run is.
 
 #: ``Product Serial : 4CX1234`` from ``ipmitool fru print`` collector output.
 _FRU_SERIAL_RE = re.compile(r"Product Serial\s*:\s*(\S+)")
-
-
-def _is_run_dir(path: Path) -> bool:
-    if path.name in _RUN_RESERVED_DIRS or not path.is_dir():
-        return False
-    return any((path / m).exists() for m in _RUN_ARTIFACTS) \
-        or (path / "dumps").is_dir()
 
 
 def _run_start_event(run_dir: Path) -> tuple[dict, str | None]:
@@ -2250,6 +2433,56 @@ def _print_artifact(path: Path) -> None:
     print(path.read_text(encoding="utf-8"))
 
 
+def _is_aborted_run(run_dir: Path) -> bool:
+    """Aborted run: nothing was ever produced beyond the audit log (or the
+    dir is empty). Real runs carry dumps/, prompt, diagnosis, trace,
+    test_logs or chat turns -- those are never classified as aborted."""
+    if not run_dir.is_dir():
+        return False
+    return {p.name for p in run_dir.iterdir()} <= {"audit.jsonl"}
+
+
+def _fmt_size(nbytes: int) -> str:
+    value = float(nbytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
+
+
+def _remove_run(run_dir: Path, cases_dir: Path, *, drop_case: bool) -> None:
+    """Delete one run's artifacts; optionally its verified case (learning)."""
+    shutil.rmtree(run_dir)
+    if drop_case:
+        from ..diagnosis.case_store import CaseStore
+
+        CaseStore(cases_dir).delete(run_dir.name)
+
+
+def _delete_run(run_dir: Path, cases_dir: Path) -> bool:
+    """Interactive per-run delete from the runs menu. The verified case (the
+    learned fix) is KEPT by default; a second confirm removes it too."""
+    from ..diagnosis.case_store import CaseStore
+    from .menu import confirm
+
+    size = sum(f.stat().st_size for f in run_dir.rglob("*") if f.is_file())
+    has_case = (cases_dir / f"{run_dir.name}.json").exists()
+    print(f"  run {run_dir.name}: {_fmt_size(size)}, "
+          + ("has a verified case (the learned fix)" if has_case
+             else "no verified case"))
+    if not confirm(f"Permanently delete run {run_dir.name}?"):
+        print("  cancelled")
+        return False
+    if has_case and confirm(
+            "Also delete its verified case (the learned fix)?"):
+        CaseStore(cases_dir).delete(run_dir.name)
+        print("  verified case deleted")
+    shutil.rmtree(run_dir)
+    print(f"  deleted run {run_dir.name}")
+    return True
+
+
 def _menu_runs(args) -> int:
     """Inspect a previous run end to end: verdict, command pathway, the exact
     prompt(s) sent to the LLM, the raw collector evidence -- and label the
@@ -2263,12 +2496,12 @@ def _menu_runs(args) -> int:
 
     out_dir = Path(getattr(args, "out_dir", "harness_runs"))
     cases_dir = out_dir / "cases"
-    runs = sorted((p for p in out_dir.glob("*") if _is_run_dir(p)),
-                  key=lambda p: p.stat().st_mtime, reverse=True)
-    if not runs:
-        print(f"  no runs yet under {out_dir}")
-        return 0
     while True:
+        runs = sorted((p for p in out_dir.glob("*") if _is_run_dir(p)),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+        if not runs:
+            print(f"  no runs yet under {out_dir}")
+            return 0
         pick = select("Run (most recent first)",
                       [_summarize_run(p, cases_dir) for p in runs])
         if pick is None:
@@ -2282,6 +2515,7 @@ def _menu_runs(args) -> int:
             ("dumps", "dumps    - raw collector evidence files"),
             ("fix", "fix      - recommended vs. labeled correct fix (learning loop)"),
             ("label", "label    - record/revise the correct fix + outcome"),
+            ("delete", "delete   - remove this run's artifacts from disk (confirm)"),
             (_BACK, _BACK),
         ]
         while True:
@@ -2303,6 +2537,8 @@ def _menu_runs(args) -> int:
                 _print_run_fix(run_dir, cases_dir)
             elif key == "label":
                 _label_run(run_dir, cases_dir)
+            elif key == "delete" and _delete_run(run_dir, cases_dir):
+                break  # run is gone: back to the refreshed list
 
 
 def _print_run_prompt(run_dir: Path) -> None:
@@ -2677,6 +2913,8 @@ def run_menu(args) -> int:
                     _menu_targets(args)
                 elif key == "secrets":
                     _menu_secrets(args)
+                elif key == "learning":
+                    _menu_learning(args)
                 elif key == "setup":
                     _run_wizard_sub(["setup", "--inventory", str(inv_path)]
                                     + _wizard_flags(args, "setup"))
@@ -2697,8 +2935,12 @@ def run_menu(args) -> int:
             if key == "advanced":
                 _run_advanced()
             elif key == "chat":
-                # Chat mode is target-less: no inventory/target pick at all.
+                # Chat mode is target-less; the inventory (when the menu has
+                # one) only enables the rack-manager hop for tunnel-backed
+                # models (the remembered profile carries `tunnel:`).
                 argv = ["chat"]
+                if inv_path:
+                    argv += ["--inventory", str(inv_path)]
                 argv += _wizard_flags(args, "chat")
                 _run_wizard_sub(argv)
             elif key == "diagnose":
@@ -2965,7 +3207,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--docs-lib", default=None,
                    help="RAG document library (default: harness_docs/ if it exists)")
     p.add_argument("--docs-dir", default=None,
-                   help="directory of architecture PDFs (legacy; prefer --docs-lib)")
+                   help="directory of architecture documents (PDF, md, txt, csv, "
+                        "json, log, docx; legacy; prefer --docs-lib)")
     p.add_argument("--parts-csv", default=None,
                    help="parts list CSV (columns: slot,fru,pn,sn)")
     p.add_argument("--ask-parts", action="store_true",
@@ -2985,12 +3228,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--inventory", required=True)
     p.set_defaults(func=run_lint)
 
-    p = sub.add_parser("docs", help="manage the RAG document library (upload PDFs / markdown / text / CSV)")
+    p = sub.add_parser("docs", help="manage the RAG document library (upload PDF / "
+                                    "markdown / text / CSV / JSON / log / DOCX)")
     p.add_argument("--lib", default="harness_docs",
                    help="library directory (default: harness_docs)")
     docs_sub = p.add_subparsers(dest="docs_action", required=True)
     a = docs_sub.add_parser("add", help="upload document(s) into the library and index them")
-    a.add_argument("files", nargs="+", help="file(s) to upload (pdf, md, txt, csv)")
+    a.add_argument("files", nargs="+",
+                   help="file(s) to upload (pdf, md, txt, csv, json, log, docx)")
     a.add_argument("--platform", default=None,
                    help="canonical model key to tag the documents with (retrieval "
                         "is filtered to the detected server model)")
@@ -3094,7 +3339,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--docs-lib", default=None,
                    help="RAG document library managed by 'harness docs'")
     p.add_argument("--docs-dir", default=None,
-                   help="directory of architecture PDFs used for RAG "
+                   help="directory of architecture documents used for RAG "
                        "(legacy ad-hoc; prefer --docs-lib)")
     p.add_argument("--parts-csv", help="parts list CSV (columns: slot,fru,pn,sn)")
     p.add_argument("--ask-parts", action="store_true",
@@ -3132,7 +3377,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--docs-lib", default=None,
                    help="RAG document library managed by 'harness docs'")
     p.add_argument("--docs-dir", default=None,
-                   help="directory of architecture PDFs used for RAG "
+                   help="directory of architecture documents used for RAG "
                        "(legacy ad-hoc; prefer --docs-lib)")
     p.add_argument("--out-dir", default="harness_runs",
                    help="where past runs are looked up (run tool) and case files live")
@@ -3145,6 +3390,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cases-dir", default="harness_runs/cases",
                    help="case store dir; prior verified fixes matched against "
                         "referenced log files come from here")
+    p.add_argument("--inventory", default=None,
+                   help="used ONLY when the model needs the rack-manager tunnel "
+                        "hop (one inventory under config/ is auto-used; chat "
+                        "itself never resolves targets)")
     _add_llm_args(p)
     p.add_argument("--llm-model", default=None,
                    help="specific LLM model for conversation, e.g. "
@@ -3302,6 +3551,70 @@ def build_parser() -> argparse.ArgumentParser:
     priors_update.add_argument("--min-verified", type=int, default=10,
                                help="minimum outcome-recorded cases before priors activate")
     priors_update.set_defaults(func=run_priors_update)
+
+    p = sub.add_parser(
+        "learning",
+        help="share the learning factor between devices: verified fixes, "
+             "priors, calibration and run artifacts (unredacted bundles)")
+    learning_sub = p.add_subparsers(dest="learning_action", required=True)
+
+    learning_export = learning_sub.add_parser(
+        "export",
+        help="bundle cases + priors + calibration + run dirs into one zip")
+    learning_export.add_argument(
+        "--out", default=None,
+        help="bundle path (default: harness-learning-<timestamp>.zip)")
+    learning_export.add_argument("--out-dir", default="harness_runs",
+                                 help="run directory root (default: harness_runs)")
+    learning_export.add_argument("--cases", default=None,
+                                 help="case store dir (default: <out-dir>/cases)")
+    learning_export.add_argument("--runs", default=None,
+                                 help="comma-separated run ids (default: all)")
+    learning_export.add_argument("--no-runs", action="store_true",
+                                 help="skip full run dirs (cases + derived only)")
+    learning_export.add_argument("--no-calibration", action="store_true",
+                                 help="skip per-LLM calibration files")
+    learning_export.add_argument("--no-priors", action="store_true",
+                                 help="skip the priors file")
+    learning_export.add_argument("--list", action="store_true",
+                                 help="preview what would be exported, write nothing")
+    learning_export.set_defaults(func=run_learning_export)
+
+    learning_import = learning_sub.add_parser(
+        "import",
+        help="import a learning bundle (skips known run ids unless --revise)")
+    learning_import.add_argument("bundle", help="bundle .zip path")
+    learning_import.add_argument("--out-dir", default="harness_runs",
+                                 help="run directory root (default: harness_runs)")
+    learning_import.add_argument("--cases", default=None,
+                                 help="case store dir (default: <out-dir>/cases)")
+    learning_import.add_argument(
+        "--revise", action="store_true",
+        help="replace existing cases/run dirs/calibration with the bundle's "
+             "versions (cases audited as case_revised)")
+    learning_import.add_argument(
+        "--dry-run", action="store_true",
+        help="show what would happen without writing anything")
+    learning_import.set_defaults(func=run_learning_import)
+
+    p = sub.add_parser(
+        "runs",
+        help="manage stored runs: delete a run's artifacts")
+    runs_sub = p.add_subparsers(dest="runs_action", required=True)
+    runs_delete = runs_sub.add_parser(
+        "delete",
+        help="delete one run's artifacts (its verified case is kept unless "
+             "--drop-case)")
+    runs_delete.add_argument("run",
+                             help="run id (or a path to the run directory)")
+    runs_delete.add_argument(
+        "--drop-case", action="store_true",
+        help="also delete the run's verified case (the learned fix)")
+    runs_delete.add_argument("--yes", action="store_true",
+                             help="skip the confirmation prompt")
+    runs_delete.add_argument("--out-dir", default="harness_runs",
+                             help="run directory root (default: harness_runs)")
+    runs_delete.set_defaults(func=run_runs_delete)
 
     p = sub.add_parser(
         "eval",

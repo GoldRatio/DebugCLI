@@ -515,7 +515,7 @@ def test_main_and_advanced_menu_shapes():
         "chat", "diagnose", "runs", "advanced", "quit"]
     adv_keys = [k for k, _ in cli_mod._ADVANCED_ACTIONS]
     assert adv_keys == ["verify", "console", "model", "docs", "targets",
-                        "secrets", "setup", "lint", cli_mod._BACK]
+                        "secrets", "learning", "setup", "lint", cli_mod._BACK]
     # labels are user-facing copy: no raw command names as the whole label
     assert "Debug a target" in dict(cli_mod._MAIN_ACTIONS)["diagnose"]
 
@@ -570,7 +570,9 @@ def test_run_menu_diagnose_builds_debug_argv(tmp_path, monkeypatch, capsys):
 
 
 def test_run_menu_chat_builds_argv_without_target(tmp_path, monkeypatch):
-    """The Chat entry is target-less: no _pick_target, `chat` argv."""
+    """The Chat entry is target-less: no _pick_target, no target argv. The
+    menu's inventory rides along only so tunnel-backed models can open the
+    LLM hop."""
     _write_inventory(tmp_path)
     monkeypatch.chdir(tmp_path)
     from harness.operator import menu as menu_mod
@@ -588,8 +590,10 @@ def test_run_menu_chat_builds_argv_without_target(tmp_path, monkeypatch):
 
     assert run_menu(_menu_args()) == 0
     assert built and built[0][0] == "chat"
-    assert "--inventory" not in built[0]
     assert "--host" not in built[0]
+    assert "--rack" not in built[0] and "--cable" not in built[0]
+    assert "--address" not in built[0] and "--target" not in built[0]
+    assert built[0][built[0].index("--inventory") + 1] == "inventory.yaml"
 
 
 # ---- runs inspection menu ----
@@ -609,8 +613,8 @@ def test_menu_runs_verdict_view(tmp_path, monkeypatch, capsys):
     base = _fake_run_dir(tmp_path, "abc123", {
         "diagnosis.json": '{"state": "healthy", "confidence": 0.8}'})
     args = SimpleNamespace(out_dir=str(base / "harness_runs"))
-    # 0 = run, 0 = verdict, 6 = back
-    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 0, 6]))
+    # 0 = run, 0 = verdict, 7 = back
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 0, 7]))
     assert _menu_runs(args) == 0
     out = capsys.readouterr().out
     assert "healthy" in out
@@ -622,8 +626,8 @@ def test_menu_runs_prompt_turns_view(tmp_path, monkeypatch, capsys):
         "prompt_turns.jsonl": '{"turn": 1, "messages": [{"role": "user", '
                               '"content": "evidence block"}]}\n'})
     args = SimpleNamespace(out_dir=str(base / "harness_runs"))
-    # 0 = run, 2 = prompt, 0 = turn 1, 6 = back
-    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 2, 0, 6]))
+    # 0 = run, 2 = prompt, 0 = turn 1, 7 = back
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 2, 0, 7]))
     assert _menu_runs(args) == 0
     assert "evidence block" in capsys.readouterr().out
 
@@ -633,8 +637,8 @@ def test_menu_runs_dumps_view(tmp_path, monkeypatch, capsys):
     base = _fake_run_dir(tmp_path, "ghi789", {
         "dumps/ipmi_0.txt": "sensor data here"})
     args = SimpleNamespace(out_dir=str(base / "harness_runs"))
-    # 0 = run, 3 = dumps, 0 = first dump file, 6 = back
-    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 3, 0, 6]))
+    # 0 = run, 3 = dumps, 0 = first dump file, 7 = back
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 3, 0, 7]))
     assert _menu_runs(args) == 0
     assert "sensor data here" in capsys.readouterr().out
 
@@ -653,10 +657,73 @@ def test_menu_runs_missing_artifact(tmp_path, monkeypatch, capsys):
         "pending_case.json": '{"run_id": "jkl012", "target_id": "x", '
                              '"symptom": "?"}'})
     args = SimpleNamespace(out_dir=str(base / "harness_runs"))
-    # 0 = run, 2 = prompt (missing artifact), 4 = fix, 6 = back
-    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 2, 4, 6]))
+    # 0 = run, 2 = prompt (missing artifact), 4 = fix, 7 = back
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 2, 4, 7]))
     assert _menu_runs(args) == 0
     assert "no prompt artifact" in capsys.readouterr().out
+
+
+# ---- runs menu: delete ----
+
+def _run_with_case(base, run_id="abc123"):
+    """A run dir plus its verified case in the (created) case store."""
+    from harness.diagnosis.case_store import CaseStore
+    from harness.diagnosis.schema import CaseOutcome
+
+    run = base / "harness_runs" / run_id
+    run.mkdir(parents=True, exist_ok=True)
+    (run / "diagnosis.json").write_text('{"state": "healthy"}', encoding="utf-8")
+    cases = base / "harness_runs" / "cases"
+    CaseStore(cases).record(CaseOutcome(
+        run_id=run_id, target_id="t", symptom="s", model_key="m",
+        outcome="fixed", actions_recommended=[], actions_taken=[],
+        llm_ident="stub", evidence_summary=[]))
+    return run, cases
+
+
+def test_menu_runs_delete_keeps_case_by_default(tmp_path, monkeypatch, capsys):
+    from harness.operator import menu as menu_mod
+    run, cases = _run_with_case(tmp_path)
+    args = SimpleNamespace(out_dir=str(tmp_path / "harness_runs"))
+    # 0 = run, 6 = delete; confirms: yes (delete run), no (keep case)
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 6]))
+    answers = iter([True, False])
+    monkeypatch.setattr(menu_mod, "confirm",
+                        lambda prompt, default=False: next(answers))
+    assert _menu_runs(args) == 0
+    out = capsys.readouterr().out
+    assert "deleted run abc123" in out
+    assert not run.exists()
+    assert (cases / "abc123.json").exists()
+
+
+def test_menu_runs_delete_also_drops_case(tmp_path, monkeypatch, capsys):
+    from harness.operator import menu as menu_mod
+    _run, cases = _run_with_case(tmp_path)
+    args = SimpleNamespace(out_dir=str(tmp_path / "harness_runs"))
+    # 0 = run, 6 = delete; confirms: yes (delete run), yes (drop case)
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 6]))
+    answers = iter([True, True])
+    monkeypatch.setattr(menu_mod, "confirm",
+                        lambda prompt, default=False: next(answers))
+    assert _menu_runs(args) == 0
+    out = capsys.readouterr().out
+    assert "verified case deleted" in out
+    assert not (cases / "abc123.json").exists()
+
+
+def test_menu_runs_delete_cancelled(tmp_path, monkeypatch, capsys):
+    from harness.operator import menu as menu_mod
+    run, cases = _run_with_case(tmp_path)
+    args = SimpleNamespace(out_dir=str(tmp_path / "harness_runs"))
+    # 0 = run, 6 = delete (confirm no), 7 = back
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 6, 7]))
+    monkeypatch.setattr(menu_mod, "confirm", lambda prompt, default=False: False)
+    assert _menu_runs(args) == 0
+    out = capsys.readouterr().out
+    assert "cancelled" in out
+    assert run.exists()
+    assert (cases / "abc123.json").exists()
 
 
 # ---- run listing labels / run metadata ----

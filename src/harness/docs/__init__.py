@@ -1,5 +1,7 @@
-"""docs: PDF ingestion, hybrid retrieval/RAG, and the physical parts graph.
+"""docs: document ingestion (PDF + text formats, vision image captioning),
+hybrid retrieval/RAG, and the physical parts graph.
 
 ``docs`` does NOT depend on ``inspect`` (see spec dependency order). The curated
-register catalog lives in ``inspect``; ``docs`` only ingests/retrieves the raw PDFs.
+register catalog lives in ``inspect``; ``docs`` only ingests/retrieves the
+uploaded documents.
 """

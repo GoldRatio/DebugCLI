@@ -8,15 +8,17 @@ Layout of a library directory::
       index.json       manifest: name -> sha256/size/chunks/error/ingested_at
       chunks.jsonl     cached chunks (text/title/page/index) for fast retrieval
 
-``add`` copies files in (PDF / Markdown / plain text / CSV), re-parses only
-files whose sha256 changed (or failed before), and records the manifest
-atomically. ``rm``/``ls``/``reindex`` manage the store, and ``build_retriever``
-returns a ``RagPipeline`` over the cached chunks without touching the sources
-again.
+``add`` copies files in (PDF / Markdown / plain text / CSV / JSON / logs /
+DOCX), re-parses only files whose sha256 changed (or failed before), and
+records the manifest atomically. ``rm``/``ls``/``reindex`` manage the store,
+and ``build_retriever`` returns a ``RagPipeline`` over the cached chunks
+without touching the sources again.
 
-Parsing is dispatched on file extension: PDFs use the injectable (layout-aware)
-``PdfParser`` -- injectable so the library is testable without pymupdf -- while
-markdown/text/CSV use the lightweight parsers in ``text_parser``.
+Parsing is dispatched on file extension: PDFs use the layout-aware
+``PdfParser`` -- injectable so the library is testable without pymupdf, with an
+optional ``ocr`` hook (typically the vision captioner in ``vision.py``) that
+captures scanned pages and embedded diagram images -- while markdown/text/CSV/
+JSON/DOCX use the lightweight parsers in ``text_parser``.
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ from ..retrieval.hybrid_search import HybridRetriever
 from ..retrieval.rag import RagPipeline
 from .chunk import CharTokenizer, Chunk, Chunker
 from .pdf_parser import PageText, PdfParser
-from .text_parser import _CsvParser, _MarkdownParser, _PlainTextParser
+from .text_parser import _CsvParser, _DocxParser, _JsonParser, _MarkdownParser, _PlainTextParser
 
 MANIFEST = "index.json"
 CHUNKS = "chunks.jsonl"
@@ -46,7 +48,10 @@ _TEXT_PARSERS: dict[str, Callable[[], object]] = {
     ".markdown": _MarkdownParser,
     ".txt": _PlainTextParser,
     ".text": _PlainTextParser,
+    ".log": _PlainTextParser,
     ".csv": _CsvParser,
+    ".json": _JsonParser,
+    ".docx": _DocxParser,
 }
 
 SUPPORTED_SUFFIXES = frozenset({".pdf"} | set(_TEXT_PARSERS))
@@ -71,6 +76,22 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _ocr_failures(ocr) -> int:
+    return int(getattr(ocr, "failures", 0) or 0)
+
+
+def _append_ocr_warn(status: list[str], ocr, before: int) -> None:
+    """One warn line when image captioning failed during this batch.
+
+    The captioner latches off after its first failure (no per-page endpoint
+    hammering), so the count is surfaced as a batch-level condition, not a
+    per-image tally; ``docs reindex`` retries once the endpoint is back.
+    """
+    if _ocr_failures(ocr) > before:
+        status.append("warn: image captioning failed (LLM unavailable) -- scanned "
+                      "pages/diagram images were skipped; 'docs reindex' retries")
+
+
 def parse_pages(path: Path, pdf_parser: Parser | None = None) -> list[PageText]:
     """Parse a source file (PDF / markdown / text / CSV) into ``PageText`` list.
 
@@ -87,12 +108,18 @@ def parse_pages(path: Path, pdf_parser: Parser | None = None) -> list[PageText]:
 
 
 class DocLibrary:
-    def __init__(self, root: str | Path, parser: Parser | None = None) -> None:
+    def __init__(self, root: str | Path, parser: Parser | None = None,
+                 ocr: Callable[[bytes], str] | None = None) -> None:
+        """``parser`` overrides PDF parsing entirely (tests); ``ocr`` is the
+        image-captioning hook handed to the default ``PdfParser`` (vision
+        ingest; see ``vision.py``). Late-bound so monkeypatched ``PdfParser``
+        test fakes keep working."""
         self.root = Path(root)
         self.pdfs_dir = self.root / PDFS
         self.manifest_path = self.root / MANIFEST
         self.chunks_path = self.root / CHUNKS
         self.parser = parser
+        self.ocr = ocr
 
     # ---- manifest ----
 
@@ -135,6 +162,7 @@ class DocLibrary:
         manifest = self._manifest()
         status: list[str] = []
         changed = False
+        ocr_before = _ocr_failures(self.ocr)
         for raw in files:
             src = Path(raw)
             if not src.is_file():
@@ -171,6 +199,7 @@ class DocLibrary:
             changed = True
         if changed:
             self._save_manifest(manifest)
+        _append_ocr_warn(status, self.ocr, ocr_before)
         return status
 
     def reindex(self) -> list[str]:
@@ -181,6 +210,7 @@ class DocLibrary:
         manifest = self._manifest()
         status: list[str] = []
         changed = False
+        ocr_before = _ocr_failures(self.ocr)
         files = sorted(
             f for f in self.pdfs_dir.iterdir()
             if f.is_file() and f.suffix.lower() in SUPPORTED_SUFFIXES)
@@ -206,6 +236,7 @@ class DocLibrary:
         if changed:
             self._save_chunks(self._all_chunks(manifest))
             self._save_manifest(manifest)
+        _append_ocr_warn(status, self.ocr, ocr_before)
         return status or ["nothing to do"]
 
     def remove(self, name: str) -> str:
@@ -259,7 +290,8 @@ class DocLibrary:
     # ---- internals ----
 
     def _parse_doc(self, name: str, platform: str | None = None) -> tuple[list[Chunk], str | None]:
-        """Parse any supported source file (PDF / markdown / text / CSV) into chunks."""
+        """Parse any supported source file (PDF / markdown / text / CSV / JSON /
+        log / DOCX) into chunks."""
         path = self.pdfs_dir / name
         try:
             pages = self._pages(path)
@@ -274,6 +306,9 @@ class DocLibrary:
         return chunks, None
 
     def _pages(self, path: Path) -> list[PageText]:
+        if self.parser is None and self.ocr is not None and path.suffix.lower() == ".pdf":
+            # Late-bound so monkeypatched PdfParser test fakes keep working.
+            return PdfParser(ocr=self.ocr).parse(path)
         return parse_pages(path, pdf_parser=self.parser)
 
     def _all_chunks(self, manifest: dict[str, dict]) -> list[Chunk]:

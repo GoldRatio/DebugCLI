@@ -31,7 +31,7 @@ src/harness/
 symptom ─▶ plan.symptom -> subsystem ─▶ minimal collector set
    ─▶ engine.runner (allowlist + force_read_only) ─▶ RegisterDump per probe
    ─▶ inspect.decoder ─▶ evidence
-   ─▶ docs.retrieval (RAG over PDFs, seeded by symptom + test-log failures)
+   ─▶ docs.retrieval (RAG over ingested documents, seeded by symptom + test-log failures)
         + parts graph ─▶ context
    ─▶ diagnosis.engine (LLM) ─▶ prioritized repair actions (JSON schema)
    ─▶ diagnosis.scorer + diagnosis.verifier (baseline compare)

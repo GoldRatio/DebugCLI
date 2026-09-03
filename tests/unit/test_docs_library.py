@@ -233,3 +233,48 @@ def test_remove_text_file(tmp_path):
     assert lib.entries() == []
     assert not (tmp_path / "lib" / "pdfs" / "a.md").exists()
     assert lib.build_retriever() is None
+
+
+def test_add_json_flattened_for_search(tmp_path):
+    lib = DocLibrary(tmp_path / "lib")
+    js = tmp_path / "sensors.json"
+    js.write_text(
+        '{"sensor": {"name": "CPU0 Temp", "reading": "72C",'
+        ' "status": "threshold_high"}}', encoding="utf-8")
+
+    status = lib.add([js])
+    assert any("indexed sensors.json" in s for s in status)
+    text = "\n".join(c.text for c in lib._load_chunks())
+    assert "sensor.name: CPU0 Temp" in text
+    assert "sensor.status: threshold_high" in text
+    lines = lib.build_retriever().lines("CPU0 Temp threshold_high", top_k=1)
+    assert lines and "[sensors.json p.1]" in lines[0]
+
+
+def test_add_log_file(tmp_path):
+    lib = DocLibrary(tmp_path / "lib")
+    log = tmp_path / "sel.log"
+    log.write_text("SEL: corrected ECC error on DIMM A1\nSEL: PSU0 input lost\n",
+                   encoding="utf-8")
+
+    status = lib.add([log])
+    assert any("indexed sel.log" in s for s in status)
+    lines = lib.build_retriever().lines("corrected ECC DIMM A1", top_k=1)
+    assert lines and "[sel.log p.1]" in lines[0]
+
+
+def test_add_docx_without_dependency_records_error(tmp_path, monkeypatch):
+    """A .docx without python-docx is a staged per-file error, never a batch
+    failure (and this stays true even when the dependency IS installed)."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "docx", None)  # force the ImportError path
+    lib = DocLibrary(tmp_path / "lib")
+    docx = tmp_path / "guide.docx"
+    docx.write_bytes(b"PK\x03\x04 fake docx")
+
+    status = lib.add([docx])
+    assert any("FAILED guide.docx" in s for s in status)
+    entry = lib.entries()[0]
+    assert entry.error and "python-docx" in entry.error
+    assert lib.build_retriever() is None  # no chunks cached for the failed file

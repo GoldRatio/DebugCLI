@@ -24,8 +24,10 @@ approves — any actual repair.
   per-server config files needed. It can also pull read-only evidence straight
   from the rack manager's Redfish API (event log, service conditions) without
   opening a serial session at all.
-- **Understands your documentation.** Add your vendor's architecture PDFs and
-  the AI cites them (title + page) instead of guessing.
+- **Understands your documentation.** Add your vendor's architecture documents
+  (PDF — including diagrams and scanned pages via vision captioning — Markdown,
+  text, CSV, JSON, logs, DOCX) and the AI cites them (title + page) instead of
+  guessing.
 - **Keeps secrets secret.** Passwords and keys are asked for once, stored
   locally, and never shown to the AI model or written into any log.
 - **Leaves a paper trail.** Every run is archived in `harness_runs/<id>/` with
@@ -260,6 +262,13 @@ harness priors update                  # rebuild subsystem priors from outcomes
 harness calibrate                      # rebuild per-model fix-rate calibration
 ```
 
+To carry that learning to another workstation, bundle it up:
+
+```powershell
+harness learning export                       # one zip: cases + priors + calibration + runs
+harness learning import <bundle.zip>          # on the other device (skips known runs; --revise to replace)
+```
+
 ## Safety and privacy, in short
 
 - **Read-only by construction** — every command passes a single runner choke
@@ -293,6 +302,8 @@ harness calibrate                      # rebuild per-model fix-rate calibration
 | `harness targets add \| ls \| rm` | Short aliases for repeated targets |
 | `harness label --run <id>` / `harness report --run <id>` | Record a run's verified outcome (learning loop) |
 | `harness calibrate` / `harness priors update` | Rebuild calibration / subsystem priors |
+| `harness learning export \| import` | Move the learning factor (verified fixes, priors, calibration, runs) between devices |
+| `harness runs delete <id> [--drop-case]` | Delete a run's artifacts (its verified case is kept unless `--drop-case`) |
 | `harness eval` | Offline regression replay against the case baseline |
 
 Common `diagnose`/`debug`/`chat` flags: `--inventory` (diagnose/debug),

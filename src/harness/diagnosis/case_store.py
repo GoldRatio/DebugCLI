@@ -126,6 +126,20 @@ class CaseStore:
             return None
         return CaseOutcome.model_validate_json(path.read_text(encoding="utf-8"))
 
+    def delete(self, run_id: str) -> bool:
+        """Remove a case record and rebuild the index.
+
+        The ONE deliberate exception to the append-only rule: used only by
+        explicit run deletion (runs menu / ``harness runs delete``), never by
+        the learning loop itself. Returns True when a record was removed.
+        """
+        path = self.root / f"{run_id}.json"
+        if not path.exists():
+            return False
+        path.unlink()
+        self._rebuild_index()
+        return True
+
     def all(self) -> list[CaseOutcome]:
         """All records, ordered by index manifest when present else file mtime."""
         ordered = self._indexed_order()

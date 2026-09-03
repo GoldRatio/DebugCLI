@@ -51,7 +51,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import ClassVar, TextIO
 
-from ..config.inventory_lint import load_inventory
+from ..config.inventory_lint import InventoryError, load_inventory
 from ..config.vault import SecretStore
 from ..diagnosis.schema import Diagnosis
 from ..inspect.base import RegisterDump
@@ -413,7 +413,7 @@ def _tool_docs(session: Session, turn: ChatTurn) -> str:
     retriever, _lib = _build_docs_retriever(SimpleNamespace(
         docs_lib=session.docs_lib, docs_dir=session.docs_dir))
     if retriever is None:
-        return "(no doc library; use `harness docs add` to upload PDFs)"
+        return "(no doc library; use `harness docs add` to upload documents)"
     lines = retriever(turn.query or "", None)
     if not lines:
         return f"(no snippets matched {turn.query!r})"
@@ -1164,11 +1164,12 @@ def _slash_targets(session: Session, arg: str) -> None:
 
 
 def _slash_docs(session: Session, arg: str) -> None:
-    """``/docs ls | add <pdf...> | rm <name> | reindex`` -- manage the RAG
+    """``/docs ls | add <file...> | rm <name> | reindex`` -- manage the RAG
     document library without leaving the session."""
     from ..docs.ingest.library import DocLibrary
+    from ..docs.ingest.vision import vision_captioner
 
-    lib = DocLibrary(session.docs_lib or "harness_docs")
+    lib = DocLibrary(session.docs_lib or "harness_docs", ocr=vision_captioner())
     parts = arg.split(None, 1)
     action = parts[0] if parts else "ls"
     rest = parts[1] if len(parts) > 1 else ""
@@ -1184,7 +1185,7 @@ def _slash_docs(session: Session, arg: str) -> None:
         elif action == "add":
             files = shlex.split(rest)
             if not files:
-                _print_line(session, "  usage: /docs add <pdf> [pdf ...]")
+                _print_line(session, "  usage: /docs add <file> [file ...]")
                 return
             for line in lib.add(files):
                 _print_line(session, f"  {line}")
@@ -1197,7 +1198,7 @@ def _slash_docs(session: Session, arg: str) -> None:
             for line in lib.reindex():
                 _print_line(session, f"  {line}")
         else:
-            _print_line(session, "  usage: /docs ls | add <pdf...> | rm <name> | reindex")
+            _print_line(session, "  usage: /docs ls | add <file...> | rm <name> | reindex")
     except KeyError as exc:
         _print_line(session, f"  x {exc.args[0] if exc.args else exc}")
 
@@ -1332,7 +1333,7 @@ _HELP_CHAT = """\
 /runs      run directories of this session
 /history   saved sessions
 /resume    load a saved session dir
-/docs      ls | add <pdf...> | rm <name> | reindex  (RAG library)
+/docs      ls | add <file...> | rm <name> | reindex  (RAG library)
 /quit      exit
 
 Anything else goes to the agent in natural language, e.g.
@@ -1360,7 +1361,7 @@ _HELP_DEBUG = """\
 /resume    load a saved session dir
 /lint      validate the inventory
 /targets   ls | add <alias> [--rack R --cable N] [--address ip] | rm <alias>
-/docs      ls | add <pdf...> | rm <name> | reindex  (RAG library)
+/docs      ls | add <file...> | rm <name> | reindex  (RAG library)
 /askparts  on | off  prompt for and store missing per-slot parts on rail faults
 /quit      exit
 
@@ -1608,13 +1609,74 @@ def run_session(args, overrides: dict | None = None) -> int:
     """Start the interactive REPL (``args.mode``: "debug" or "chat").
 
     Debug: target picked up front, the agent drives read-only debugging tools.
-    Chat: no target, no inventory -- a pure docs/run/file reference assistant.
+    Chat: no target -- a pure docs/run/file reference assistant. An inventory
+    is loaded only when the model needs the rack-manager tunnel hop.
     Returns the process exit code.
     """
     mode = getattr(args, "mode", "debug")
     if mode == "chat":
         return _run_chat(args, overrides or {})
     return _run_debug(args, overrides or {})
+
+
+def _chat_needs_hop(args) -> bool:
+    """True when the chat LLM endpoint sits behind the rack-manager hop: an
+    explicit ``--llm-tunnel``, or a tunnel on the resolved model profile. An
+    explicit ``--llm-url`` drops the profile tunnel (a pinned direct URL is
+    authoritative), so a workstation-reachable endpoint never needs the hop."""
+    if getattr(args, "llm_tunnel", None):
+        return True
+    from ..operator.cli import _resolve_profile
+
+    profile = _resolve_profile(args, _NoInventory())
+    return bool(getattr(profile, "tunnel", None))
+
+
+def _chat_hop_inventory(args):
+    """The inventory chat mode needs ONLY to open the LLM tunnel hop: explicit
+    ``--inventory``, else the single auto-discovered candidate. Chat itself
+    stays target-less -- the inventory's ``llm_console``/``console_defaults``
+    block just supplies the rack-manager SSH hop config. Anything unusable
+    fails fast with targeted guidance; None means "stop with exit code 2"."""
+    from ..operator.cli import _discover_inventory
+    from .llm_discover import llm_console_domain
+
+    guidance = (
+        "  harness chat --inventory <file>       (one inventory under config/ is auto-used)\n"
+        "  harness chat --llm-url <direct-url>   (workstation-reachable endpoint)\n"
+        "  harness chat --llm-model <non-tunnel-model>\n"
+        "  harness debug --inventory <file> ...  (live debugging; the tunnel is built in)")
+    explicit = getattr(args, "inventory", None)
+    if explicit:
+        paths: list[Path] = [Path(explicit)]
+    else:
+        found = _discover_inventory()
+        if not found:
+            print("error: the model is served behind the rack-manager tunnel, but no "
+                  "inventory was found to open the hop", file=sys.stderr)
+            print(guidance, file=sys.stderr)
+            return None
+        if len(found) > 1:
+            print("error: several inventories found; pass --inventory <file>:",
+                  file=sys.stderr)
+            for p in found:
+                print(f"  {p}", file=sys.stderr)
+            return None
+        paths = [found[0]]
+    try:
+        inv = load_inventory(paths[0])
+    except (OSError, InventoryError) as exc:
+        print(f"error: inventory {paths[0]!r} unusable: {exc}", file=sys.stderr)
+        print("chat mode needs it only to open the LLM tunnel hop:\n" + guidance,
+              file=sys.stderr)
+        return None
+    if llm_console_domain(inv) is None:
+        print("error: the model is served behind the rack-manager tunnel, but the "
+              "inventory has no llm_console (or console_defaults) block to open the hop",
+              file=sys.stderr)
+        print(guidance, file=sys.stderr)
+        return None
+    return inv
 
 
 class _NoInventory:
@@ -1632,7 +1694,11 @@ class _NoInventory:
 
 
 def _run_chat(args, overrides: dict) -> int:
-    """Chat-mode REPL: LLM + docs only; no inventory, no target resolution."""
+    """Chat-mode REPL: LLM + docs only; no target resolution. An inventory is
+    loaded only when the model endpoint needs the rack-manager tunnel hop
+    (tunnel profile / ``--llm-tunnel``); the hop config comes from its
+    ``llm_console``/``console_defaults`` block -- the session itself stays
+    target-less."""
     from ..operator.cli import (
         _llm_ident_for,
         _make_store,
@@ -1646,7 +1712,12 @@ def _run_chat(args, overrides: dict) -> int:
     # debug): a dead --llm-url must fail here, not mid-conversation.
     forward = overrides.get("llm_forward")
     if forward is None:
-        forward = _prepare_llm_endpoint(args, inv, store)
+        hop_inv = None
+        if _chat_needs_hop(args):
+            hop_inv = _chat_hop_inventory(args)
+            if hop_inv is None:
+                return 2
+        forward = _prepare_llm_endpoint(args, hop_inv or inv, store)
     llm = overrides.get("llm") or _resolve_llm(args, inv, store)
     router_llm = overrides.get("router_llm") or _resolve_llm(args, inv, store)
     llm_ident = _llm_ident_for(args, inv)
