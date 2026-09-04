@@ -79,11 +79,22 @@ where.exe harness               # no output means it is not on PATH
 A pip warning during install ("The script harness.exe is installed in
 '...' which is not on PATH") confirms the case. Common causes and fixes:
 
-- **User-site fallback / Microsoft Store Python** — scripts land under
-  `%APPDATA%\Python\Python3XX\Scripts\` or
-  `%LOCALAPPDATA%\Packages\PythonSoftwareFoundation...\LocalCache\local-packages\...\Scripts\`,
-  neither of which is on `PATH`. Add the reported directory to your user
-  `PATH`, then open a new terminal:
+- **Microsoft Store Python** — pip installs into
+  `%LOCALAPPDATA%\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\Scripts\`,
+  which is not on `PATH`. Derive the directory from Python itself and add it
+  to your user `PATH` — the app's own folder under
+  `C:\Program Files\WindowsApps\` is a read-only package dir; pip never puts
+  scripts there:
+
+  ```powershell
+  $scripts = python -c "import sysconfig; print(sysconfig.get_path('scripts'))"
+  $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+  [Environment]::SetEnvironmentVariable('Path', "$userPath;$scripts", 'User')
+  ```
+
+- **User-site fallback** (python.org install without admin rights) — scripts
+  land under `%APPDATA%\Python\Python3XX\Scripts\`, also not on `PATH`. Add
+  the directory pip reports to your user `PATH`, then open a new terminal:
 
   ```powershell
   $scripts = "<the Scripts directory reported above>"
