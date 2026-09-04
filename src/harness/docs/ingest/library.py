@@ -34,7 +34,7 @@ from pathlib import Path
 from ..retrieval.hybrid_search import HybridRetriever
 from ..retrieval.rag import RagPipeline
 from .chunk import CharTokenizer, Chunk, Chunker
-from .pdf_parser import PageText, PdfParser
+from .pdf_parser import PageText, PdfParser, render_page_png
 from .text_parser import _CsvParser, _DocxParser, _JsonParser, _MarkdownParser, _PlainTextParser
 
 MANIFEST = "index.json"
@@ -64,6 +64,7 @@ class DocEntry:
     size: int
     chunks: int
     ingested_at: str
+    captions: int = 0
     error: str | None = None
     platform: str | None = None
 
@@ -83,13 +84,15 @@ def _ocr_failures(ocr) -> int:
 def _append_ocr_warn(status: list[str], ocr, before: int) -> None:
     """One warn line when image captioning failed during this batch.
 
-    The captioner latches off after its first failure (no per-page endpoint
-    hammering), so the count is surfaced as a batch-level condition, not a
-    per-image tally; ``docs reindex`` retries once the endpoint is back.
+    Transient per-image failures are retried inside the captioner; this fires
+    when caption attempts failed at all (the latch marks repeated consecutive
+    failures). ``docs reindex --force`` retries once the endpoint works.
     """
-    if _ocr_failures(ocr) > before:
-        status.append("warn: image captioning failed (LLM unavailable) -- scanned "
-                      "pages/diagram images were skipped; 'docs reindex' retries")
+    if _ocr_failures(ocr) <= before:
+        return
+    reason = f" ({getattr(ocr, 'error', None)})" if getattr(ocr, "error", None) else ""
+    status.append(f"warn: image captioning failed{reason} -- scanned pages/diagram "
+                  "images were skipped; 'docs reindex --force' retries")
 
 
 def parse_pages(path: Path, pdf_parser: Parser | None = None) -> list[PageText]:
@@ -150,17 +153,23 @@ class DocLibrary:
 
     # ---- operations ----
 
-    def add(self, files: list[str | Path], platform: str | None = None) -> list[str]:
+    def add(self, files: list[str | Path], platform: str | None = None,
+            progress: Callable[[str], None] | None = None) -> list[str]:
         """Upload documents into the library and index them. Returns status lines.
 
         ``platform`` tags every chunk of those documents with a canonical model
         key so retrieval can be filtered to the detected server model. None
-        leaves the documents untagged (platform-neutral knowledge).
+        leaves the documents untagged (platform-neutral knowledge). ``progress``
+        receives one line per vision caption attempt (page-level pulse for
+        long ingest runs over a tunnel).
         """
         self.root.mkdir(parents=True, exist_ok=True)
         self.pdfs_dir.mkdir(parents=True, exist_ok=True)
         manifest = self._manifest()
+        cached = self._load_chunks()  # reused for files not touched this run
         status: list[str] = []
+        touched: set[str] = set()
+        fresh: list[Chunk] = []
         changed = False
         ocr_before = _ocr_failures(self.ocr)
         for raw in files:
@@ -180,7 +189,8 @@ class DocLibrary:
                 status.append(f"unchanged {src.name} (already indexed)")
                 continue
             shutil.copy2(src, self.pdfs_dir / src.name)
-            chunks, error = self._parse_doc(src.name, platform)
+            touched.add(src.name)
+            chunks, error, captions = self._parse_doc(src.name, platform, progress)
             if error:
                 manifest[src.name] = {
                     "sha256": digest, "size": src.stat().st_size,
@@ -192,23 +202,38 @@ class DocLibrary:
                 manifest[src.name] = {
                     "sha256": digest, "size": src.stat().st_size,
                     "chunks": len(chunks), "ingested_at": _now(),
+                    "captions": captions,
                     "platform": platform,
                 }
-                self._save_chunks(self._all_chunks(manifest))
-                status.append(f"indexed {src.name}: {len(chunks)} chunk(s)")
+                fresh.extend(chunks)
+                status.append(f"indexed {src.name}: {len(chunks)} chunk(s)"
+                              + _image_only_hint(src.name, chunks, captions))
             changed = True
         if changed:
+            # Chunks come from THIS run's parses; untouched docs keep their
+            # cached chunks. Re-parsing the whole library here would re-run
+            # vision captioning for every document on every save.
+            self._save_chunks(
+                [c for c in cached if c.title not in touched] + fresh)
             self._save_manifest(manifest)
         _append_ocr_warn(status, self.ocr, ocr_before)
         return status
 
-    def reindex(self) -> list[str]:
+    def reindex(self, force: bool = False,
+                progress: Callable[[str], None] | None = None) -> list[str]:
         """(Re-)index every supported file in ``pdfs/``: retries failures,
-        picks up dropped files (manual copy into the library counts as upload)."""
+        picks up dropped files (manual copy into the library counts as upload).
+
+        ``force`` re-parses even unchanged files -- e.g. to caption PDF images
+        after enabling a vision LLM, where the earlier pass was text-only.
+        ``progress`` receives one line per vision caption attempt."""
         self.root.mkdir(parents=True, exist_ok=True)
         self.pdfs_dir.mkdir(parents=True, exist_ok=True)
         manifest = self._manifest()
+        cached = self._load_chunks()
         status: list[str] = []
+        touched: set[str] = set()
+        fresh: list[Chunk] = []
         changed = False
         ocr_before = _ocr_failures(self.ocr)
         files = sorted(
@@ -217,9 +242,10 @@ class DocLibrary:
         for src in files:
             digest = _sha256(src)
             entry = manifest.get(src.name)
-            if entry and entry.get("sha256") == digest and not entry.get("error"):
+            if not force and entry and entry.get("sha256") == digest and not entry.get("error"):
                 continue
-            chunks, error = self._parse_doc(src.name)
+            touched.add(src.name)
+            chunks, error, captions = self._parse_doc(src.name, progress=progress)
             if error:
                 manifest[src.name] = {
                     "sha256": digest, "size": src.stat().st_size,
@@ -230,11 +256,15 @@ class DocLibrary:
                 manifest[src.name] = {
                     "sha256": digest, "size": src.stat().st_size,
                     "chunks": len(chunks), "ingested_at": _now(),
+                    "captions": captions,
                 }
-                status.append(f"indexed {src.name}: {len(chunks)} chunk(s)")
+                fresh.extend(chunks)
+                status.append(f"indexed {src.name}: {len(chunks)} chunk(s)"
+                              + _image_only_hint(src.name, chunks, captions))
             changed = True
         if changed:
-            self._save_chunks(self._all_chunks(manifest))
+            self._save_chunks(
+                [c for c in cached if c.title not in touched] + fresh)
             self._save_manifest(manifest)
         _append_ocr_warn(status, self.ocr, ocr_before)
         return status or ["nothing to do"]
@@ -247,7 +277,7 @@ class DocLibrary:
         pdf = self.pdfs_dir / name
         if pdf.exists():
             pdf.unlink()
-        self._save_chunks(self._all_chunks(manifest))
+        self._save_chunks([c for c in self._load_chunks() if c.title != name])
         self._save_manifest(manifest)
         return f"removed {name}"
 
@@ -255,24 +285,32 @@ class DocLibrary:
         """Set (or clear) the platform tag on already-indexed documents.
 
         ``platform`` may be a single canonical key or a comma-separated list of
-        keys; None clears the tag (back to platform-neutral). Chunks are rebuilt
-        from the manifest, so previously-tagged chunks are retagged too. Unknown
-        names are reported, never fatal.
+        keys; None clears the tag (back to platform-neutral). Tags are applied
+        in place to the cached chunks -- no re-parse (which with vision
+        ingest would re-caption every document). Unknown names are reported,
+        never fatal.
         """
         manifest = self._manifest()
         status: list[str] = []
+        tag_map: dict[str, list[str]] = {}
         for name in names:
             if name not in manifest:
                 status.append(f"missing {name}: not in library")
                 continue
             if platform is None:
                 manifest[name].pop("platform", None)
+                tag_map[name] = []
             else:
-                manifest[name]["platform"] = ",".join(
-                    p.strip() for p in platform.split(",") if p.strip())
+                tags = ",".join(p.strip() for p in platform.split(",") if p.strip())
+                manifest[name]["platform"] = tags
+                tag_map[name] = [p.strip() for p in tags.split(",") if p.strip()]
             status.append(f"tagged {name}: platform={platform or '(none)'}")
-        if status:
-            self._save_chunks(self._all_chunks(manifest))
+        if tag_map:
+            chunks = self._load_chunks()
+            for c in chunks:
+                if c.title in tag_map:
+                    c.platforms = list(tag_map[c.title])
+            self._save_chunks(chunks)
             self._save_manifest(manifest)
         return status
 
@@ -287,41 +325,58 @@ class DocLibrary:
             return None
         return RagPipeline(HybridRetriever(chunks))
 
+    def page_image(self, title: str, page: int, *, max_px: int = 1200,
+                   max_bytes: int = 1_500_000) -> bytes | None:
+        """One page of an indexed PDF as PNG bytes (query-time vision RAG).
+
+        The ``title`` is the indexed document name (a ``pdfs/`` member). None
+        for non-PDF sources, missing files, out-of-range pages, or render
+        failures -- callers degrade to the text snippet only."""
+        path = self.pdfs_dir / title
+        if not path.is_file() or path.suffix.lower() != ".pdf":
+            return None
+        return render_page_png(path, page, max_px=max_px, max_bytes=max_bytes)
+
     # ---- internals ----
 
-    def _parse_doc(self, name: str, platform: str | None = None) -> tuple[list[Chunk], str | None]:
-        """Parse any supported source file (PDF / markdown / text / CSV / JSON /
-        log / DOCX) into chunks."""
+    def _parse_doc(self, name: str, platform: str | None = None,
+                   progress: Callable[[str], None] | None = None
+                   ) -> tuple[list[Chunk], str | None, int]:
+        """Parse any supported source file into chunks + a caption count.
+
+        The third element counts pages whose images were captioned into the
+        text (``PageText.ocr``), surfaced in the manifest and ``docs ls`` so
+        silent image loss is visible. ``progress`` receives page-level
+        caption lines from the PDF parser."""
         path = self.pdfs_dir / name
         try:
-            pages = self._pages(path)
+            pages = self._pages(path, progress)
         except Exception as exc:  # noqa: BLE001 - record per-file, never fatal
-            return [], str(exc)
+            return [], str(exc), 0
         chunks = Chunker(CharTokenizer()).chunk_pages(pages, title=name)
+        captions = sum(1 for p in pages if p.ocr)
         if platform:
             # A comma-separated tag tags one chunk with multiple platforms (e.g.
             # a compute-tray guide that applies to both the node and the rack).
             for chunk in chunks:
                 chunk.platforms = [p.strip() for p in platform.split(",") if p.strip()]
-        return chunks, None
+        return chunks, None, captions
 
-    def _pages(self, path: Path) -> list[PageText]:
+    def _pages(self, path: Path, progress: Callable[[str], None] | None = None
+               ) -> list[PageText]:
         if self.parser is None and self.ocr is not None and path.suffix.lower() == ".pdf":
             # Late-bound so monkeypatched PdfParser test fakes keep working.
-            return PdfParser(ocr=self.ocr).parse(path)
+            return PdfParser(ocr=self.ocr, progress=progress).parse(path)
         return parse_pages(path, pdf_parser=self.parser)
 
-    def _all_chunks(self, manifest: dict[str, dict]) -> list[Chunk]:
-        """Rebuild the chunk cache from indexed, error-free entries."""
-        chunks: list[Chunk] = []
-        for name, entry in manifest.items():
-            if entry.get("error"):
-                continue
-            parsed, error = self._parse_doc(name, entry.get("platform"))
-            if error or not parsed:
-                continue
-            chunks.extend(parsed)
-        return chunks
+
+def _image_only_hint(name: str, chunks: list[Chunk], captions: int) -> str:
+    """Call-out for a PDF that yielded neither text nor captions -- almost
+    always an image-only document indexed without a working vision LLM."""
+    if chunks or captions or not name.lower().endswith(".pdf"):
+        return ""
+    return (" (no text, no captions -- image-only PDF? configure a vision LLM "
+            "and 'docs reindex')")
 
 
 def _now() -> str:

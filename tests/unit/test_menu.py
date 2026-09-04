@@ -648,7 +648,7 @@ def test_menu_runs_empty(tmp_path, monkeypatch, capsys):
     args = SimpleNamespace(out_dir=str(tmp_path / "harness_runs"))
     monkeypatch.setattr(menu_mod, "select", _scripted_select([0]))
     assert _menu_runs(args) == 0
-    assert "no runs yet" in capsys.readouterr().out
+    assert "no runs or chat sessions yet" in capsys.readouterr().out
 
 
 def test_menu_runs_missing_artifact(tmp_path, monkeypatch, capsys):
@@ -724,6 +724,104 @@ def test_menu_runs_delete_cancelled(tmp_path, monkeypatch, capsys):
     assert "cancelled" in out
     assert run.exists()
     assert (cases / "abc123.json").exists()
+
+
+# ---- runs menu: chat sessions ----
+
+def _fake_chat_session(base, name="chat-1",
+                       messages=("what is the memory rule?",), mode="chat"):
+    """A saved chat session dir (session.json, mode + transcript)."""
+    root = base / "harness_runs" / "sessions" / name
+    root.mkdir(parents=True, exist_ok=True)
+    transcript = [{"role": "user", "kind": "message", "content": m}
+                  for m in messages]
+    transcript.append({"role": "agent", "kind": "say", "content": "an answer"})
+    (root / "session.json").write_text(json.dumps(
+        {"mode": mode, "transcript": transcript}), encoding="utf-8")
+    return root
+
+
+def test_menu_runs_lists_chat_sessions(tmp_path, monkeypatch, capsys):
+    from harness.operator import menu as menu_mod
+    _fake_chat_session(tmp_path)
+    args = SimpleNamespace(out_dir=str(tmp_path / "harness_runs"))
+    seen = {}
+
+    def fake_select(prompt, options):
+        seen.setdefault(prompt, options)
+        return len(options) - 1  # first call picks the chat, then Back
+
+    monkeypatch.setattr(menu_mod, "select", fake_select)
+    assert _menu_runs(args) == 0
+    labels = seen["Run or chat session (most recent first)"]
+    assert labels and labels[0].startswith("chat |")
+    assert "what is the memory rule?" in labels[0]
+
+
+def test_menu_runs_chat_continue_builds_resume_argv(tmp_path, monkeypatch):
+    """'continue' launches the chat REPL with --resume pointing at the SAME
+    session dir (in-place continue)."""
+    from harness.operator import menu as menu_mod
+    root = _fake_chat_session(tmp_path)
+    args = SimpleNamespace(out_dir=str(tmp_path / "harness_runs"))
+    built = []
+    monkeypatch.setattr(cli_mod, "_run_wizard_sub",
+                        lambda argv: built.append(argv) or 0)
+    # 0 = the chat session, 0 = continue
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 0]))
+    assert _menu_runs(args) == 0
+    assert built and built[0][0] == "chat"
+    assert built[0][built[0].index("--resume") + 1] == str(root)
+    assert built[0][built[0].index("--session-dir") + 1] == str(root.parent)
+
+
+def test_menu_runs_chat_transcript_view(tmp_path, monkeypatch, capsys):
+    from harness.operator import menu as menu_mod
+    _fake_chat_session(tmp_path)
+    args = SimpleNamespace(out_dir=str(tmp_path / "harness_runs"))
+    # 0 = chat session, 1 = transcript, 3 = back
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 1, 3]))
+    assert _menu_runs(args) == 0
+    out = capsys.readouterr().out
+    assert "[you]" in out and "[agent]" in out
+    assert "an answer" in out
+
+
+def test_menu_runs_chat_delete(tmp_path, monkeypatch, capsys):
+    from harness.operator import menu as menu_mod
+    root = _fake_chat_session(tmp_path)
+    args = SimpleNamespace(out_dir=str(tmp_path / "harness_runs"))
+    # 0 = chat session, 2 = delete; confirm yes
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 2]))
+    monkeypatch.setattr(menu_mod, "confirm", lambda prompt, default=False: True)
+    assert _menu_runs(args) == 0
+    assert "deleted chat session chat-1" in capsys.readouterr().out
+    assert not root.exists()
+
+
+def test_menu_runs_mixed_runs_and_chats(tmp_path, monkeypatch, capsys):
+    """Debug runs and chat sessions share one picker: the run is index 0, the
+    chat session index 1, and picking the chat opens the chat views."""
+    from harness.operator import menu as menu_mod
+    base = _fake_run_dir(tmp_path, "abc123", {
+        "diagnosis.json": '{"state": "healthy", "confidence": 0.8}'})
+    _fake_chat_session(base)
+    args = SimpleNamespace(out_dir=str(base / "harness_runs"))
+    # 1 = the chat session, 3 = back
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([1, 3]))
+    assert _menu_runs(args) == 0
+    assert "---- chat session chat-1 ----" in capsys.readouterr().out
+
+
+def test_chat_sessions_skips_debug_sessions_and_garbage(tmp_path):
+    base = tmp_path / "harness_runs"
+    debug = _fake_chat_session(base, name="debug-1", mode="debug")
+    broken = base / "harness_runs" / "sessions" / "broken"
+    broken.mkdir(parents=True)
+    (broken / "session.json").write_text("not json", encoding="utf-8")
+    _fake_chat_session(base, name="chat-2")
+    found = cli_mod._chat_sessions(base / "harness_runs")
+    assert [p.name for p in found] == ["chat-2"] and debug.exists()
 
 
 # ---- run listing labels / run metadata ----

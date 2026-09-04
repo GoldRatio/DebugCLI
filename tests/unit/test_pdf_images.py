@@ -11,6 +11,7 @@ import random
 
 import pytest
 
+from harness.diagnosis.llm import LLMError
 from harness.docs.ingest.pdf_parser import PdfParser
 
 pymupdf = pytest.importorskip("pymupdf")
@@ -120,6 +121,24 @@ def test_without_ocr_hook_text_only(tmp_path):
     assert pages[0].ocr is False
 
 
+def test_repeated_logo_captioned_once(tmp_path):
+    """The same embedded image on many pages costs exactly one vision call."""
+    pdf = tmp_path / "logo_pages.pdf"
+    png = _noise_png()
+    doc = pymupdf.open()
+    for _ in range(3):
+        page = doc.new_page()
+        page.insert_text((72, 72), "Section text continues here")
+        page.insert_image(pymupdf.Rect(72, 100, 372, 250), stream=png)
+    doc.save(str(pdf))
+    doc.close()
+    cap = _Captioner("RECURRING LOGO")
+    pages = PdfParser(ocr=cap).parse(pdf)
+    assert len(cap.calls) == 1  # cached per document xref
+    assert all(p.ocr for p in pages)
+    assert all("RECURRING LOGO" in p.text for p in pages)
+
+
 # ---- VisionCaptioner ----
 
 def test_vision_captioner_none_when_disabled(monkeypatch):
@@ -137,7 +156,7 @@ def test_vision_captioner_stub_end_to_end(monkeypatch):
     assert cap.failures == 0
 
 
-def test_vision_captioner_latches_after_failure():
+def test_vision_captioner_latches_after_repeated_failures():
     from harness.diagnosis.llm import LLMError
     from harness.docs.ingest import vision
 
@@ -145,17 +164,42 @@ def test_vision_captioner_latches_after_failure():
         def __init__(self):
             self.attempts = 0
 
-        def caption_image(self, png, prompt=None):
+        def caption_image(self, png, prompt=None, mime="image/png"):
             self.attempts += 1
             raise LLMError("endpoint down")
 
     broken = _Broken()
     cap = vision.VisionCaptioner(broken)
-    with pytest.raises(LLMError):
-        cap(b"png1")
+    for _ in range(vision.VisionCaptioner.max_consecutive_failures):
+        with pytest.raises(LLMError):
+            cap(b"png")
     with pytest.raises(LLMError, match="disabled"):
+        cap(b"png")
+    # transient failures are tolerated; only the latch stops further attempts
+    assert broken.attempts == vision.VisionCaptioner.max_consecutive_failures
+    assert cap.failures == vision.VisionCaptioner.max_consecutive_failures
+    assert "endpoint down" in (cap.error or "")
+
+
+def test_vision_captioner_tolerates_transient_failures():
+    from harness.docs.ingest import vision
+
+    class _Flaky:
+        def __init__(self):
+            self.calls = 0
+
+        def caption_image(self, png, prompt=None, mime="image/png"):
+            self.calls += 1
+            if self.calls == 2:
+                raise LLMError("LLM caption reply was empty")  # one hiccup
+            return "fine"
+
+    flaky = _Flaky()
+    cap = vision.VisionCaptioner(flaky)
+    assert cap(b"png1") == "fine"
+    with pytest.raises(LLMError):
         cap(b"png2")
-    assert broken.attempts == 1  # latched: one attempt, not one per image
+    assert cap(b"png3") == "fine"  # batch survives the transient failure
     assert cap.failures == 1
 
 

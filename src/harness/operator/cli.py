@@ -374,6 +374,8 @@ def _build_retriever(docs_dir: str | None):
         print("  [docs] extras not installed; install harness[docs] for --docs-dir",
               file=sys.stderr)
         return None
+    # Env-configured captioner only: this legacy path runs inside a diagnose
+    # session and must never open tunnels or pull in the operator's catalog.
     parser = PdfParser(ocr=vision_captioner())
     chunks = []
     for pdf in sorted(Path(docs_dir).iterdir()):
@@ -725,34 +727,90 @@ def run_lint(args) -> int:
     return 0
 
 
-def _ingest_captioner():
+def _ingest_captioner(args=None, inv=None, store=None):
     """Vision captioner for docs ingest (PDF images -> searchable text).
 
-    Built from env config (``HARNESS_LLM_PROVIDER``/``HARNESS_LLM_URL``/...);
-    None when no LLM is configured or the docs extras are absent. Caption
-    failures latch off inside the captioner, so a dead endpoint costs one
-    attempt per ingest run and the library surfaces a warn line.
+    Resolution: env config (``HARNESS_LLM_PROVIDER``/``URL``/...) first;
+    otherwise the operator's remembered model profile (``config/models.yaml``
+    current -- the same model chat/diagnose resolves), opening its
+    rack-manager tunnel when configured. ``HARNESS_LLM_PROVIDER=none``
+    disables captioning outright. None (text-only ingest) when no usable
+    model resolves or setup fails; caption failures latch inside the
+    captioner, so a dead or text-only endpoint costs one attempt per ingest
+    run and the library surfaces a warn line.
     """
+    from types import SimpleNamespace
+
     try:
         from ..docs.ingest.vision import vision_captioner
     except ImportError:
         return None
-    return vision_captioner()
+    if os.environ.get("HARNESS_LLM_PROVIDER") is not None:
+        return vision_captioner()
+    try:
+        from ..config.model_catalog import ModelCatalog
+
+        if inv is None:
+            discovered = _discover_inventory()
+            inv = load_inventory(discovered[0]) if discovered else None
+        profile = ModelCatalog.load(inv=inv).current
+        if profile is None or profile.provider == "stub" or profile.needs_setup:
+            return None
+        if store is None:
+            store = _make_store(
+                SimpleNamespace(secret_dir=getattr(args, "secret_dir", None)),
+                prompt=False)
+        ns = SimpleNamespace(llm=None, llm_model=None, llm_url=None,
+                             llm_tunnel=None, llm_timeout=30.0,
+                             rack=None, cable=None)
+        _prepare_llm_endpoint(ns, inv, store)
+        llm = profile.build(store)
+        forwarded = getattr(ns, "llm_url", None)
+        if forwarded:
+            llm.url = forwarded.rstrip("/")
+        return vision_captioner(llm)
+    except Exception:  # noqa: BLE001 - never let doc ingest fail on model setup
+        _close_llm_forwards()
+        return None
+
+
+def _session_captioner(session):
+    """Captioner for in-session doc ingest: reuse the session's live LLM
+    (already profile-resolved and tunnel-connected). Stub/garbage backends
+    are excluded so stub captions never pollute the library."""
+    try:
+        from ..diagnosis.llm import StubLLM
+        from ..docs.ingest.vision import vision_captioner
+    except ImportError:
+        return None
+    llm = getattr(session, "llm", None)
+    if llm is None or isinstance(llm, StubLLM) or not hasattr(llm, "caption_image"):
+        return None
+    return vision_captioner(llm)
 
 
 def run_docs(args) -> int:
     """Manage the RAG document library: upload (add), list, remove, reindex."""
     from ..docs.ingest.library import DocLibrary
-    lib = DocLibrary(args.lib, ocr=_ingest_captioner())
+    lib = DocLibrary(args.lib, ocr=_ingest_captioner(args))
+    try:
+        return _run_docs_action(args, lib)
+    finally:
+        _close_llm_forwards()  # ingest may have opened the profile tunnel
+
+
+def _run_docs_action(args, lib) -> int:
     action = args.docs_action
     if action == "add":
         platform = getattr(args, "platform", None)
-        for line in lib.add(args.files, platform=platform):
+        for line in lib.add(args.files, platform=platform,
+                            progress=_progress_printer()):
             print(line)
         if platform:
             print(f"  tagged {len(args.files)} document(s) as platform={platform}")
     elif action == "reindex":
-        for line in lib.reindex():
+        for line in lib.reindex(force=getattr(args, "force", False),
+                                progress=_progress_printer()):
             print(line)
     elif action == "retag":
         for line in lib.retag(args.names, platform=getattr(args, "platform", None)):
@@ -771,8 +829,9 @@ def run_docs(args) -> int:
         for e in entries:
             platform = f"  platform={e.platform}" if e.platform else ""
             suffix = f"  ERROR: {e.error}" if e.error else ""
+            captions = f"  captions={e.captions}" if e.captions else ""
             print(f"{e.name}  sha256={e.sha256[:12]}  {e.chunks} chunk(s)  "
-                  f"{e.ingested_at}{platform}{suffix}")
+                  f"{e.ingested_at}{captions}{platform}{suffix}")
     return 0
 
 
@@ -1764,7 +1823,7 @@ _BACK = "back"
 _MAIN_ACTIONS: list[tuple[str, str]] = [
     ("chat", "Chat session        docs, past runs, or a referenced log file (no target)"),
     ("diagnose", "Debug a target       interactive agent debugging on one machine (iterative)"),
-    ("runs", "Inspect past runs    verdicts, commands, evidence from earlier diagnoses"),
+    ("runs", "Inspect past runs    diagnosis runs + saved chat sessions (continue a chat)"),
     ("advanced", "Advanced             verify - console - model - docs - targets - secrets - learning - setup - lint"),
     ("quit", "Quit"),
 ]
@@ -2483,13 +2542,114 @@ def _delete_run(run_dir: Path, cases_dir: Path) -> bool:
     return True
 
 
+def _chat_sessions(out_dir: Path) -> list[Path]:
+    """Saved chat sessions: dirs under ``out_dir/sessions`` whose session.json
+    records mode "chat" (debug sessions excluded -- the inspector's run views
+    need diagnosis artifacts). Newest first."""
+    root = out_dir / "sessions"
+    try:
+        entries = sorted(root.iterdir(), key=lambda p: p.stat().st_mtime,
+                         reverse=True)
+    except OSError:
+        return []
+    found: list[Path] = []
+    for p in entries:
+        payload_path = p / "session.json"
+        if not p.is_dir() or not payload_path.is_file():
+            continue
+        try:
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(payload, dict) and payload.get("mode") == "chat":
+            found.append(p)
+    return found
+
+
+def _chat_session_payload(session_dir: Path) -> dict:
+    """The parsed session.json of a saved chat session ({} when unreadable)."""
+    try:
+        payload = json.loads(
+            (session_dir / "session.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _summarize_chat_session(session_dir: Path) -> str:
+    """Picker one-liner for a saved chat session, clearly distinct from the
+    debug-run rows, e.g.::
+
+        chat | 2026-09-03 14:22 | 12 message(s) | 'what does the manual say ...'
+
+    The leading ``chat`` tag plus the message count replaces the run rows'
+    host/verdict/fix fields; the first operator message makes the session
+    findable via the picker's type-to-filter.
+    """
+    try:
+        when = datetime.fromtimestamp(
+            session_dir.stat().st_mtime, tz=UTC).astimezone().strftime(
+                "%Y-%m-%d %H:%M")
+    except OSError:
+        when = ""
+    entries = _chat_session_payload(session_dir).get("transcript") or []
+    messages = [e for e in entries
+                if isinstance(e, dict) and e.get("kind") == "message"]
+    first = str(messages[0].get("content", "")) if messages else ""
+    bits = [b for b in ("chat", when, f"{len(messages)} message(s)",
+                        f"'{ui.clip(first, 48)}'" if first else None) if b]
+    return " | ".join(bits) if bits else session_dir.name
+
+
+def _print_chat_transcript(session_dir: Path) -> None:
+    """The saved conversation, one labeled row per transcript entry."""
+    entries = _chat_session_payload(session_dir).get("transcript") or []
+    if not entries:
+        print("  (empty transcript)")
+        return
+    who = {"message": "you", "answer": "you", "context": "context",
+           "say": "agent", "action": "agent", "diagnosis": "agent",
+           "result": "tool", "error": "error"}
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        speaker = who.get(str(e.get("kind")), str(e.get("role", "?")))
+        print(f"  {ui.dim(f'[{speaker}]')} {e.get('content', '')}")
+
+
+def _continue_chat_session(args, session_dir: Path) -> None:
+    """Re-enter a saved chat IN PLACE: --resume points session_dir at the
+    same directory, so the conversation keeps growing in that session.json."""
+    out_dir = getattr(args, "out_dir", "harness_runs")
+    argv = ["chat", "--resume", str(session_dir),
+            "--out-dir", str(out_dir),
+            "--session-dir", str(Path(out_dir) / "sessions")]
+    argv += _wizard_flags(args, "chat")
+    _run_wizard_sub(argv)
+
+
+def _delete_chat_session(session_dir: Path) -> bool:
+    """Interactive per-session delete from the runs menu."""
+    from .menu import confirm
+
+    if not confirm(f"Permanently delete chat session {session_dir.name}?"):
+        print("  cancelled")
+        return False
+    shutil.rmtree(session_dir)
+    print(f"  deleted chat session {session_dir.name}")
+    return True
+
+
 def _menu_runs(args) -> int:
     """Inspect a previous run end to end: verdict, command pathway, the exact
     prompt(s) sent to the LLM, the raw collector evidence -- and label the
-    correct fix so the learning loop can consume the run.
+    correct fix so the learning loop can consume the run. Saved chat sessions
+    are listed here too, with chat-specific views (continue in place, print
+    the transcript, delete).
 
     Runs are listed with identifying one-liners (date, host, rack/cable,
-    serial, verdict, fix) instead of raw hash paths; type-to-filter matches
+    serial, verdict, fix) instead of raw hash paths; chat sessions carry a
+    leading ``chat`` tag + the first operator message. Type-to-filter matches
     any substring of those.
     """
     from .menu import select
@@ -2499,14 +2659,44 @@ def _menu_runs(args) -> int:
     while True:
         runs = sorted((p for p in out_dir.glob("*") if _is_run_dir(p)),
                       key=lambda p: p.stat().st_mtime, reverse=True)
-        if not runs:
-            print(f"  no runs yet under {out_dir}")
+        chats = _chat_sessions(out_dir)
+        if not runs and not chats:
+            print(f"  no runs or chat sessions yet under {out_dir}")
             return 0
-        pick = select("Run (most recent first)",
-                      [_summarize_run(p, cases_dir) for p in runs])
+        picks: list[tuple[str, Path, str]] = (
+            [("run", p, _summarize_run(p, cases_dir)) for p in runs]
+            + [("chat", p, _summarize_chat_session(p)) for p in chats])
+        pick = select("Run or chat session (most recent first)",
+                      [label for _, _, label in picks])
         if pick is None:
             return 0
-        run_dir = runs[pick]
+        kind, run_dir, _ = picks[pick]
+        if kind == "chat":
+            print(f"---- chat session {run_dir.name} ----")
+            n_entries = len(_chat_session_payload(run_dir)
+                            .get("transcript") or [])
+            print(f"  dir: {run_dir}  ({n_entries} transcript entries)")
+            views = [
+                ("continue", "continue  - resume this chat where it left off"),
+                ("transcript", "transcript - print the saved conversation"),
+                ("delete", "delete    - remove this chat session (confirm)"),
+                (_BACK, _BACK),
+            ]
+            while True:
+                idx = select("Inspect", [label for _, label in views])
+                if idx is None:
+                    return 0
+                key = views[idx][0]
+                if key == _BACK:
+                    return 0
+                if key == "continue":
+                    _continue_chat_session(args, run_dir)
+                    return 0
+                if key == "transcript":
+                    _print_chat_transcript(run_dir)
+                elif key == "delete" and _delete_chat_session(run_dir):
+                    break  # deleted: back to the refreshed list
+            continue
         _print_run_header(run_dir, cases_dir)
         views = [
             ("verdict", "verdict  - diagnosis.json (state, text, confidence, actions)"),
@@ -3242,8 +3432,11 @@ def build_parser() -> argparse.ArgumentParser:
     r = docs_sub.add_parser("rm", help="remove a document from the library")
     r.add_argument("name", help="filename as shown by 'docs ls'")
     docs_sub.add_parser("ls", help="list indexed documents")
-    docs_sub.add_parser("reindex", help="re-index all documents (retries failures, "
-                                        "picks up files dropped into the library)")
+    r = docs_sub.add_parser("reindex", help="re-index all documents (retries failures, "
+                                            "picks up files dropped into the library)")
+    r.add_argument("--force", action="store_true",
+                   help="re-index even unchanged files (re-captures PDF images, "
+                        "e.g. after enabling a vision LLM)")
     t = docs_sub.add_parser("retag", help="set/clear the platform tag on indexed documents")
     t.add_argument("names", nargs="+", help="document name(s) as shown by 'docs ls'")
     t.add_argument("--platform", default=None,

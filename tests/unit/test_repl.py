@@ -560,7 +560,8 @@ def test_session_repl_verify_without_baseline(tmp_path, capsys):
     assert "no baseline yet" in out
 
 
-def test_session_repl_docs_without_library(tmp_path, capsys):
+def test_session_repl_docs_without_library(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)  # isolate from the repo's harness_docs/ library
     reader = _ScriptedReader(["look up the DIMM in the manual", "/quit"])
     run_session(_session_args(tmp_path), overrides={
         "reader": reader, "llm": StubLLM(), "router_llm": _NoChatLLM()})
@@ -1518,6 +1519,29 @@ def test_chat_repl_agent_uses_file_tool(tmp_path, capsys):
     assert "FAN1_CTRL fault logged at boot" in out
 
 
+def test_chat_repl_docs_auto_discovers_default_library(tmp_path, monkeypatch, capsys):
+    """`harness chat` with no --docs-lib/--docs-dir still reaches documents: the
+    docs tool must auto-discover the default harness_docs/ library (same as
+    diagnose), not claim no library is configured."""
+    monkeypatch.chdir(tmp_path)
+    from harness.docs.ingest.library import DocLibrary
+
+    md = tmp_path / "dimm_guide.md"
+    md.write_text("# DIMM population rules\n\n"
+                  "Populate memory slots in pairs per the platform manual.\n",
+                  encoding="utf-8")
+    DocLibrary(tmp_path / "harness_docs").add([str(md)])
+    reader = _ScriptedReader(["what are the DIMM population rules?", "/quit"])
+    run_session(_chat_args(tmp_path), overrides={
+        "reader": reader, "llm": StubLLM(),
+        "router_llm": _AgentLLM({"say": "Looking that up in the manuals.",
+                                 "tool": "docs", "query": "DIMM population rules"})})
+    out = capsys.readouterr().out
+    assert "no doc library" not in out
+    assert "DIMM population rules" in out
+    assert "dimm_guide.md" in out  # cited snippet carries the document title
+
+
 def test_chat_session_persists_mode(tmp_path):
     """session.json records mode=chat; /resume in chat mode ignores targets."""
     holder = {}
@@ -1665,3 +1689,44 @@ def test_chat_llm_url_overrides_tunnel_profile_without_hop(
     assert code == 0
     from harness.operator.repl import _NoInventory
     assert isinstance(captured["inv"], _NoInventory)
+
+
+def test_chat_answer_printed_once(tmp_path, capsys):
+    """A conversational answer streams once ('agent: ...'); it must not be
+    printed a second time as a green '+ done' line."""
+    reader = _ScriptedReader(["what is the rule?", "/quit"])
+    run_session(_chat_args(tmp_path), overrides={
+        "reader": reader, "llm": StubLLM(),
+        "router_llm": _AgentLLM({"say": "The manual says populate in pairs.",
+                                  "tool": "none"})})
+    out = capsys.readouterr().out
+    assert "agent: The manual says populate in pairs." in out
+    assert out.count("The manual says populate in pairs.") == 1
+
+
+def test_chat_resume_continues_in_place(tmp_path, capsys):
+    """`harness chat --resume <dir>` re-enters THAT session: the conversation
+    keeps growing in the same session.json (no new chat-<ts> dir)."""
+    session_dir = tmp_path / "sessions" / "chat-1"
+    session_dir.mkdir(parents=True)
+    (session_dir / "session.json").write_text(json.dumps({
+        "mode": "chat",
+        "transcript": [{"role": "user", "kind": "message",
+                        "content": "earlier question"}],
+    }), encoding="utf-8")
+    args = build_parser().parse_args([
+        "chat", "--resume", str(session_dir),
+        "--out-dir", str(tmp_path / "runs"),
+        "--session-dir", str(tmp_path / "sessions"),
+        "--llm", "stub"])
+    reader = _ScriptedReader(["follow-up message", "/quit"])
+    code = run_session(args, overrides={"reader": reader, "llm": StubLLM(),
+                                        "router_llm": _NoChatLLM()})
+    assert code == 0
+    assert "resumed (chat)" in capsys.readouterr().out
+    payload = json.loads(
+        (session_dir / "session.json").read_text(encoding="utf-8"))
+    contents = [e.get("content") for e in payload["transcript"]]
+    assert "earlier question" in contents
+    assert "follow-up message" in contents
+    assert [p.name for p in (tmp_path / "sessions").iterdir()] == ["chat-1"]

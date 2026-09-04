@@ -9,8 +9,8 @@ chain steps and answer follow-up questions grounded in the evidence it
 gathered. Debugging is iterative, not one-shot: keep prompting, ask for
 re-checks, steer the agent while it works.
 
-``harness chat`` starts the CHAT REPL: no target, no connection. A pure
-reference assistant -- manual/docs lookups, past-run loading, and reading
+``harness chat`` starts the CHAT REPL: no target, no connection. A general
+technical assistant -- manual/docs lookups, past-run loading, and reading
 files you reference by path (e.g. a FAT log; factory-test logs also match
 prior verified fixes from the case library).
 
@@ -38,6 +38,7 @@ Every turn and every run is persisted to ``--session-dir`` as ``session.json``
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import io
 import json
@@ -58,7 +59,14 @@ from ..inspect.base import RegisterDump
 from ..operator.supervisor import Escalation
 from ..targets import TargetError, TargetSpec, resolve_target
 from . import ui
-from .chat_agent import ChatTurn, build_evidence, build_messages, decide, fallback_turn
+from .chat_agent import (
+    ChatTurn,
+    build_evidence,
+    build_messages,
+    decide,
+    fallback_turn,
+    strip_images,
+)
 from .credential_gate import apply_ssh_context
 from .menu import LineReader as _LineReader
 from .router import _keyword_route
@@ -98,6 +106,11 @@ class Session:
     transcript: list[dict] = field(default_factory=list)
     evidence: str = ""       # digest of the latest diagnosis (chat grounding)
     pending: list[str] = field(default_factory=list)
+    pending_images: list[tuple[str, str]] = field(default_factory=list)
+    # (label, b64_png) page renders queued by the docs tool for the NEXT agent
+    # turn (vision RAG); cleared every turn so nothing stale rides along.
+    vision_ok: bool | None = None   # None = not probed yet (non-Gemini endpoints)
+    vision_disabled: bool = False   # endpoint rejected image parts; stay text-only
     test_logs: list[str] = field(default_factory=list)  # queued --test-log paths
     runs: list[Path] = field(default_factory=list)
     last_run: Path | None = None
@@ -403,10 +416,80 @@ def _tool_verify(session: Session, turn: ChatTurn,
     return "\n".join(lines) or "(verify produced no output)"
 
 
+def _llm_supports_vision(session: Session) -> bool:
+    """Whether the session's LLM can accept image parts.
+
+    Gemini is vision-capable by construction; OpenAI-compatible endpoints
+    (vLLM/llama.cpp gateways) are probed once per session with a 1x1 PNG;
+    stub never. A rejected probe or a mid-session rejection sets
+    ``vision_disabled`` so later lookups skip rendering entirely."""
+    if session.vision_disabled:
+        return False
+    if session.vision_ok is not None:
+        return session.vision_ok
+    llm = session.llm
+    from ..diagnosis.llm import GeminiLLM, StubLLM
+    if isinstance(llm, StubLLM) or not hasattr(llm, "caption_image"):
+        session.vision_ok = False
+        return False
+    if isinstance(llm, GeminiLLM):
+        session.vision_ok = True
+        return True
+    try:  # one tiny probe: text-only endpoints reject image parts with a 400
+        llm.caption_image(_VISION_PROBE_PNG)
+    except Exception:  # noqa: BLE001 - any failure = no vision this session
+        session.vision_ok = False
+        return False
+    session.vision_ok = True
+    return True
+
+
+# 67-byte valid 1x1 gray PNG; enough to learn whether the endpoint takes images.
+_VISION_PROBE_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mM8Z+RfDwADfgG4"
+    "j8x0rAAAAABJRU5ErkJggg==")
+
+
+def _queue_page_images(session: Session, query: str, lib_dir: str | None) -> str | None:
+    """Vision RAG: queue page renders behind the retrieved snippets.
+
+    Re-ranks the query against the library (deterministic BM25, same order as
+    the text lines), dedups the top snippets to <=3 unique pages, renders each
+    from the uploaded source PDFs, and queues them on the session for the next
+    agent turn. Returns a note for the tool result (None when nothing queued).
+    """
+    if not _llm_supports_vision(session):
+        return None
+    try:
+        from ..docs.ingest.library import DocLibrary
+        lib = DocLibrary(lib_dir or "harness_docs")
+        rag = lib.build_retriever()
+        if rag is None:
+            return None
+        snippets = rag.retrieve(query, top_k=5)
+    except Exception:  # noqa: BLE001 - vision is best-effort, never blocks docs
+        return None
+    images: list[tuple[str, str]] = []
+    seen: set[tuple[str, int]] = set()
+    for s in snippets:
+        key = (s.title, s.page)
+        if key in seen or len(images) >= 3:
+            continue
+        seen.add(key)
+        png = lib.page_image(s.title, s.page)
+        if png:
+            images.append((f"{s.title} p.{s.page}", base64.b64encode(png).decode("ascii")))
+    if not images:
+        return None
+    session.pending_images = images
+    return (f"[{len(images)} page image(s) attached for vision: "
+            + ", ".join(label for label, _ in images) + "]")
+
+
 def _tool_docs(session: Session, turn: ChatTurn) -> str:
-    if not session.docs_lib and not session.docs_dir:
-        return ("(no doc library configured; set --docs-lib / --docs-dir or "
-                "use `harness docs add`)")
+    # No early return when docs_lib/docs_dir are unset: _build_docs_retriever
+    # auto-discovers the default harness_docs/ library (same as diagnose),
+    # so a bare `harness chat` still reaches indexed documents.
     from types import SimpleNamespace
 
     from ..operator.cli import _build_docs_retriever
@@ -417,7 +500,8 @@ def _tool_docs(session: Session, turn: ChatTurn) -> str:
     lines = retriever(turn.query or "", None)
     if not lines:
         return f"(no snippets matched {turn.query!r})"
-    return "\n".join(f"- {line}" for line in lines)
+    note = _queue_page_images(session, turn.query or "", _lib)
+    return "\n".join(f"- {line}" for line in lines) + (f"\n{note}" if note else "")
 
 
 def _tool_run(session: Session, turn: ChatTurn) -> str:
@@ -925,6 +1009,7 @@ def _run_agent(session: Session, line: str,
     needs was already printed/streamed).
     """
     context_lines = list(session.pending)  # queued notes feed THIS turn
+    images: list[tuple[str, str]] = []  # vision RAG pages for the next decide()
     first = True
     tool_calls = 0
     max_tools = _tool_budget(session)
@@ -934,15 +1019,30 @@ def _run_agent(session: Session, line: str,
             raise Escalation("run cancelled by operator")
         if first:
             progress("thinking: the agent is considering your message ...")
+        if session.pending_images:  # e.g. queued by a docs tool call last chain step
+            images = list(session.pending_images)
+            session.pending_images = []
         messages = build_messages(
             transcript=session.transcript, user_text=line,
             evidence_digest=session.evidence,
             host_names=tuple(session.inv.host_names),
             target_label=session.target_label,
             pending=context_lines if first else [],
-            mode=session.mode)
+            mode=session.mode,
+            images=images or None)
         turn = decide(session.router_llm, messages,
                       tuple(session.inv.host_names), mode=session.mode)
+        if turn is None and images:
+            # The endpoint rejected the image parts (or garbled them): retry
+            # text-only once and stop attaching pages for the session.
+            session.vision_disabled = True
+            session.vision_ok = False
+            progress("vision: page images rejected by the model endpoint; "
+                     "continuing text-only")
+            messages = strip_images(messages)
+            turn = decide(session.router_llm, messages,
+                          tuple(session.inv.host_names), mode=session.mode)
+        images = []  # images attach to one decision, not the whole chain
         if turn is None:
             if not first:
                 break  # mid-chain LLM failure: stop with what we have
@@ -957,11 +1057,15 @@ def _run_agent(session: Session, line: str,
         if turn.say:
             _say(session, progress, turn.say)
         if turn.tool in ("", "none"):
-            return turn.say or final
+            # A say was already streamed ("agent: ..."); returning it here
+            # would print the same answer twice (cyan say + green "+ done").
+            # A final tool result from earlier chain steps is still worth the
+            # "+ done" line.
+            return None if turn.say else final
         if tool_calls >= max_tools:
             progress("tool-call budget reached for this message; send another "
                      "message to continue")
-            return final or turn.say
+            return final
         tool_calls += 1
         session.transcript.append(
             {"role": "agent", "kind": "action", "content": _action_text(turn)})
@@ -1167,9 +1271,10 @@ def _slash_docs(session: Session, arg: str) -> None:
     """``/docs ls | add <file...> | rm <name> | reindex`` -- manage the RAG
     document library without leaving the session."""
     from ..docs.ingest.library import DocLibrary
-    from ..docs.ingest.vision import vision_captioner
+    from .cli import _session_captioner
 
-    lib = DocLibrary(session.docs_lib or "harness_docs", ocr=vision_captioner())
+    lib = DocLibrary(session.docs_lib or "harness_docs",
+                     ocr=_session_captioner(session))
     parts = arg.split(None, 1)
     action = parts[0] if parts else "ls"
     rest = parts[1] if len(parts) > 1 else ""
@@ -1181,13 +1286,15 @@ def _slash_docs(session: Session, arg: str) -> None:
                 return
             for e in entries:
                 suffix = f"  ERROR: {e.error}" if e.error else ""
-                _print_line(session, f"  {e.name}  {e.chunks} chunk(s){suffix}")
+                _print_line(session, f"  {e.name}  {e.chunks} chunk(s)"
+                                     + (f"  captions={e.captions}" if e.captions else "")
+                                     + suffix)
         elif action == "add":
             files = shlex.split(rest)
             if not files:
                 _print_line(session, "  usage: /docs add <file> [file ...]")
                 return
-            for line in lib.add(files):
+            for line in lib.add(files, progress=lambda t: _print_line(session, f"  {t}")):
                 _print_line(session, f"  {line}")
         elif action == "rm":
             if not rest:
@@ -1195,7 +1302,7 @@ def _slash_docs(session: Session, arg: str) -> None:
                 return
             _print_line(session, f"  {lib.remove(rest)}")
         elif action == "reindex":
-            for line in lib.reindex():
+            for line in lib.reindex(progress=lambda t: _print_line(session, f"  {t}")):
                 _print_line(session, f"  {line}")
         else:
             _print_line(session, "  usage: /docs ls | add <file...> | rm <name> | reindex")
@@ -1596,7 +1703,9 @@ def _list_sessions(session: Session) -> None:
             continue
         first = next((e.get("content") for e in payload.get("transcript", [])
                       if e.get("kind") == "message"), "")
-        _print_line(session, f"  {path}  host={payload.get('host')}  "
+        mode = payload.get("mode") or "debug"
+        host = f"  host={payload.get('host')}" if payload.get("host") else ""
+        _print_line(session, f"  {path}  [{mode}]{host}  "
                              f"'{str(first)[:60]}'")
         shown += 1
     if not shown:
@@ -1723,6 +1832,10 @@ def _run_chat(args, overrides: dict) -> int:
     llm_ident = _llm_ident_for(args, inv)
     llm_mode = "stub" if llm_ident == "stub" else llm_ident.split("/")[0]
 
+    # --resume continues THAT session: point session_dir at it so the saved
+    # transcript keeps growing in the same session.json (menu "continue" and
+    # `harness chat --resume` both re-enter the same conversation).
+    resume = getattr(args, "resume", None) or None
     session = Session(
         mode="chat",
         inv_path="",
@@ -1730,7 +1843,8 @@ def _run_chat(args, overrides: dict) -> int:
         host=None,
         store=store,
         out_dir=Path(args.out_dir),
-        session_dir=Path(args.session_dir) / f"chat-{int(time.time())}",
+        session_dir=(Path(resume) if resume
+                     else Path(args.session_dir) / f"chat-{int(time.time())}"),
         llm=llm,
         router_llm=router_llm,
         llm_mode=llm_mode,
@@ -1746,8 +1860,8 @@ def _run_chat(args, overrides: dict) -> int:
         cases_dir=getattr(args, "cases_dir", None),
         overrides=overrides,
     )
-    if getattr(args, "resume", None):
-        _load_session(session, Path(args.resume))
+    if resume:
+        _load_session(session, Path(resume))
 
     on_session = overrides.get("on_session")
     if on_session is not None:

@@ -131,11 +131,28 @@ harness docs reindex                 # rebuild index, retries failures
 Supported formats: PDF, Markdown, plain text, CSV, JSON, `.log`, and DOCX
 (`.docx` needs the `docs` extra's python-docx dependency). PDF image content is
 not lost: pages are run through the configured vision LLM (scanned pages and
-embedded diagrams/callouts are transcribed into searchable text). Captioning
-uses the same endpoint config as the diagnosis LLM (`HARNESS_LLM_URL`,
-`HARNESS_LLM_MODEL`, `HARNESS_LLM_API_KEY`; `HARNESS_LLM_PROVIDER=none` disables
-it) and degrades to text-only when the endpoint is unreachable -- `docs reindex`
-retries the images once it is back.
+embedded diagrams/callouts are transcribed into searchable text; repeated
+logos are captioned once per document). Captioning resolves the model the
+same way chat does: `HARNESS_LLM_*` env first, then your remembered model
+(`config/models.yaml` current — including its rack-manager tunnel), then the
+inventory `llm:` block; `HARNESS_LLM_PROVIDER=none` disables it. A failed or
+text-only endpoint degrades to text-only ingest with a visible warn line —
+re-run `harness docs reindex --force` once the vision endpoint works
+(`--force` re-captures even unchanged files). `docs ls` shows per-document
+`captions=` counts.
+
+Already-indexed libraries that predate image captioning need the force flag:
+
+```powershell
+harness docs reindex --force      # caption images in unchanged PDFs too
+```
+
+In chat/debug sessions the agent can also be shown the actual pages: when the
+session model is vision-capable (Gemini, or an OpenAI-compatible endpoint that
+accepts image parts), a `docs` lookup renders up to 3 retrieved pages from the
+uploaded PDFs and attaches them to the agent's next turn. Non-vision models
+(local text-only, stub) see captions only; if the endpoint rejects image parts
+mid-session, the agent retries text-only and stays text-only for the session.
 
 Vendor PDFs are git-ignored; they live on your machine only.
 
@@ -196,6 +213,10 @@ harness chat> what does the manual say about DIMM population rules?
   `debug` uses -- pass `--inventory <file>` explicitly, or a single inventory
   under `config/` is auto-used. An explicit `--llm-url` (workstation-reachable
   endpoint) or a non-tunnel model (`--llm-model`) skips the hop entirely.
+- Every conversation is saved (transcript + grounded context) and listed
+  under "Inspect past runs" with a `chat |` tag -- pick one and `continue`
+  re-enters it in place, or start it directly:
+  `harness chat --resume <session-dir>`.
 - Target tools (`diagnose`/`probe`/`verify`) are unavailable: the agent says
   so and points you at `harness debug` for live debugging.
 - Slash commands: `/help`, `/model`, `/context`, `/status`, `/stop`, `/runs`,
@@ -395,6 +416,17 @@ Under `harness_runs/<run-id>/`:
 - `trace.json` — what was planned, collected, decoded, and concluded.
 - `audit.jsonl` — append-only audit chain (redacted).
 - `dumps/*.txt` — raw collector output for manual cross-checking.
+
+Chat sessions are saved alongside the runs (`harness_runs/sessions/chat-*`)
+and listed in the same "Inspect past runs" menu, tagged `chat |` with the
+date, message count, and your first message so they are type-to-filter
+findable. Picking one offers chat-specific views:
+
+- `continue` — re-enter that conversation where it left off (the same
+  session keeps growing; equivalent to `harness chat --resume <dir>`).
+- `transcript` — print the saved conversation (`[you]` / `[agent]` /
+  `[tool]` rows).
+- `delete` — remove the saved session after a confirm.
 
 ### Deleting runs
 

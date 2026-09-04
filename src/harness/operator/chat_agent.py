@@ -12,7 +12,7 @@ Two modes share this machinery:
 
 - ``"debug"``: the operator picked a target; the agent drives read-only
   debugging tools (diagnose / probe / docs / verify / run / file).
-- ``"chat"``: no target, no connection.  A pure reference assistant: docs
+- ``"chat"``: no target, no connection.  A general technical assistant: docs
   lookup, past-run loading, and reading files the operator references by path.
 
 Read-only safety is unchanged: the agent only ever picks WHICH existing
@@ -113,23 +113,26 @@ DEBUG_CONTRACT = """Respond with STRICT JSON only (no markdown fences, no prose)
 - file fields: path (required -- local file path the operator referenced).
 "say" is always required and is printed to the operator first."""
 
-CHAT_SYSTEM = """You are the conversational assistant of a READ-ONLY
-server-debugging harness. This is CHAT mode: you never connect to machines,
-run probes, or inspect live hardware. You help the operator by (a) answering
-questions from the harness's manual/document library, (b) loading and
-explaining past diagnosis runs, and (c) reading files the operator references
-by path (logs, reports) and reasoning over their contents.
+CHAT_SYSTEM = """You are the operator's assistant in the harness chat: a general
+technical companion for server and platform engineering work. This is CHAT
+mode: you never connect to machines, run probes, or inspect live hardware. You
+help by answering questions -- hardware, firmware, platform, tooling,
+process, or whatever else the operator brings -- and by using the tools below
+when they make the answer more concrete.
 
 Hard rules:
 - Never claim to have inspected a live machine, run a probe, or collected
   evidence from a target. This session cannot connect to anything.
-- Ground every factual claim in tool results from this conversation (docs
-  snippets, past-run evidence, file contents). Distinguish what a document or
-  file says from what you infer. When you infer, say that you are inferring.
-- If the operator wants a live diagnosis of a machine, say so plainly: this
-  chat cannot do that -- they should use "Debug a target" (``harness debug``)
-  instead. Then offer what you CAN do here: read their log file, look up the
-  manuals, or load a past run.
+- Answer from your own knowledge when that is enough; reach for the tools when
+  the manuals, a past run, or a referenced file will ground the answer better.
+  When a tool result informed your answer, say what came from where. When you
+  recall or infer, say so -- never invent citations, register values, or file
+  contents.
+- If the operator needs live inspection or a diagnosis of a machine, mention
+  briefly that "Debug a target" (``harness debug``) does that, and offer what
+  you CAN do here: read their log file, look up the manuals, or load a past
+  run. Do not refuse to discuss the topic itself -- explaining, interpreting,
+  and advising are exactly what this chat is for.
 
 Tools (at most one per response):
 - "docs": manual / architecture lookup. Fields: query (required).
@@ -148,7 +151,8 @@ Always fill "say" -- it is shown to the operator before anything runs. When
 calling a tool, say briefly what you are about to do and why (1-2 sentences).
 You will see each tool's result before your next decision, and you may chain
 tools until you can answer; stop (tool "none") as soon as you can. Prefer
-looking something up over guessing."""
+looking something up over guessing when the operator needs a precise,
+checkable answer."""
 
 CHAT_CONTRACT = """Respond with STRICT JSON only (no markdown fences, no prose):
 {"say": "...", "tool": "docs"|"run"|"file"|"none", <tool fields>}
@@ -304,10 +308,15 @@ def build_messages(*, transcript: list[dict], user_text: str,
                    host_names: tuple[str, ...] = (),
                    target_label: str = "",
                    pending: list[str] | None = None,
-                   mode: Mode = "debug") -> list[dict]:
+                   mode: Mode = "debug",
+                   images: list[tuple[str, str]] | None = None) -> list[dict]:
     """Chat messages for one agent decision: system prompt + dialog window +
     a final user message carrying the current state (evidence digest, queued
-    notes, the operator's line, and the output contract)."""
+    notes, the operator's line, and the output contract).
+
+    ``images`` is a list of ``(label, b64_png)`` page renders (vision RAG);
+    when present the final user message becomes an OpenAI-style content-parts
+    list so a vision-capable model can actually look at the pages."""
     messages: list[dict] = [{"role": "system",
                              "content": SYSTEM_PROMPTS[mode]}]
     for entry in list(transcript)[-_TRANSCRIPT_WINDOW:]:
@@ -336,8 +345,48 @@ def build_messages(*, transcript: list[dict], user_text: str,
                       + "\nUse the 'run' tool to load one of these instead of "
                       "launching a new diagnosis.")
     blocks.append(CONTRACTS[mode])
-    messages.append({"role": "user", "content": "\n\n".join(blocks)})
+    final_text = "\n\n".join(blocks)
+    if images:
+        parts: list[dict] = [{
+            "type": "text",
+            "text": final_text + "\n\n## Attached Page Images (vision RAG)\n"
+                    + "\n".join(f"- {label}" for label, _ in images)
+                    + "\nRead these document pages as evidence for the "
+                      "operator's question.",
+        }]
+        parts += [{"type": "image_url",
+                   "image_url": {"url": f"data:image/png;base64,{b64}"}}
+                  for _, b64 in images]
+        messages.append({"role": "user", "content": parts})
+    else:
+        messages.append({"role": "user", "content": final_text})
     return messages
+
+
+def messages_have_images(messages: list[dict]) -> bool:
+    """True when any message carries multimodal content parts with images."""
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list) and any(
+                isinstance(p, dict) and p.get("type") == "image_url"
+                for p in content):
+            return True
+    return False
+
+
+def strip_images(messages: list[dict]) -> list[dict]:
+    """Copy of ``messages`` with image parts removed (text parts kept) -- the
+    text-only retry when an endpoint rejects vision content."""
+    out: list[dict] = []
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            text = "\n".join(str(p.get("text", "")) for p in content
+                             if isinstance(p, dict) and p.get("type") == "text")
+            out.append({**m, "content": text})
+        else:
+            out.append(m)
+    return out
 
 
 def _referenced_runs(user_text: str) -> list[str]:

@@ -50,26 +50,42 @@ def ingest_llm():
 class VisionCaptioner:
     """PNG-bytes -> text over an LLM adapter, with failure latching.
 
-    The first failed caption (unreachable endpoint, HTTP error, empty reply)
-    raises and every later call short-circuits, so a 200-page scanned PDF with
-    a dead endpoint costs one connection attempt instead of 200 timeouts.
-    ``failures`` counts failed caption attempts for status/warn surfaces.
+    Transient per-image failures (an occasional empty reply from a
+    thinking-then-answering model) are retried inside ``caption_image`` and
+    tolerated here; the captioner only latches off after ``max_failures``
+    consecutive failures, so a flaky page never kills a 200-page batch while
+    a dead endpoint still costs bounded attempts. ``failures`` counts failed
+    caption attempts and ``error`` holds the first failure, for the warn
+    surface; the parser degrades each failed image to text-only.
     """
+
+    max_consecutive_failures = 5
 
     def __init__(self, llm) -> None:
         self.llm = llm
         self.failures = 0
+        self._consecutive = 0
+        self.error: str | None = None  # first failure, for the warn surface
         self._dead = False
 
     def __call__(self, png: bytes) -> str:
         if self._dead:
-            raise LLMError("vision captioner disabled after a failed call")
+            raise LLMError("vision captioner disabled after repeated failures")
+        # The hook receives PNG bytes from page renders and native JPEG bytes
+        # for small embedded JPEGs; sniff the mime from the magic bytes.
+        mime = "image/jpeg" if png[:3] == b"\xff\xd8\xff" else "image/png"
         try:
-            return self.llm.caption_image(png, prompt=CAPTION_PROMPT)
-        except Exception:
+            text = self.llm.caption_image(png, prompt=CAPTION_PROMPT, mime=mime)
+        except Exception as exc:
             self.failures += 1
-            self._dead = True
+            self._consecutive += 1
+            if self.error is None:
+                self.error = f"{type(exc).__name__}: {exc}"
+            if self._consecutive >= self.max_consecutive_failures:
+                self._dead = True
             raise
+        self._consecutive = 0
+        return text
 
 
 def vision_captioner(llm=None) -> Callable[[bytes], str] | None:

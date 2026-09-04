@@ -446,7 +446,7 @@ def test_diagnose_console_requires_console_block(tmp_path):
 
 
 class _FakePdfParser:
-    def __init__(self, ocr=None):  # ocr: vision captioner passed by DocLibrary
+    def __init__(self, ocr=None, progress=None):  # vision captioner + pulse
         self.ocr = ocr
 
     def parse(self, path):
@@ -494,8 +494,8 @@ def test_docs_add_wires_env_captioner(tmp_path, monkeypatch):
     captured = {}
 
     class _SpyParser(_FakePdfParser):
-        def __init__(self, ocr=None):
-            super().__init__(ocr=ocr)
+        def __init__(self, ocr=None, progress=None):
+            super().__init__(ocr=ocr, progress=progress)
             captured["ocr"] = ocr
 
     monkeypatch.setattr(lib_mod, "PdfParser", _SpyParser)

@@ -93,28 +93,44 @@ class OpenAICompatLLM:
                     pass
             raise LLMError(f"LLM returned non-JSON: {content[:200]!r}") from None
 
-    def caption_image(self, png_bytes: bytes, prompt: str | None = None) -> str:
-        """Vision captioning: describe/transcribe a PNG via a multimodal turn.
+    def caption_image(self, image_bytes: bytes, prompt: str | None = None,
+                      mime: str = "image/png") -> str:
+        """Vision captioning: describe/transcribe an image via a multimodal turn.
 
         Sends the image as a base64 data URL part (OpenAI wire format, honored
         by Gemini's OpenAI-compat layer and vLLM vision models) and returns the
-        model's plain-text reply. Raises :class:`LLMError` on transport or
-        malformed-reply failure so callers can degrade to text-only ingest.
+        model's plain-text reply. One retry on an empty/malformed reply (models
+        that think-before-answering occasionally emit an empty content with an
+        otherwise healthy envelope); transport failures raise immediately.
+        Raises :class:`LLMError` on final failure so callers can degrade to
+        text-only ingest.
         """
-        b64 = base64.b64encode(png_bytes).decode("ascii")
+        b64 = base64.b64encode(image_bytes).decode("ascii")
         messages = [{"role": "user", "content": [
             {"type": "text", "text": prompt or CAPTION_PROMPT},
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
         ]}]
         body = {"model": self.model, "messages": messages, "temperature": 0.0}
-        data = self._post_chat(body)
+        content = self._caption_content(self._post_chat(body))
+        if content is not None:
+            return content
+        # One retry: models that think before answering occasionally emit an
+        # empty content with an otherwise healthy envelope (observed on a
+        # rack-served vLLM vision model mid-batch).
+        content = self._caption_content(self._post_chat(body))
+        if content is None:
+            raise LLMError("LLM caption reply was empty")
+        return content
+
+    def _caption_content(self, data: dict) -> str | None:
+        """Caption text from a reply envelope; None when the content is empty."""
         try:
             content = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMError(f"LLM caption reply malformed: {exc}") from exc
-        if not isinstance(content, str) or not content.strip():
-            raise LLMError("LLM caption reply was empty")
-        return content.strip()
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        return None
 
     def _post_chat(self, body: dict) -> dict:
         """POST a chat-completions body, returning the parsed reply envelope."""
@@ -342,6 +358,7 @@ class StubLLM:
             "tool": "none",
         }
 
-    def caption_image(self, png_bytes: bytes, prompt: str | None = None) -> str:
+    def caption_image(self, png_bytes: bytes, prompt: str | None = None,
+                      mime: str = "image/png") -> str:
         """Deterministic offline caption so vision paths run (and test) without infra."""
         return "(stub caption) no vision LLM configured; image content unavailable."
