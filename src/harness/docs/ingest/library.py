@@ -316,7 +316,13 @@ class DocLibrary:
 
     def entries(self) -> list[DocEntry]:
         manifest = self._manifest()
-        return [DocEntry(name=n, **fields) for n, fields in sorted(manifest.items())]
+        known = set(DocEntry.__dataclass_fields__) - {"name"}
+        # Unknown manifest keys are dropped, not passed through: a long-running
+        # session must survive manifest fields written by a NEWER harness
+        # (observed as "DocEntry.__init__() got an unexpected keyword argument
+        # 'captions'" in a chat session predating the field's introduction).
+        return [DocEntry(name=n, **{k: v for k, v in fields.items() if k in known})
+                for n, fields in sorted(manifest.items())]
 
     def build_retriever(self) -> RagPipeline | None:
         """Retriever over the cached index. Returns None when the library is empty."""

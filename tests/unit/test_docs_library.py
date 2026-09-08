@@ -235,6 +235,25 @@ def test_remove_text_file(tmp_path):
     assert lib.build_retriever() is None
 
 
+def test_entries_tolerate_unknown_manifest_fields(tmp_path):
+    """A manifest written by a NEWER harness must not crash a running session:
+    unknown fields are dropped, known ones (incl. captions) survive."""
+    import json as _json
+
+    lib = DocLibrary(tmp_path / "lib")
+    txt = _write_pdf(tmp_path, "a.md", "# A\n\ncontent here")
+    lib.add([txt])
+    manifest_path = tmp_path / "lib" / "index.json"
+    manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["a.md"]["captions_v2"] = {"future": "field"}
+    manifest["a.md"]["chunks"] = 2
+    manifest_path.write_text(_json.dumps(manifest), encoding="utf-8")
+
+    entry = DocLibrary(tmp_path / "lib").entries()[0]
+    assert entry.chunks == 2
+    assert entry.error is None
+
+
 def test_add_json_flattened_for_search(tmp_path):
     lib = DocLibrary(tmp_path / "lib")
     js = tmp_path / "sensors.json"
