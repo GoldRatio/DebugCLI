@@ -62,7 +62,10 @@ serves two modes:
 
 Both modes persist `session.json` under `--session-dir` (mode, transcript,
 runs) and fall back to the deterministic keyword router when the conversation
-LLM is unavailable.
+LLM is unavailable. Re-entry auto-continues the newest matching session
+(chat: any chat; debug: the same target label), so one conversation maps to
+one `session.json`; `--new` forces a fresh dir, and a session dir is only
+created once it has content (no empty `chat-<ts>` dirs).
 
 ## Execution domains
 

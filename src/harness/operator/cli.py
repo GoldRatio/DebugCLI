@@ -3548,6 +3548,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="where chat sessions are saved (see /history, /resume)")
     p.add_argument("--resume", default=None,
                    help="resume a saved session directory at startup")
+    p.add_argument("--new", action="store_true",
+                   help="start a FRESH session instead of auto-continuing the "
+                        "newest saved session for this target")
     p.add_argument("--max-tools", type=int, default=0,
                    help="tool calls per operator message (default: 8 for debug)")
     p.add_argument("--cases-dir", default="harness_runs/cases",
@@ -3578,6 +3581,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="where chat sessions are saved (see /history, /resume)")
     p.add_argument("--resume", default=None,
                    help="resume a saved session directory at startup")
+    p.add_argument("--new", action="store_true",
+                   help="start a FRESH chat instead of auto-continuing the "
+                        "newest saved chat session")
     p.add_argument("--max-tools", type=int, default=0,
                    help="tool calls per operator message (default: 4 for chat)")
     p.add_argument("--cases-dir", default="harness_runs/cases",

@@ -1730,3 +1730,131 @@ def test_chat_resume_continues_in_place(tmp_path, capsys):
     assert "earlier question" in contents
     assert "follow-up message" in contents
     assert [p.name for p in (tmp_path / "sessions").iterdir()] == ["chat-1"]
+
+
+# ---- auto-continue: one conversation, one session.json ----
+
+def _saved_session(base: Path, name: str, mode: str, first: str,
+                   target_label: str | None = None) -> Path:
+    """Pre-existing saved session dir, as an earlier launch would have left it."""
+    d = base / name
+    d.mkdir(parents=True)
+    payload: dict = {"mode": mode, "transcript": [
+        {"role": "user", "kind": "message", "content": first}]}
+    if target_label:
+        payload["target_label"] = target_label
+    (d / "session.json").write_text(json.dumps(payload), encoding="utf-8")
+    return d
+
+
+def test_chat_auto_continues_newest_session(tmp_path, capsys):
+    """Re-entering chat with no --resume continues the NEWEST chat session:
+    the conversation keeps growing in one session.json instead of forking a
+    fresh chat-<ts> dir per launch (the runs picker stays one chat)."""
+    root = tmp_path / "sessions"
+    chat_dir = _saved_session(root, "chat-1", "chat", "earlier question")
+    # a NEWER debug session must NOT be picked up by chat mode
+    _saved_session(root, "h1-999", "debug", "debug turn", target_label="h1")
+    reader = _ScriptedReader(["hello there", "/quit"])
+    code = run_session(_chat_args(tmp_path), overrides={
+        "reader": reader, "llm": StubLLM(), "router_llm": _NoChatLLM()})
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "continuing chat-1" in out
+    assert "h1-999" not in out
+    payload = json.loads((chat_dir / "session.json").read_text(encoding="utf-8"))
+    contents = [e.get("content") for e in payload["transcript"]]
+    assert "earlier question" in contents and "hello there" in contents
+    assert sorted(p.name for p in root.iterdir()) == ["chat-1", "h1-999"]
+
+
+def test_chat_new_flag_starts_fresh_session(tmp_path, capsys):
+    """--new opts out of auto-continue: a fresh chat-<ts> dir is minted and
+    the previous session is left untouched."""
+    root = tmp_path / "sessions"
+    old_dir = _saved_session(root, "chat-1", "chat", "earlier question")
+    reader = _ScriptedReader(["hello there", "/quit"])
+    args = build_parser().parse_args([
+        "chat", "--new",
+        "--out-dir", str(tmp_path / "runs"),
+        "--session-dir", str(root),
+        "--llm", "stub"])
+    code = run_session(args, overrides={"reader": reader, "llm": StubLLM(),
+                                        "router_llm": _NoChatLLM()})
+    assert code == 0
+    assert "continuing" not in capsys.readouterr().out
+    dirs = sorted(root.iterdir())
+    assert len(dirs) == 2 and dirs[0].name == "chat-1"
+    old_payload = json.loads(
+        (old_dir / "session.json").read_text(encoding="utf-8"))
+    assert [e.get("content") for e in old_payload["transcript"]] == \
+        ["earlier question"]
+    new_payload = json.loads(
+        (dirs[1] / "session.json").read_text(encoding="utf-8"))
+    assert "hello there" in [e.get("content") for e in new_payload["transcript"]]
+
+
+def test_chat_fresh_launch_leaves_no_session_dir(tmp_path):
+    """A launch where nothing happened (no message, no run, no /model) must
+    not spawn an empty session dir -- no more 0-message chat clutter."""
+    run_session(_chat_args(tmp_path),
+                overrides={"reader": _ScriptedReader(["/quit"])})
+    root = tmp_path / "sessions"
+    assert not root.exists() or not any(root.iterdir())
+
+
+def test_debug_auto_continues_target_session(tmp_path, capsys):
+    """Repeated `harness debug --host h1` launches grow ONE session for the
+    target: the newest saved h1 session is auto-continued without --resume."""
+    root = tmp_path / "sessions"
+    h1_dir = _saved_session(root, "h1-123", "debug", "earlier symptom",
+                            target_label="h1")
+    reader = _ScriptedReader(["hello there", "/quit"])
+    code = run_session(_session_args(tmp_path), overrides={
+        "reader": reader, "llm": StubLLM(), "router_llm": StubLLM()})
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "continuing h1-123" in out
+    payload = json.loads((h1_dir / "session.json").read_text(encoding="utf-8"))
+    contents = [e.get("content") for e in payload["transcript"]]
+    assert "earlier symptom" in contents and "hello there" in contents
+    assert [p.name for p in root.iterdir()] == ["h1-123"]
+
+
+def test_debug_auto_continue_scoped_to_target(tmp_path, capsys):
+    """A different target's session is never hijacked: debugging h1 when the
+    only saved session belongs to h2-cable1 mints a fresh h1 dir."""
+    root = tmp_path / "sessions"
+    _saved_session(root, "h2-cable1-456", "debug", "other target's turn",
+                   target_label="h2-cable1")
+    run_session(_session_args(tmp_path), overrides={
+        "reader": _ScriptedReader(["hello there", "/quit"]), "llm": StubLLM(),
+        "router_llm": StubLLM()})
+    dirs = sorted(p.name for p in root.iterdir())
+    assert len(dirs) == 2 and dirs[0].startswith("h1-")
+    assert dirs[1] == "h2-cable1-456"
+    new_payload = json.loads(
+        (root / dirs[0] / "session.json").read_text(encoding="utf-8"))
+    contents = [e.get("content") for e in new_payload["transcript"]]
+    assert "hello there" in contents and "other target's turn" not in contents
+    assert "continuing" not in capsys.readouterr().out
+
+
+def test_debug_new_flag_starts_fresh_session(tmp_path, capsys):
+    root = tmp_path / "sessions"
+    _saved_session(root, "h1-123", "debug", "earlier symptom",
+                   target_label="h1")
+    args = build_parser().parse_args([
+        "debug", "--inventory", _inventory(tmp_path), "--host", "h1",
+        "--out-dir", str(tmp_path / "runs"),
+        "--session-dir", str(root),
+        "--llm", "stub", "--new"])
+    run_session(args, overrides={
+        "reader": _ScriptedReader(["hello there", "/quit"]), "llm": StubLLM(),
+        "router_llm": StubLLM()})
+    dirs = sorted(p.name for p in root.iterdir())
+    assert len(dirs) == 2 and dirs[0] == "h1-123"
+    new_payload = json.loads(
+        (root / dirs[1] / "session.json").read_text(encoding="utf-8"))
+    assert "hello there" in [e.get("content") for e in new_payload["transcript"]]
+    assert "continuing" not in capsys.readouterr().out

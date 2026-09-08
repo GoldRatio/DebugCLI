@@ -193,7 +193,10 @@ harness debug> the DIMM error is back on h1
 - Type-ahead: messages typed while a run is in progress are queued; the agent
   reads them on its next decision and they seed the next run as context.
 - Sessions persist under `--session-dir`; each run keeps `diagnosis.json` /
-  `trace.json` / `dumps.json` under `--out-dir`.
+  `trace.json` / `dumps.json` under `--out-dir`. Re-entering `harness debug`
+  for the same target auto-continues that target's newest session (one
+  conversation per target, no `--resume` needed); `--new` forces a fresh
+  session and `--resume <dir>` picks a specific one.
 
 ### Chat (target-less)
 
@@ -214,9 +217,11 @@ harness chat> what does the manual say about DIMM population rules?
   under `config/` is auto-used. An explicit `--llm-url` (workstation-reachable
   endpoint) or a non-tunnel model (`--llm-model`) skips the hop entirely.
 - Every conversation is saved (transcript + grounded context) and listed
-  under "Inspect past runs" with a `chat |` tag -- pick one and `continue`
-  re-enters it in place, or start it directly:
-  `harness chat --resume <session-dir>`.
+  under "Inspect past runs" with a `chat |` tag. Re-entering `harness chat`
+  auto-continues your newest chat, so one conversation stays one entry
+  instead of a new chat dir per launch (`--new` starts a fresh chat;
+  `--resume <session-dir>` re-enters a specific one; the "Inspect past runs"
+  `continue` action does the same).
 - Target tools (`diagnose`/`probe`/`verify`) are unavailable: the agent says
   so and points you at `harness debug` for live debugging.
 - Slash commands: `/help`, `/model`, `/context`, `/status`, `/stop`, `/runs`,

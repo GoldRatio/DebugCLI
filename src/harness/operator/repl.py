@@ -1374,7 +1374,7 @@ def _set_session_model(session: Session, catalog, profile) -> None:
     catalog.save()
     _print_line(session, ui.good(
         f"  model: {profile.ident} (active for the next run; saved)"))
-    _save_session(session)
+    _save_session(session, force=True)
 
 
 def _slash_model(session: Session, arg: str) -> None:
@@ -1580,11 +1580,11 @@ def _handle_slash(session: Session, line: str) -> None:
             session.ask_parts = True
             _print_line(session, "  ask-parts ON: diagnoses prompt for and store "
                                  "missing per-slot parts (kept on this session)")
-            _save_session(session)
+            _save_session(session, force=True)
         elif arg in ("off", "0", "no", "false"):
             session.ask_parts = False
             _print_line(session, "  ask-parts OFF")
-            _save_session(session)
+            _save_session(session, force=True)
         else:
             state = "ON" if session.ask_parts else "OFF"
             _print_line(session, f"  ask-parts is {state}; usage: /askparts on|off")
@@ -1594,8 +1594,50 @@ def _handle_slash(session: Session, line: str) -> None:
 
 # ---- persistence ----
 
-def _save_session(session: Session) -> None:
+def _newest_session(root: Path, mode: str,
+                    target_label: str | None = None) -> Path | None:
+    """Newest saved session under *root* worth auto-continuing, or None.
+
+    Chat matches payload ``mode == "chat"``; debug matches the resolved target
+    label (payload ``target_label`` first, ``<label>-<ts>`` dir-name prefix as
+    fallback). This is what keeps one conversation in one session.json across
+    REPL re-entries instead of forking a fresh ``chat-<ts>`` dir every launch.
+    """
+    if not root.is_dir():
+        return None
+    best: tuple[float, Path] | None = None
+    for path in root.iterdir():
+        payload_path = path / "session.json"
+        if not path.is_dir() or not payload_path.exists():
+            continue
+        try:
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if mode == "chat":
+            if payload.get("mode") != "chat":
+                continue
+        else:
+            if payload.get("mode") == "chat":
+                continue
+            label = payload.get("target_label") or path.name.rsplit("-", 1)[0]
+            if target_label and label != target_label:
+                continue
+        try:
+            mtime = payload_path.stat().st_mtime
+        except OSError:
+            continue
+        if best is None or mtime > best[0]:
+            best = (mtime, path)
+    return best[1] if best else None
+
+
+def _save_session(session: Session, force: bool = False) -> None:
     try:
+        payload_path = session.session_dir / "session.json"
+        if (not force and not payload_path.exists()
+                and not session.transcript and not session.runs):
+            return  # nothing to keep yet: don't spawn empty session dirs
         session.session_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "mode": session.mode,
@@ -1832,10 +1874,16 @@ def _run_chat(args, overrides: dict) -> int:
     llm_ident = _llm_ident_for(args, inv)
     llm_mode = "stub" if llm_ident == "stub" else llm_ident.split("/")[0]
 
-    # --resume continues THAT session: point session_dir at it so the saved
-    # transcript keeps growing in the same session.json (menu "continue" and
-    # `harness chat --resume` both re-enter the same conversation).
+    # One conversation, one session.json: an explicit --resume re-enters that
+    # exact session; with no --resume the newest saved chat is auto-continued
+    # so re-entering chat (menu or CLI) appends to it instead of forking yet
+    # another chat-<ts> dir. --new forces a fresh session.
     resume = getattr(args, "resume", None) or None
+    auto = None
+    if resume is None and not getattr(args, "new", False):
+        auto = _newest_session(Path(args.session_dir), "chat")
+        if auto is not None:
+            resume = str(auto)
     session = Session(
         mode="chat",
         inv_path="",
@@ -1861,6 +1909,8 @@ def _run_chat(args, overrides: dict) -> int:
         overrides=overrides,
     )
     if resume:
+        if auto is not None:
+            print(f"  continuing {auto.name} (newest chat; --new starts a fresh one)")
         _load_session(session, Path(resume))
 
     on_session = overrides.get("on_session")
@@ -1934,6 +1984,18 @@ def _run_debug(args, overrides: dict) -> int:
     if target is not None:
         apply_ssh_context(store, target, ssh_user=getattr(args, "ssh_user", "diagbot"))
 
+    # One session per target: an explicit --resume re-enters that session;
+    # with no --resume the newest saved session for THIS target is
+    # auto-continued, so repeated `harness debug --host h1` launches grow one
+    # session.json instead of spawning a fresh h1-<ts> dir each time.
+    # --new forces a fresh dir.
+    resume = getattr(args, "resume", None) or None
+    auto = None
+    if resume is None and target is not None and not getattr(args, "new", False):
+        auto = _newest_session(Path(args.session_dir), "debug",
+                               target_label=target.label)
+        if auto is not None:
+            resume = str(auto)
     session = Session(
         mode="debug",
         inv_path=args.inventory,
@@ -1941,9 +2003,9 @@ def _run_debug(args, overrides: dict) -> int:
         host=target.host if target is not None else None,
         store=store,
         out_dir=Path(args.out_dir),
-        session_dir=Path(args.session_dir) / (
+        session_dir=(Path(resume) if resume else Path(args.session_dir) / (
             f"{target.label}-{int(time.time())}" if target is not None
-            else f"session-{int(time.time())}"),
+            else f"session-{int(time.time())}")),
         llm=llm,
         router_llm=router_llm,
         llm_mode=llm_mode,
@@ -1967,8 +2029,11 @@ def _run_debug(args, overrides: dict) -> int:
         identity_vault_path=getattr(args, "identity_vault_path", None),
         known_hosts_path=getattr(args, "known_hosts_path", "config/known_hosts"),
     )
-    if getattr(args, "resume", None):
-        _load_session(session, Path(args.resume))
+    if resume:
+        if auto is not None:
+            print(f"  continuing {auto.name} (newest {target.label} session; "
+                  f"--new starts a fresh one)")
+        _load_session(session, Path(resume))
 
     on_session = overrides.get("on_session")
     if on_session is not None:

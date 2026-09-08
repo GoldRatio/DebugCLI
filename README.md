@@ -220,6 +220,12 @@ harness chat
 
 Resolution order: `--host` > `--target <alias>` > `--rack/--cable` > `--address`.
 
+Sessions continue themselves: re-entering `harness debug` for the same target
+(or `harness chat` at all) auto-continues the newest saved session, so one
+conversation stays one entry under "Inspect past runs" instead of becoming a
+new `chat-<timestamp>` dir per launch. `--new` starts a fresh session;
+`--resume <dir>` re-enters a specific one.
+
 ### Optional: rack-level Redfish evidence
 
 With a Redfish password configured, each console diagnosis **also** fetches
@@ -299,8 +305,8 @@ harness learning import <bundle.zip>          # on the other device (skips known
 |---|---|
 | `harness` / `harness menu` | Interactive menu: debug a target, inspect past runs, pick the model |
 | `harness setup` | Guided first-run wizard: inventory + credentials + LLM access |
-| `harness debug` (alias `session`) | Interactive debug REPL on a target; background runs, slash commands (`/model`, `/testlog`, `/quit`) |
-| `harness chat` | Target-less chat REPL: manuals, past runs, referenced files — no machine is contacted |
+| `harness debug` (alias `session`) | Interactive debug REPL on a target; background runs, slash commands (`/model`, `/testlog`, `/quit`); re-entering a target auto-continues its newest session (`--new` forces fresh) |
+| `harness chat` | Target-less chat REPL: manuals, past runs, referenced files — no machine is contacted; re-entering continues your latest chat (`--new` forces fresh) |
 | `harness diagnose` | One-shot read-only diagnosis of a target (CLI/automation) |
 | `harness console` | Run read-only probes over the serial console (lab/QA only) |
 | `harness verify --baseline <dumps.json>` | Re-run collectors, compare error counters |
