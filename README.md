@@ -71,10 +71,23 @@ so open a new one after any change.
 Find where pip put it:
 
 ```powershell
-python -m pip show -f harness   # "Location:" plus a ..\..\Scripts\harness.exe entry
-python -c "import sys, sysconfig; print(sysconfig.get_path('scripts'))"
-where.exe harness               # no output means it is not on PATH
-```
+# 1. Get the correct user-site scripts path for Microsoft Store Python
+$scripts = (python -c "import sysconfig; print(sysconfig.get_path('scripts', 'nt_user'))").Trim()
+ 
+# 2. Update the User Environment Variable in the Registry
+$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+if ($userPath -notlike "*$scripts*") {
+    [Environment]::SetEnvironmentVariable('Path', "$userPath;$scripts", 'User')
+    Write-Host "Successfully added to User PATH: $scripts" -ForegroundColor Green
+} else {
+    Write-Host "It is already present in the User PATH registry." -ForegroundColor Yellow
+}
+ 
+# 3. Instantly update the current open session's PATH
+if ($env:PATH -notlike "*$scripts*") {
+    $env:PATH += ";$scripts"
+    Write-Host "Updated current session PATH." -ForegroundColor Green
+}```
 
 A pip warning during install ("The script harness.exe is installed in
 '...' which is not on PATH") confirms the case. Common causes and fixes:
