@@ -52,6 +52,11 @@ class Target:
     trust_level: str
     host: Host
     console: ConsoleDomain | None = None
+    # Multi-service console access: one ConsoleDomain PER service port
+    # (BMC shell 2200, host SOL 22, ...) when console_defaults.services is
+    # configured. Handled by engine.services.MultiConsoleRunner; ``console``
+    # stays the legacy default domain either way.
+    console_services: dict[str, ConsoleDomain] | None = None
     ip: str | None = None
     model_hint: str | None = None  # canonical model key from a target alias
 
@@ -62,13 +67,17 @@ def _dummy_bmc() -> BMCDomain:
     return BMCDomain(address="", username="", password_vault_path="")
 
 
-def _synthetic_console_host(label: str, console: ConsoleDomain) -> Host:
+def _synthetic_console_host(label: str, console: ConsoleDomain,
+                            bmc: BMCDomain | None = None) -> Host:
     return Host(
         name=label,
         address="",
         model="unknown",
         ssh=SSHDomain(user="", identity_vault_path="", known_hosts_path=""),
-        bmc=_dummy_bmc(),
+        # A configured console_defaults.bmc block gives console targets the
+        # ipmitool-over-LAN channel (separate BMC credential domain, same as
+        # named hosts); absent, the BMC LAN channel stays unavailable.
+        bmc=bmc if bmc is not None else _dummy_bmc(),
         collector_profile="default",
         trust_level=console.trust_level,
         console=console,
@@ -195,9 +204,18 @@ def resolve_target(
     if spec.rack is not None and spec.cable is not None:
         console = _console_domain(inv, spec.rack, spec.cable, defaults=console_defaults)
         label = f"{console.rack}-cable{console.cable}"
+        defaults = console_defaults or inv.console_defaults
+        # Multi-service map only when services are configured; the legacy
+        # single-port path keeps console_services=None (unchanged behavior).
+        services = None
+        if defaults is not None and defaults.services:
+            services = defaults.consoles_for_rack(console.rack, console.cable)
         return Target(
             kind="console", label=label, trust_level=console.trust_level,
-            host=_synthetic_console_host(label, console), console=console,
+            host=_synthetic_console_host(
+                label, console,
+                bmc=defaults.bmc if defaults is not None else None),
+            console=console, console_services=services,
             model_hint=alias_model,
         )
 

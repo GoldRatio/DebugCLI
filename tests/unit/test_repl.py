@@ -21,6 +21,7 @@ from harness.operator.repl import (
     Session,
     _diagnose_argv,
     _handle_busy_line,
+    _load_session,
     _tool_file,
     run_session,
 )
@@ -1745,6 +1746,24 @@ def _saved_session(base: Path, name: str, mode: str, first: str,
         payload["target_label"] = target_label
     (d / "session.json").write_text(json.dumps(payload), encoding="utf-8")
     return d
+
+
+def test_load_session_applies_ssh_context(tmp_path, monkeypatch):
+    """Resuming a debug session re-resolves the target and, like a fresh
+    launch, pushes its credential context onto the store."""
+    from harness.operator import repl as repl_mod
+    d = _saved_session(tmp_path, "h1-123", "debug", "earlier symptom",
+                       target_label="h1")
+    payload = json.loads((d / "session.json").read_text(encoding="utf-8"))
+    payload["target"] = {"name": "h1"}
+    (d / "session.json").write_text(json.dumps(payload), encoding="utf-8")
+    session = _make_session(tmp_path)
+    marks = []
+    monkeypatch.setattr(repl_mod, "apply_ssh_context",
+                        lambda store, target, ssh_user="diagbot":
+                        marks.append((target.label, ssh_user)))
+    _load_session(session, d)
+    assert marks == [("h1", "diagbot")]
 
 
 def test_chat_auto_continues_newest_session(tmp_path, capsys):

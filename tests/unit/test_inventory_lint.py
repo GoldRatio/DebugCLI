@@ -180,3 +180,90 @@ def test_lint_llm_key_requires_vault_path():
                     llm=LLMConfig(provider="gemini", api_key_vault_path="A" * 70))
     issues = lint_inventory(inv)
     assert any("inline secret" in i.message for i in issues)
+
+
+# ---- multi-service console_defaults (services + bmc LAN block) ----
+
+_SERVICES_INV = (
+    "trust_level: lab\n"
+    "console_defaults:\n"
+    "  address: 192.168.202.51\n"
+    "  user: log\n"
+    "  identity_vault_path: secret/harness/rackmgr/id_ed25519\n"
+    "  known_hosts_path: config/rackmgr_known_hosts\n"
+    "  tool: jumpin\n"
+    "  trust_level: lab\n"
+    "  sudo_vault_path: secret/harness/bmc/sudo\n"
+    "  services:\n"
+    "    bmc:\n"
+    "      port: 2200\n"
+    "    host:\n"
+    "      port: 22\n"
+    "      node_user: root\n"
+    "      node_password_vault_path: secret/harness/node/pass\n"
+    "      programs: [lspci, dmidecode]\n"
+    "      subsystems: [pcie, storage, kernel]\n"
+    "  bmc:\n"
+    "    address: 10.0.0.11\n"
+    "    username: bmc-ro\n"
+    "    password_vault_path: secret/harness/bmc/bmc-ro\n"
+    "hosts: []\n"
+)
+
+
+def test_services_parse_and_expand(tmp_path):
+    from harness.config.models import default_programs_for_service, default_subsystems_for_service
+    inv_path = tmp_path / "inv.yaml"
+    inv_path.write_text(_SERVICES_INV, encoding="utf-8")
+    d = load_inventory(str(inv_path)).console_defaults
+    assert set(d.services) == {"bmc", "host"}
+    assert d.bmc is not None and d.bmc.address == "10.0.0.11"
+
+    domains = d.consoles_for_rack("Q61", "8")
+    assert set(domains) == {"bmc", "host"}
+    bmc, host = domains["bmc"], domains["host"]
+    assert bmc.port == 2200 and host.port == 22
+    # per-service credential overrides layer onto fleet defaults
+    assert bmc.sudo_vault_path == "secret/harness/bmc/sudo"
+    assert host.node_user == "root"
+    assert host.node_password_vault_path == "secret/harness/node/pass"
+    # name convention fills routing tables; explicit programs win
+    assert bmc.programs == default_programs_for_service("bmc")
+    assert bmc.subsystems == default_subsystems_for_service("bmc")
+    assert host.programs == ("lspci", "dmidecode")
+    assert host.subsystems == ("pcie", "storage", "kernel")
+    assert host.rack == "Q61" and host.cable == "8"
+
+
+def test_services_lint_clean(tmp_path):
+    inv_path = tmp_path / "inv.yaml"
+    inv_path.write_text(_SERVICES_INV, encoding="utf-8")
+    assert load_inventory(str(inv_path))  # no InventoryError
+
+
+def test_services_lint_duplicate_port(tmp_path):
+    inv_path = tmp_path / "inv.yaml"
+    inv_path.write_text(_SERVICES_INV.replace("      port: 22\n", "      port: 2200\n"),
+                        encoding="utf-8")
+    with pytest.raises(InventoryError, match="already used by service"):
+        load_inventory(str(inv_path))
+
+
+def test_services_lint_bad_service_name(tmp_path):
+    inv_path = tmp_path / "inv.yaml"
+    inv_path.write_text(
+        _SERVICES_INV.replace("  services:\n", "  services:\n")
+        .replace("    bmc:\n", "    bmc shell:\n"), encoding="utf-8")
+    with pytest.raises(InventoryError, match=r"must match \[A-Za-z0-9_-\]\+"):
+        load_inventory(str(inv_path))
+
+
+def test_services_lint_bmc_requires_address_and_vault(tmp_path):
+    inv_path = tmp_path / "inv.yaml"
+    inv_path.write_text(_SERVICES_INV
+                        .replace("    address: 10.0.0.11\n", "")
+                        .replace("    password_vault_path: secret/harness/bmc/bmc-ro\n",
+                                 "    address: 10.0.0.11\n"),
+                        encoding="utf-8")
+    with pytest.raises(InventoryError):
+        load_inventory(str(inv_path))

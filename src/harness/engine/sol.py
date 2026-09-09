@@ -825,11 +825,15 @@ class ConsoleRunner:
     """
 
     def __init__(self, console: SerialConsole,
-                 on_probe: Callable[[CommandResult], None] | None = None) -> None:
+                 on_probe: Callable[[CommandResult], None] | None = None,
+                 label: str | None = None) -> None:
         self._console = console
         self.calls: list[CommandResult] = []
         # Optional live listener: fired per recorded result (UI streaming).
         self.on_probe = on_probe
+        # Multi-service provenance label (the console_defaults.services key);
+        # stamped onto every result this runner records.
+        self.label = label
         # Results keyed by the WIRE command (absolute paths): a plan-level
         # pre-batch runs every probe once in ONE console session; later
         # per-collector executions dedupe against this cache.
@@ -874,6 +878,8 @@ class ConsoleRunner:
         return self._record(out)
 
     def _record(self, result: CommandResult) -> CommandResult:
+        if self.label is not None:
+            result.service = self.label
         self.calls.append(result)
         if self.on_probe is not None:
             self.on_probe(result)

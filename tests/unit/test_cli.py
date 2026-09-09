@@ -857,6 +857,169 @@ def test_diagnose_rack_cable_without_console_defaults_raises(tmp_path):
         run_diagnose(args, overrides={})
 
 
+# ---- multi-service console_defaults: one session, several service ports ----
+
+_MULTI_SERVICE_INVENTORY = (
+    "trust_level: lab\n"
+    "llm:\n"
+    "  provider: stub\n"
+    "console_defaults:\n"
+    "  address: 192.168.202.51\n"
+    "  user: log\n"
+    "  identity_vault_path: secret/harness/rackmgr/id_ed25519\n"
+    "  known_hosts_path: config/rackmgr_known_hosts\n"
+    "  tool: jumpin\n"
+    "  trust_level: lab\n"
+    "  sudo_vault_path: secret/harness/bmc/sudo\n"
+    "  services:\n"
+    "    bmc:\n"
+    "      port: 2200\n"
+    "    host:\n"
+    "      port: 22\n"
+    "hosts: []\n"
+)
+
+
+def _multi_service_inventory(tmp_path) -> str:
+    path = tmp_path / "inventory.yaml"
+    path.write_text(_MULTI_SERVICE_INVENTORY, encoding="utf-8")
+    return str(path)
+
+
+_MULTI_SERVICE_BMC_LAN_INVENTORY = _MULTI_SERVICE_INVENTORY.replace(
+    "hosts: []\n",
+    "  bmc:\n"
+    "    address: 10.0.0.11\n"
+    "    username: bmc-ro\n"
+    "    password_vault_path: secret/harness/bmc/bmc-ro\n"
+    "hosts: []\n")
+
+
+class _ServiceConsoleRunner(_FakeConsoleRunner):
+    """Adds the batch hook so the plan-level pre-batch path stays active."""
+
+    def __init__(self):
+        super().__init__()
+        self.label = None
+
+    def batch_execute(self, cmds, timeout=300.0):
+        return [self.execute(cmd.split()) for cmd in cmds]
+
+
+def test_diagnose_multi_service_routes_probes(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # isolate from any harness_docs/ discovery
+    bmc_r = _ServiceConsoleRunner()
+    host_r = _ServiceConsoleRunner()
+    args = build_parser().parse_args([
+        "diagnose", "--inventory", _multi_service_inventory(tmp_path),
+        "--rack", "Q61", "--cable", "8",
+        "--symptom", "Repair seems to be done",
+        "--out-dir", str(tmp_path / "runs"), "--llm", "stub", "--approve-all"])
+    run_diagnose(args, overrides={
+        "console_runners": {"bmc": bmc_r, "host": host_r}})
+
+    bmc_calls = [" ".join(c.argv) for c in bmc_r.calls]
+    host_calls = [" ".join(c.argv) for c in host_r.calls]
+    # BMC-shell subsystems (cpu_msr/kernel/ipmi via the name convention) run on 2200
+    assert "sudo -S ipmitool fru print" in bmc_calls
+    assert "sudo -S ipmitool sensor list" in bmc_calls
+    assert "sudo -S ipmitool sel list" in bmc_calls
+    assert "sudo -S i2cdump -y 8 0xb" in bmc_calls
+    assert "dmesg -r" in bmc_calls
+    # host-OS collectors run on the host SOL port (22) -- unreachable before
+    assert "/usr/bin/lspci -xxx" in host_calls
+    assert any(c.startswith("/bin/smartctl") for c in host_calls)
+    # and the two never leak onto each other's port
+    assert not any("ipmitool" in c for c in host_calls)
+    assert not any("lspci" in c or "smartctl" in c for c in bmc_calls)
+
+    run_dir = next((tmp_path / "runs").iterdir())
+    run_start = next(e.payload for e in
+                     AuditLog(run_dir / "audit.jsonl").read()
+                     if e.kind == "run_start")
+    assert run_start["services"] == {"bmc": 2200, "host": 22}
+
+
+def test_diagnose_multi_service_explicit_port_pins_legacy(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    console_runner = _FakeConsoleRunner()  # no batch_execute -> prebatch off
+    args = build_parser().parse_args([
+        "diagnose", "--inventory", _multi_service_inventory(tmp_path),
+        "--rack", "Q61", "--cable", "8", "--port", "2200",
+        "--symptom", "Repair seems to be done",
+        "--out-dir", str(tmp_path / "runs"), "--llm", "stub", "--approve-all"])
+    run_diagnose(args, overrides={"console_runner": console_runner})
+
+    calls = [" ".join(c.argv) for c in console_runner.calls]
+    # explicit --port pins single-service legacy mode: everything on one runner
+    assert calls == [
+        "sudo -S ipmitool fru print",
+        "sudo -S ipmitool sensor list",
+        "sudo -S i2cdump -y 8 0xb",
+        "sudo -S ipmitool sel list",
+        "dmesg -r",
+    ]
+
+
+def test_diagnose_bmc_lan_wins_ipmi(tmp_path, monkeypatch):
+    # console_defaults.bmc gives rack/cable targets the ipmitool-over-LAN
+    # channel with SEPARATE BMC credentials; the `ipmi` collector runs there.
+    monkeypatch.chdir(tmp_path)
+    secret_dir = tmp_path / "secrets"
+    vault = secret_dir / "secret" / "harness" / "bmc"
+    vault.mkdir(parents=True)
+    (vault / "bmc-ro").write_text("5ecret!\n", encoding="utf-8")
+
+    seen = {}
+    instances = []
+
+    class _FakeLan:
+        is_console = False
+        force_read_only = True
+
+        def __init__(self, address, username, password):
+            seen.update(address=address, username=username, password=password)
+            self.calls = []
+            instances.append(self)
+
+        def execute(self, argv, timeout=30.0):
+            res = CommandResult(argv=list(argv), stdout="lan sensor ok\n",
+                                stderr="", exit_code=0, elapsed_ms=1)
+            self.calls.append(res)
+            return res
+
+    monkeypatch.setattr(cli_mod, "LanProbeRunner", _FakeLan)
+
+    bmc_r = _ServiceConsoleRunner()
+    host_r = _ServiceConsoleRunner()
+    lan_inv = tmp_path / "inventory_lan.yaml"
+    lan_inv.write_text(_MULTI_SERVICE_BMC_LAN_INVENTORY, encoding="utf-8")
+    args = build_parser().parse_args([
+        "diagnose", "--inventory", str(lan_inv),
+        "--rack", "Q61", "--cable", "8",
+        "--symptom", "Repair seems to be done",
+        "--secret-dir", str(secret_dir),
+        "--out-dir", str(tmp_path / "runs"), "--llm", "stub", "--approve-all"])
+    run_diagnose(args, overrides={
+        "console_runners": {"bmc": bmc_r, "host": host_r}})
+
+    # separate BMC credential domain: address/username from the defaults
+    # block, password read from the vault (never inline, never in argv)
+    assert seen["address"] == "10.0.0.11"
+    assert seen["username"] == "bmc-ro"
+    assert seen["password"].strip() == "5ecret!"
+
+    # the ipmi collector ran on the LAN channel, not the console
+    assert [" ".join(c.argv) for c in instances[0].calls] == [
+        "/usr/sbin/ipmitool sensor",
+        "/usr/sbin/ipmitool sel list",
+        "/usr/sbin/ipmitool fru print",
+    ]
+    # and the BMC-shell channel still served the i2c/CPLD dump for cpu
+    assert any("i2cdump" in c for c in (" ".join(c.argv) for c in bmc_r.calls))
+
+
+
 def test_diagnose_by_address_uses_ssh_identity_from_store(tmp_path):
     store = MemorySecretStore({
         "secret/harness/ssh/10.0.0.50": b"-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n"

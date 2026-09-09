@@ -1641,6 +1641,7 @@ def _save_session(session: Session, force: bool = False) -> None:
         session.session_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "mode": session.mode,
+            "inv_path": session.inv_path,
             "host": session.host.name if session.host is not None else None,
             "target_label": session.target_label,
             "target_kind": session.target_kind,
@@ -1713,11 +1714,18 @@ def _load_session(session: Session, path: Path) -> None:
             session.host.name if session.host is not None else "(target)")
         session.target_kind = payload.get("target_kind") or ""
         try:
-            resolve_target(session.target, session.inv, session.store,
-                           targets_path=session.targets_file,
-                           ssh_user=session.ssh_user,
-                           identity_vault_path=session.identity_vault_path,
-                           known_hosts_path=session.known_hosts_path)
+            resolved = resolve_target(
+                session.target, session.inv, session.store,
+                targets_path=session.targets_file,
+                ssh_user=session.ssh_user,
+                identity_vault_path=session.identity_vault_path,
+                known_hosts_path=session.known_hosts_path)
+            # A resumed session gets the same credential context a fresh
+            # launch would have applied for this target.
+            if resolved is not None:
+                session.host = resolved.host or session.host
+                apply_ssh_context(session.store, resolved,
+                                  ssh_user=session.ssh_user)
         except TargetError as exc:
             session.target_label = payload.get("target_label") or "(target)"
             _print_line(session, f"  x target no longer resolvable: {exc}")

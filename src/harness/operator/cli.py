@@ -1,4 +1,4 @@
-"""CLI entry point: inventory -> target -> session -> plan -> collect -> decode ->
+﻿"""CLI entry point: inventory -> target -> session -> plan -> collect -> decode ->
 RAG -> LLM -> score -> approval -> audit -> JSON/trace output.
 
 Subcommands:
@@ -22,6 +22,10 @@ Subcommands:
                 serial console instead of SSH, and
                 ``--console-address``/``--rack``/``--cable``/``--port``/
                 ``--sudo-vault-path`` override the console target per launch.
+- ``fleet``     one-shot initial-debug fan-out over an inline list of servers
+                (``--servers name ip rack=R,cable=C``): the diagnose agent
+                runs concurrently on every one; each server gets its own
+                regular run directory (diagnosis.json, audit, trace).
 - ``console``   run read-only probes over the serial console (lab/qa only); per
                 launch select the rack manager console and cable with
                 ``--console-address``/``--rack``/``--cable``/``--port``/
@@ -74,7 +78,7 @@ import yaml
 from ..audit.auditlog import AuditLog
 from ..audit.redact import Redactor
 from ..audit.trace import SessionTrace
-from ..config.inventory_lint import load_inventory
+from ..config.inventory_lint import InventoryError, load_inventory
 from ..config.models import ConsoleDomain, Host, Inventory
 from ..config.vault import DirSecretStore, MemorySecretStore, SecretStore
 from ..diagnosis.engine import DiagnosticEngine, EngineContext
@@ -92,9 +96,10 @@ from ..diagnosis.schema import Diagnosis
 from ..diagnosis.scorer import evidence_fit_from_dumps, score_diagnosis
 from ..diagnosis.verifier import Verifier
 from ..engine.allowlist import default_policy
-from ..engine.bmc import BmcRunner
+from ..engine.bmc import LanProbeRunner
 from ..engine.redfish import RedfishClient
 from ..engine.runner import CommandResult, Runner
+from ..engine.services import MultiConsoleRunner, service_programs
 from ..engine.session import SSHSession
 from ..engine.sol import (
     ConsoleRunner,
@@ -300,10 +305,13 @@ def _tunnel_failure(exc: TunnelError, target: str) -> RuntimeError:
     return RuntimeError(str(exc))
 
 
-def _console_overrides(domain: ConsoleDomain, args) -> ConsoleDomain:
+def _console_overrides(domain: ConsoleDomain, args,
+                       *, with_port: bool = True) -> ConsoleDomain:
     """Per-launch console selection: rack manager console (address), rack id and
     cable are chosen at each launch and layered over the inventory defaults.
-    Rack/cable are identifier-validated (injection-safe into the expect script)."""
+    Rack/cable are identifier-validated (injection-safe into the expect script).
+    ``with_port=False`` skips the ``--port`` override (multi-service domains
+    carry their own port)."""
     from ..engine.sol import validate_identifier
     kw: dict = {}
     addr = getattr(args, "console_address", None)
@@ -315,7 +323,7 @@ def _console_overrides(domain: ConsoleDomain, args) -> ConsoleDomain:
         kw["rack"] = validate_identifier(rack, "rack")
     if cable:
         kw["cable"] = validate_identifier(cable, "cable")
-    if getattr(args, "port", None) is not None:
+    if with_port and getattr(args, "port", None) is not None:
         kw["port"] = args.port
     if getattr(args, "sudo_vault_path", None) is not None:
         kw["sudo_vault_path"] = args.sudo_vault_path
@@ -850,7 +858,8 @@ def _probe_line(res: CommandResult) -> str:
     cmd = " ".join(res.argv)
     outcome = "ok" if res.ok else f"exit {res.exit_code}"
     elapsed = f"{res.elapsed_ms / 1000:.1f}s" if res.elapsed_ms else ""
-    return f"{cmd} -> {outcome} {elapsed}"
+    service = f" via {res.service}" if res.service else ""
+    return f"{cmd} -> {outcome} {elapsed}{service}"
 
 
 def _audit_model(log: AuditLog, trace: SessionTrace, model, drifted: bool,
@@ -974,6 +983,10 @@ def _diagnose_pipeline(args, overrides: dict) -> Diagnosis:
         "target": target.kind,
         **({"rack": target.console.rack, "cable": target.console.cable}
            if target.console is not None else {}),
+        **({"services": {name: dom.port
+                         for name, dom in (target.console_services or {}).items()}}
+           if target.console_services and getattr(args, "port", None) is None
+           else {}),
         **({"ip": target.ip} if target.ip is not None else {}),
         **({"docs_lib": docs_lib_used} if docs_lib_used else {}),
     })
@@ -990,18 +1003,59 @@ def _diagnose_pipeline(args, overrides: dict) -> Diagnosis:
         })
 
     use_console = bool(getattr(args, "console", False)) or target.kind == "console"
+    service_domains: dict[str, ConsoleDomain] = {}
+    service_runners: dict[str, Runner] = {}
     if use_console:
         if host.console is None:
             raise RuntimeError(
                 f"target {target.label!r} has no console block (use --rack/--cable "
                 "with a fleet console_defaults block, or a named host with a "
                 "console block)")
-        domain = _console_overrides(host.console, args)
-        _console_sudo_secret(store, domain, secrets)
-        console_runner = overrides.get("console_runner")
-        if console_runner is None:
-            console_runner = ConsoleRunner(SerialConsole(domain, store))
-        runner: Runner = console_runner
+        # Multi-service targets (console_defaults.services) get one ConsoleDomain
+        # per service port; an explicit --port pins single-service legacy mode.
+        services = target.console_services
+        if services and getattr(args, "port", None) is not None:
+            services = None
+        if services:
+            service_domains = {svc_name: _console_overrides(svc_dom, args,
+                                                            with_port=False)
+                               for svc_name, svc_dom in services.items()}
+            domain = service_domains.get(
+                "default", next(iter(service_domains.values())))
+        else:
+            domain = _console_overrides(host.console, args)
+            service_domains = {}
+        seen_vault_paths: set[str] = set()
+        if service_domains:
+            for svc_dom in service_domains.values():
+                if svc_dom.sudo_vault_path and svc_dom.sudo_vault_path not in seen_vault_paths:
+                    seen_vault_paths.add(svc_dom.sudo_vault_path)
+                    _console_sudo_secret(store, svc_dom, secrets)
+        else:
+            _console_sudo_secret(store, domain, secrets)
+        console_runners_injected = overrides.get("console_runners") or {}
+        for svc_name, svc_dom in service_domains.items():
+            svc_runner = console_runners_injected.get(svc_name)
+            if svc_runner is None and svc_name == "default" \
+                    and overrides.get("console_runner") is not None:
+                svc_runner = overrides["console_runner"]
+            if svc_runner is None:
+                svc_runner = ConsoleRunner(SerialConsole(svc_dom, store),
+                                           label=("default"
+                                                  if len(service_domains) == 1
+                                                  else svc_name))
+            service_runners[svc_name] = svc_runner
+        if service_runners:
+            runner: Runner = (
+                MultiConsoleRunner(service_runners,
+                                   service_programs(service_domains))
+                if len(service_runners) > 1
+                else next(iter(service_runners.values())))
+        else:
+            console_runner = overrides.get("console_runner")
+            if console_runner is None:
+                console_runner = ConsoleRunner(SerialConsole(domain, store))
+            runner = console_runner
     else:
         session = overrides.get("session")
         if session is None:
@@ -1049,7 +1103,7 @@ def _diagnose_pipeline(args, overrides: dict) -> Diagnosis:
 
     bmc_runner = overrides.get("bmc_runner")
     if bmc_runner is None and bmc_password is not None:
-        bmc_runner = BmcRunner(host.bmc.address, host.bmc.username, bmc_password)
+        bmc_runner = LanProbeRunner(host.bmc.address, host.bmc.username, bmc_password)
 
     supervisor = RunSupervisor(max_steps=8,
                                wall_s=float(getattr(args, "wall_s", 900.0)))
@@ -1081,6 +1135,24 @@ def _diagnose_pipeline(args, overrides: dict) -> Diagnosis:
     def collector_factory(name, _runner):
         if name == "redfish":
             return redfish_collector
+        # BMC LAN (ipmitool -I lanplus -H) wins for ipmi whenever the separate
+        # BMC credential domain is available (named hosts with a bmc block, or
+        # console targets with console_defaults.bmc); the BMC shell stays the
+        # fallback for sel/sensor/fru plus the only source of I2C/CPLD dumps.
+        if name == "ipmi" and bmc_runner is not None:
+            return IpmiCollector(bmc_runner)
+        if service_domains:
+            # Multi-service routing: each collector is bound to the service
+            # whose subsystem table lists it (config order = precedence).
+            for svc_name, svc_dom in service_domains.items():
+                if name in getattr(svc_dom, "subsystems", ()):
+                    svc_runner = service_runners[svc_name]
+                    if name in ("cpu_msr", "kernel", "ipmi"):
+                        return BmcConsoleCollector(svc_runner, subsystem={
+                            "cpu_msr": "cpu", "kernel": "kernel", "ipmi": "ipmi",
+                        }[name])
+                    return make_collector(name, svc_runner)
+            return None
         if _runner.is_console:
             # BMC BusyBox shell: no rdmsr/smartctl/lspci/dmidecode. Map the
             # host-OS subsystems to BMC-shell probes; skip host-only ones.
@@ -1177,7 +1249,7 @@ def _diagnose_pipeline(args, overrides: dict) -> Diagnosis:
     _seat_pending_case(out, diagnosis, target.label, ident, symptom,
                        trace.session_id,
                        test_log_failures=(test_log_case_terms or []))
-    _write_run_meta(out, target, host, trace.session_id)
+    _write_run_meta(out, target, host, trace.session_id, args=args)
     print(f"\npending case: {out / 'pending_case.json'}")
     print("close the learning loop after the repair with:")
     print(f"  harness label --run {trace.session_id}")
@@ -1192,6 +1264,147 @@ def _diagnose_pipeline(args, overrides: dict) -> Diagnosis:
     if redfish_collector is not None:
         redfish_collector.client.close()   # tunnel (if any) dies with the run
     return diagnosis
+
+
+def run_debug_fleet(args) -> int:
+    """One-shot initial-debug fan-out: run the full read-only diagnose agent
+    on every server in the inline ``--servers`` list, N at a time.
+
+    Accepts a mixed list: inventory host names, plain IPv4 addresses, or
+    ``rack=<id>,cable=<n>`` pairs (console). Each server gets an independent
+    regular run (own session_id, harness_runs/<id>/ artifacts, verdict), so
+    ``harness report``/``label`` work per run exactly as after ``diagnose``.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if getattr(args, "approval", False) or getattr(args, "ask_parts", False) \
+            or getattr(args, "label_prompt", False):
+        print("  error: interactive flags (--approval/--ask-parts/--label-prompt) "
+              "cannot run under parallel workers; use per-server `harness diagnose` "
+              "for those runs", file=sys.stderr)
+        return 2
+    if not args.symptom and not getattr(args, "test_log", None):
+        print("  error: --symptom (or --test-log) is required", file=sys.stderr)
+        return 2
+
+    inv = load_inventory(args.inventory)
+    store = _make_store(args)
+    workers = max(1, min(int(getattr(args, "workers", 4) or 4), 32))
+    targets: list[tuple[str, argparse.Namespace]] = []
+    for token in args.servers:
+        try:
+            targets.append(_fleet_plan_run(args, inv, store, token))
+        except Exception as exc:  # noqa: BLE001 - bad token never blocks the fleet
+            print(f"  [{token}] skipped: {exc}", file=sys.stderr)
+    if not targets:
+        print("  error: no resolvable servers in --servers", file=sys.stderr)
+        return 2
+
+    base_overrides: dict = {"store": store}
+    retriever, _docs_lib = _build_docs_retriever(args)
+    if retriever is not None:
+        base_overrides["retriever"] = retriever
+    # LLM endpoint (tunnel/preflight) is set up exactly once; every worker
+    # shares it via the non-None "llm_forward" sentinel (the pipeline only
+    # opens its own endpoint -- or closes one at run end -- when that key is
+    # absent).
+    _prepare_llm_endpoint(args, inv, base_overrides["store"])
+    base_overrides["llm_forward"] = "shared"
+
+    print(f"debug-fleet: {len(targets)} server(s), {workers} worker(s)",
+          file=sys.stderr)
+    results: dict[str, str | None] = {}
+    failures: list[str] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_fleet_worker, ns, dict(base_overrides)): label
+            for label, ns in targets
+        }
+        for future in as_completed(futures):
+            label = futures[future]
+            try:
+                session_id = future.result()
+            except Exception as exc:  # noqa: BLE001 - per-server isolation
+                failures.append(label)
+                results[label] = None
+                print(f"  [{label}] FAILED: {exc}", file=sys.stderr)
+            else:
+                results[label] = session_id
+                suffix = f" (run {session_id})" if session_id else ""
+                print(f"  [{label}] done{suffix}", file=sys.stderr)
+
+    print("\ndebug-fleet runs:")
+    for label, value in results.items():
+        print(f"  {label}: {value or 'FAILED'}")
+    return 1 if failures else 0
+
+
+def _fleet_plan_run(args, inv: Inventory, store: SecretStore,
+                    token: str) -> tuple[str, argparse.Namespace]:
+    """Resolve one inline ``--servers`` token to a label and a per-run
+    namespace (targeting fields set, everything else shared). Token forms:
+    inventory host name | IPv4 | ``rack=<id>,cable=<n>`` | target alias."""
+    from ..targets.resolver import TargetError, TargetSpec, resolve_target
+
+    def _target(spec: TargetSpec):
+        return resolve_target(
+            spec, inv, store,
+            targets_path=getattr(args, "targets_file", None),
+            ssh_user=getattr(args, "ssh_user", "diagbot"),
+            identity_vault_path=getattr(args, "identity_vault_path", None),
+            known_hosts_path=getattr(args, "known_hosts_path",
+                                     "config/known_hosts"),
+        )
+
+    if "=" in token:
+        fields: dict[str, str] = {}
+        for part in re.split(r"[,:]", token):
+            key, _, value = part.partition("=")
+            key = key.strip().lower()
+            if key not in ("rack", "cable"):
+                raise ValueError(
+                    f"unknown keyword {key!r} (use rack=<id>,cable=<n>)")
+            fields[key] = value.strip()
+        if "rack" not in fields or "cable" not in fields:
+            raise ValueError("rack/cable targeting needs both 'rack=' and 'cable='")
+        spec = TargetSpec(rack=fields["rack"], cable=fields["cable"])
+    elif re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", token):
+        spec = TargetSpec(ip=token)
+    else:
+        spec = TargetSpec(name=token)
+        try:
+            _target(spec)
+        except TargetError as exc:
+            if "unknown host" not in str(exc):
+                raise
+            spec = TargetSpec(alias=token)
+            try:
+                _target(spec)
+            except TargetError as exc2:
+                raise ValueError(
+                    f"not a known host or target alias: {token!r} ({exc2})") from exc2
+
+    target = _target(spec)
+    ns = argparse.Namespace(**vars(args))
+    ns.host = spec.name
+    ns.rack = spec.rack
+    ns.cable = spec.cable
+    ns.address = target.ip if spec.ip is not None else None
+    ns.target = spec.alias
+    return target.label, ns
+
+
+def _fleet_worker(ns: argparse.Namespace, overrides: dict) -> str | None:
+    """One fleet slot: a regular run_diagnose pipeline with [label]-prefixed
+    progress and its own overrides (trace, session, secrets)."""
+    rack_cable = f"{ns.rack}:{ns.cable}" if ns.rack is not None else None
+    label = ns.host or ns.address or rack_cable or ns.target or "server"
+    print(f"  [{label}] starting", file=sys.stderr, flush=True)
+    overrides["progress"] = lambda text, _label=label: print(
+        f"  [{_label}] {text}", file=sys.stderr, flush=True)
+    run_diagnose(ns, overrides)
+    trace = overrides.get("trace")
+    return trace.session_id if trace is not None else None
 
 
 def run_console(args) -> int:
@@ -1817,13 +2030,16 @@ _IP4_RE = re.compile(
 
 _BACK = "back"
 
+#: Sentinel returned by ``_pick_target`` when the fleet-debug row is chosen.
+_FLEET_PICK = "fleet"
+
 # Top-level menu: the two daily flows plus runs, everything else one hop down.
 # Action KEYS are stable (tests and argv building depend on them); only the
 # display labels are user-facing copy.
 _MAIN_ACTIONS: list[tuple[str, str]] = [
     ("chat", "Chat session        docs, past runs, or a referenced log file (no target)"),
     ("diagnose", "Debug a target       interactive agent debugging on one machine (iterative)"),
-    ("runs", "Inspect past runs    diagnosis runs + saved chat sessions (continue a chat)"),
+    ("runs", "Inspect past runs    diagnosis runs + saved chat/debug sessions (continue from the last point)"),
     ("advanced", "Advanced             verify - console - model - docs - targets - secrets - learning - setup - lint"),
     ("quit", "Quit"),
 ]
@@ -1859,6 +2075,8 @@ _ALLOWED_FLAGS: dict[str, tuple[str, ...]] = {
     "debug": ("--secret-dir", "--docs-lib", "--docs-dir", "--parts-csv",
               "--parts-dir", "--out-dir", "--session-dir", "--targets-file",
               "--test-log"),
+    "fleet": ("--secret-dir", "--docs-lib", "--docs-dir", "--parts-csv",
+              "--parts-dir", "--out-dir", "--targets-file", "--test-log"),
     "chat": ("--secret-dir", "--docs-lib", "--docs-dir", "--out-dir",
              "--session-dir"),
     "console": ("--secret-dir", "--out-dir", "--targets-file"),
@@ -1939,11 +2157,15 @@ def _ssh_target_args(args) -> dict:
     }
 
 
-def _pick_target(inv, store, args, *, console: bool) -> TargetSpec | None:
+def _pick_target(inv, store, args, *, console: bool,
+                 fleet: bool = False) -> TargetSpec | None | str:
     """Menu to pick a target: named host / alias / rack+cable / IP / none.
 
     Resolves eagerly so a doomed target (missing console_defaults, unregistered
-    identity) is reported before any run is launched.
+    identity) is reported before any run is launched. With ``fleet`` set (the
+    debug flow), a final "Fleet debug" row offers the one-shot many-server
+    fan-out; the caller receives the ``_FLEET_PICK`` sentinel instead of a
+    spec.
     """
     from .menu import ask_text, select
 
@@ -1962,12 +2184,17 @@ def _pick_target(inv, store, args, *, console: bool) -> TargetSpec | None:
     choices.append(("Rack + cable (console target, zero-YAML)", None))
     ip_idx = len(choices)
     choices.append(("IP address (SSH by address)", None))
+    fleet_idx = len(choices)
+    if fleet:
+        choices.append(("Fleet debug (one-shot diagnose on many servers)", None))
     none_idx = len(choices)
     choices.append(("(none - name a target later)", None))
 
     idx = select("Target", [label for label, _ in choices])
     if idx is None or idx == none_idx:
         return None
+    if fleet and idx == fleet_idx:
+        return _FLEET_PICK
     if idx == rack_idx:
         rack = ask_text("Rack id (e.g. Q61)").strip()
         cable = ask_text("Cable number").strip()
@@ -1993,6 +2220,83 @@ def _pick_target(inv, store, args, *, console: bool) -> TargetSpec | None:
     return spec
 
 
+def _fleet_wizard(args, inv: Inventory, store: SecretStore, inv_path: str) -> int:
+    """Interactive fleet-debug flow: prompt for the server list (inline tokens
+    or ``file:<path>``), a shared symptom, and the worker count, then run the
+    one-shot fan-out. Tokens may be mixed freely: inventory host names, IPv4
+    addresses, ``rack=<id>,cable=<n>`` pairs, or target aliases."""
+    from .menu import ask_text, confirm
+
+    while True:
+        raw = ask_text(
+            "Servers (space-separated: name / IPv4 / rack=X,cable=Y; "
+            "file:<path> reads one target per line)"
+        ).strip()
+        if not raw:
+            print("  cancelled: no servers given")
+            return 0
+        try:
+            tokens = _fleet_tokens_from_input(raw)
+        except (ValueError, OSError) as exc:
+            print(f"  cancelled: {exc}", file=sys.stderr)
+            continue
+        if not tokens:
+            print("  cancelled: the server list came out empty (blank lines "
+                  "and # comments are skipped)", file=sys.stderr)
+            continue
+        labels: list[str] = []
+        bad: list[tuple[str, str]] = []
+        for token in tokens:
+            try:
+                label, _ns = _fleet_plan_run(args, inv, store, token)
+                labels.append(label)
+            except Exception as exc:  # noqa: BLE001 - report and drop
+                bad.append((token, str(exc)))
+        if bad:
+            for token, exc in bad:
+                print(f"  [{token}] skipped: {exc}", file=sys.stderr)
+        if not labels:
+            print("  cancelled: none of the servers resolved", file=sys.stderr)
+            continue
+        print(f"  {len(labels)} server(s): {', '.join(labels)}")
+
+        symptom = ask_text("Symptom (one-shot, applied to every server)").strip()
+        if not symptom:
+            print("  cancelled: a symptom is required", file=sys.stderr)
+            continue
+        workers_raw = ask_text("Parallel workers (Enter = 4)").strip()
+        try:
+            workers = int(workers_raw) if workers_raw else 4
+        except ValueError:
+            print("  cancelled: worker count must be a number", file=sys.stderr)
+            continue
+        argv = ["fleet", "--inventory", inv_path, "--symptom", symptom,
+                "--workers", str(workers)]
+        argv += ["--servers", *tokens]
+        argv += _wizard_flags(args, "fleet")
+        if confirm("Record every approved action (--approve-all)?"):
+            argv.append("--approve-all")
+        return _run_wizard_sub(argv)
+
+
+def _fleet_tokens_from_input(raw: str) -> list[str]:
+    """Menu server-list input -> tokens: ``shlex`` split (quoted paths ok),
+    with ``file:<path>`` entries replaced by the file's lines (one target per
+    line; blanks and ``#`` comments ignored, mixed with inline tokens)."""
+    tokens: list[str] = []
+    for item in shlex.split(raw.replace("\\", "/")):
+        if item.lower().startswith("file:"):
+            path = item[5:]
+            if not path:
+                raise ValueError("file: entry needs a path (file:<path>)")
+            lines = Path(path).read_text(encoding="utf-8").splitlines()
+            tokens += [line.strip() for line in lines
+                       if line.strip() and not line.strip().startswith("#")]
+        else:
+            tokens.append(item)
+    return tokens
+
+
 def _target_argv(spec: TargetSpec) -> list[str]:
     argv: list[str] = []
     if spec.name is not None:
@@ -2016,14 +2320,14 @@ def _wizard_flags(args, subcommand: str) -> list[str]:
             values = value if isinstance(value, list) else [value]
             for v in values:
                 argv += [flag, str(v)]
-    if subcommand in ("diagnose", "debug", "chat"):
+    if subcommand in ("diagnose", "debug", "chat", "fleet"):
         llm = getattr(args, "llm", None)
         if llm:
             argv += ["--llm", llm]
-    if subcommand in ("diagnose", "debug"):
+    if subcommand in ("diagnose", "debug", "fleet"):
         if getattr(args, "console", False):
             argv.append("--console")
-        if getattr(args, "ask_parts", False):
+        if getattr(args, "ask_parts", False) and subcommand != "fleet":
             argv.append("--ask-parts")
     return argv
 
@@ -2449,11 +2753,14 @@ def _print_run_header(run_dir: Path, cases_dir: Path) -> None:
             print(f"  {label:<9} {value}")
 
 
-def _write_run_meta(out: Path, target, host, session_id: str) -> None:
+def _write_run_meta(out: Path, target, host, session_id: str,
+                    args=None) -> None:
     """Write ``run_meta.json`` (display metadata) into a finished run dir.
 
     Captures the machine serial parsed from the FRU collector output so the
     runs menu never has to re-parse the full dumps just to show one label.
+    With ``args``, the exact launch targeting is recorded too, so the runs
+    menu's "continue" can rebuild the same TargetSpec for a follow-up session.
     """
     serial: str | None = None
     dumps_dir = out / "dumps"
@@ -2480,6 +2787,13 @@ def _write_run_meta(out: Path, target, host, session_id: str) -> None:
         meta["cable"] = console.cable
     if serial:
         meta["serial"] = serial
+    if args is not None:
+        spec = {key: getattr(args, key, None) for key in
+                ("host", "rack", "cable", "address", "target",
+                 "targets_file")}
+        spec = {k: v for k, v in spec.items() if v is not None}
+        if spec:
+            meta["spec"] = spec
     (out / "run_meta.json").write_text(json.dumps(meta, indent=2),
                                        encoding="utf-8")
 
@@ -2620,37 +2934,226 @@ def _print_chat_transcript(session_dir: Path) -> None:
 def _continue_chat_session(args, session_dir: Path) -> None:
     """Re-enter a saved chat IN PLACE: --resume points session_dir at the
     same directory, so the conversation keeps growing in that session.json."""
-    out_dir = getattr(args, "out_dir", "harness_runs")
-    argv = ["chat", "--resume", str(session_dir),
-            "--out-dir", str(out_dir),
-            "--session-dir", str(Path(out_dir) / "sessions")]
-    argv += _wizard_flags(args, "chat")
-    _run_wizard_sub(argv)
+    argv = _continue_session_argv(args, "chat", session_dir, None)
+    if argv is not None:
+        _run_wizard_sub(argv)
 
 
 def _delete_chat_session(session_dir: Path) -> bool:
     """Interactive per-session delete from the runs menu."""
     from .menu import confirm
 
-    if not confirm(f"Permanently delete chat session {session_dir.name}?"):
+    mode = _chat_session_payload(session_dir).get("mode") or "chat"
+    if not confirm(f"Permanently delete {mode} session "
+                   f"{session_dir.name}?"):
         print("  cancelled")
         return False
     shutil.rmtree(session_dir)
-    print(f"  deleted chat session {session_dir.name}")
+    print(f"  deleted {mode} session {session_dir.name}")
     return True
 
 
-def _menu_runs(args) -> int:
+def _debug_sessions(out_dir: Path) -> list[Path]:
+    """Saved debug (REPL) sessions: dirs under ``out_dir/sessions`` whose
+    session.json records a non-chat mode. Newest first. The runs menu lists
+    these next to the chat sessions so an interrupted debug conversation can
+    be continued in place."""
+    root = out_dir / "sessions"
+    try:
+        entries = sorted(root.iterdir(), key=lambda p: p.stat().st_mtime,
+                         reverse=True)
+    except OSError:
+        return []
+    found: list[Path] = []
+    for p in entries:
+        payload_path = p / "session.json"
+        if not p.is_dir() or not payload_path.is_file():
+            continue
+        try:
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(payload, dict) and payload.get("mode") != "chat":
+            found.append(p)
+    return found
+
+
+def _session_inventory(args, payload: dict, inv_path: str | None = None
+                       ) -> str | None:
+    """Inventory path to give a resumed debug REPL: the menu's picked
+    inventory first, then the one recorded in the session payload (older
+    sessions may lack it), then a single auto-discovered inventory."""
+    explicit = inv_path or getattr(args, "inventory", None)
+    if explicit:
+        return str(explicit)
+    saved = payload.get("inv_path")
+    if saved:
+        return str(saved)
+    found = _discover_inventory()
+    if len(found) == 1:
+        return str(found[0])
+    return None
+
+
+def _summarize_debug_session(session_dir: Path) -> str:
+    """Picker one-liner for a saved debug session, e.g.::
+
+        debug | 2026-09-03 14:22 | Q61-cable4 | 5 message(s) | 'mem errors ...'
+    """
+    payload = _chat_session_payload(session_dir)
+    try:
+        when = datetime.fromtimestamp(
+            session_dir.stat().st_mtime, tz=UTC).astimezone().strftime(
+                "%Y-%m-%d %H:%M")
+    except OSError:
+        when = ""
+    entries = payload.get("transcript") or []
+    messages = [e for e in entries
+                if isinstance(e, dict) and e.get("kind") == "message"]
+    first = str(messages[0].get("content", "")) if messages else ""
+    bits = [b for b in ("debug", when, payload.get("target_label"),
+                        f"{len(messages)} message(s)",
+                        f"'{ui.clip(first, 48)}'" if first else None) if b]
+    return " | ".join(bits) if bits else session_dir.name
+
+
+def _continue_session_argv(args, mode: str, session_dir: Path,
+                           inv_path: str | None) -> list[str] | None:
+    """The argv for resuming a session in place; None (with an error printed)
+    when a debug resume has no inventory to load."""
+    out_dir = getattr(args, "out_dir", "harness_runs")
+    if mode == "chat":
+        argv = ["chat", "--resume", str(session_dir),
+                "--out-dir", str(out_dir),
+                "--session-dir", str(Path(out_dir) / "sessions")]
+        argv += _wizard_flags(args, "chat")
+        return argv
+    payload = _chat_session_payload(session_dir)
+    inventory = _session_inventory(args, payload, inv_path)
+    if not inventory:
+        print("  debug continue needs an inventory: pass --inventory or put "
+              "one under config/", file=sys.stderr)
+        return None
+    argv = ["debug", "--inventory", inventory,
+            "--resume", str(session_dir),
+            "--out-dir", str(out_dir),
+            "--session-dir", str(Path(out_dir) / "sessions")]
+    raw = payload.get("target") or {}
+    if isinstance(raw, dict) and raw:
+        spec = TargetSpec(
+            name=raw.get("name"), rack=raw.get("rack"),
+            cable=raw.get("cable"), ip=raw.get("ip"),
+            alias=raw.get("alias"))
+        argv += _target_argv(spec)
+    argv += _wizard_flags(args, "debug")
+    return argv
+
+
+def _spec_from_run_meta(meta: dict, host_names=()) -> TargetSpec | None:
+    """Rebuild a TargetSpec from a run dir's metadata so its session can be
+    continued: the exact launch spec when recorded (run_meta ``spec``, new
+    runs), else rack+cable, else the host label when it names a host in the
+    inventory. None means "no usable target info"."""
+    spec_raw = meta.get("spec")
+    if isinstance(spec_raw, dict):
+        spec = TargetSpec(
+            name=spec_raw.get("host"),
+            rack=spec_raw.get("rack"),
+            cable=spec_raw.get("cable"),
+            ip=spec_raw.get("address"),
+            alias=spec_raw.get("target"),
+        )
+        if any((spec.name, spec.rack, spec.cable, spec.ip, spec.alias)):
+            return spec
+    rack, cable = meta.get("rack"), meta.get("cable")
+    if rack is not None and cable is not None:
+        return TargetSpec(rack=rack, cable=cable)
+    label = meta.get("host")
+    if label and label in host_names:
+        return TargetSpec(name=label)
+    return None
+
+
+def _continue_run_dir(args, run_dir: Path, inv_path: str | None) -> bool:
+    """Continue a finished diagnosis run: seed a fresh debug session from the
+    run's last point (target rebuilt from its metadata, evidence digest from
+    its diagnosis.json, the run linked in the session's history) and launch
+    the debug REPL on it. Future saves then keep growing that seeded session.
+    False (nothing launched) lets the inspector stay open."""
+    from .chat_agent import build_evidence
+
+    out_dir = Path(getattr(args, "out_dir", "harness_runs"))
+    diag_path = run_dir / "diagnosis.json"
+    if not diag_path.exists():
+        print("  no diagnosis.json in this run: nothing to continue from")
+        return False
+    try:
+        diag = Diagnosis.model_validate(json.loads(
+            diag_path.read_text(encoding="utf-8")))
+        evidence = build_evidence(diag, str(run_dir))
+    except (OSError, ValueError):
+        print("  unreadable diagnosis.json: cannot continue this run")
+        return False
+    meta = _read_run_meta(run_dir)
+    inv = None
+    if inv_path:
+        try:
+            inv = load_inventory(inv_path)
+        except (OSError, InventoryError) as exc:
+            print(f"  inventory {inv_path!r} unusable: {exc}", file=sys.stderr)
+            return False
+    spec = _spec_from_run_meta(
+        meta, host_names=inv.host_names if inv is not None else ())
+    label = meta.get("host") or run_dir.name
+    state = diag.state or ""
+    verdict = state.upper() if state else "run"
+    summary = (f"continuing from run {run_dir.name} "
+               f"({verdict}{f' {round(diag.confidence * 100)}%' if diag.confidence is not None else ''}): "
+               f"{evidence}")
+    transcript = [{"role": "agent", "kind": "diagnosis", "content": summary}]
+    payload = {
+        "mode": "debug",
+        "host": spec.name if spec is not None else None,
+        "target_label": label,
+        "target_kind": "",
+        "target": ({k: v for k, v in
+                    {"name": spec.name, "rack": spec.rack, "cable": spec.cable,
+                     "ip": spec.ip, "alias": spec.alias}.items() if v}
+                   if spec is not None else {}),
+        "llm_mode": "",
+        "llm_ident": "",
+        "ask_parts": False,
+        "inv_path": str(inv_path) if inv_path else "",
+        "transcript": transcript,
+        "evidence": evidence,
+        "runs": [str(run_dir)],
+    }
+    session_dir = out_dir / "sessions" / (
+        f"{label}-continue-{int(datetime.now(UTC).timestamp())}")
+    try:
+        session_dir.mkdir(parents=True)
+        (session_dir / "session.json").write_text(
+            json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError as exc:
+        print(f"  cannot seed session dir: {exc}", file=sys.stderr)
+        return False
+    argv = _continue_session_argv(args, "debug", session_dir, inv_path)
+    if argv is None:
+        shutil.rmtree(session_dir, ignore_errors=True)
+        return False
+    print(f"  seeded {session_dir} from run {run_dir.name}")
+    _run_wizard_sub(argv)
+    return True
+
+
+def _menu_runs(args, inv_path: str | None = None) -> int:
     """Inspect a previous run end to end: verdict, command pathway, the exact
     prompt(s) sent to the LLM, the raw collector evidence -- and label the
-    correct fix so the learning loop can consume the run. Saved chat sessions
-    are listed here too, with chat-specific views (continue in place, print
-    the transcript, delete).
-
-    Runs are listed with identifying one-liners (date, host, rack/cable,
-    serial, verdict, fix) instead of raw hash paths; chat sessions carry a
-    leading ``chat`` tag + the first operator message. Type-to-filter matches
-    any substring of those.
+    correct fix so the learning loop can consume the run. Saved chat AND debug
+    sessions are listed here too, with session views (continue in place,
+    print the transcript, delete), and each diagnosis run offers a
+    "continue" that seeds a fresh debug session from the run's last point
+    and launches it.
     """
     from .menu import select
 
@@ -2660,26 +3163,33 @@ def _menu_runs(args) -> int:
         runs = sorted((p for p in out_dir.glob("*") if _is_run_dir(p)),
                       key=lambda p: p.stat().st_mtime, reverse=True)
         chats = _chat_sessions(out_dir)
-        if not runs and not chats:
-            print(f"  no runs or chat sessions yet under {out_dir}")
+        dsessions = _debug_sessions(out_dir)
+        if not runs and not chats and not dsessions:
+            print(f"  no runs or saved sessions yet under {out_dir}")
             return 0
         picks: list[tuple[str, Path, str]] = (
             [("run", p, _summarize_run(p, cases_dir)) for p in runs]
-            + [("chat", p, _summarize_chat_session(p)) for p in chats])
-        pick = select("Run or chat session (most recent first)",
+            + [("chat", p, _summarize_chat_session(p)) for p in chats]
+            + [("dsession", p, _summarize_debug_session(p))
+               for p in dsessions])
+        pick = select("Run or saved session (most recent first)",
                       [label for _, _, label in picks])
         if pick is None:
             return 0
         kind, run_dir, _ = picks[pick]
-        if kind == "chat":
-            print(f"---- chat session {run_dir.name} ----")
-            n_entries = len(_chat_session_payload(run_dir)
-                            .get("transcript") or [])
+        if kind in ("chat", "dsession"):
+            header_kind = ("chat session" if kind == "chat"
+                           else "debug session")
+            print(f"---- {header_kind} {run_dir.name} ----")
+            payload = _chat_session_payload(run_dir)
+            n_entries = len(payload.get("transcript") or [])
+            if payload.get("target_label"):
+                print(f"  target: {payload['target_label']}")
             print(f"  dir: {run_dir}  ({n_entries} transcript entries)")
             views = [
-                ("continue", "continue  - resume this chat where it left off"),
+                ("continue", "continue  - resume this session where it left off"),
                 ("transcript", "transcript - print the saved conversation"),
-                ("delete", "delete    - remove this chat session (confirm)"),
+                ("delete", "delete    - remove this session (confirm)"),
                 (_BACK, _BACK),
             ]
             while True:
@@ -2690,15 +3200,23 @@ def _menu_runs(args) -> int:
                 if key == _BACK:
                     return 0
                 if key == "continue":
-                    _continue_chat_session(args, run_dir)
-                    return 0
+                    argv = _continue_session_argv(args, kind, run_dir, inv_path)
+                    if argv is not None:
+                        _run_wizard_sub(argv)
+                        return 0
                 if key == "transcript":
                     _print_chat_transcript(run_dir)
                 elif key == "delete" and _delete_chat_session(run_dir):
                     break  # deleted: back to the refreshed list
             continue
         _print_run_header(run_dir, cases_dir)
-        views = [
+        views = []
+        has_diagnosis = (run_dir / "diagnosis.json").exists()
+        if has_diagnosis:
+            views.append(("continue",
+                          ("continue - seed a debug session from this "
+                           "run's last point and launch it")))
+        views += [
             ("verdict", "verdict  - diagnosis.json (state, text, confidence, actions)"),
             ("commands", "commands - trace.json (every command run, in order)"),
             ("prompt", "prompt   - the exact prompt(s) sent to the LLM"),
@@ -2715,6 +3233,10 @@ def _menu_runs(args) -> int:
             key = views[idx][0]
             if key == _BACK:
                 return 0
+            if key == "continue":
+                if _continue_run_dir(args, run_dir, inv_path):
+                    return 0
+                continue
             if key == "verdict":
                 _print_artifact(run_dir / "diagnosis.json")
             elif key == "commands":
@@ -3137,7 +3659,16 @@ def run_menu(args) -> int:
                 # "Debug a target": the interactive debug REPL on the picked
                 # target. The first message to the agent carries the symptom;
                 # test logs can be queued in-session (/testlog or a file path).
-                spec = _pick_target(inv, store, args, console=console_default)
+                # An extra "Fleet debug" row forks off the one-shot many-server
+                # fan-out instead.
+                spec = _pick_target(inv, store, args, console=console_default,
+                                    fleet=True)
+                if spec is _FLEET_PICK:
+                    if inv_path is None:
+                        print("  fleet debug needs an inventory", file=sys.stderr)
+                        continue
+                    _fleet_wizard(args, inv, store, str(inv_path))
+                    continue
                 if spec is None:
                     continue
                 argv = ["debug", "--inventory", str(inv_path)]
@@ -3145,7 +3676,7 @@ def run_menu(args) -> int:
                 argv += _wizard_flags(args, "debug")
                 _run_wizard_sub(argv)
             elif key == "runs":
-                _menu_runs(args)
+                _menu_runs(args, str(inv_path) if inv_path else None)
         except KeyboardInterrupt:
             print("  (interrupted)")
     return 0
@@ -3477,7 +4008,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--console-address", default=None,
                    help="override the rack manager console address (inventory default)")
     p.add_argument("--port", type=int, default=None,
-                   help="override the BMC access port (inventory default: 2200)")
+                   help="pin single-service legacy mode on this port (ignores a configured console_defaults.services map)")
     p.add_argument("--sudo-vault-path", default=None,
                    help="override the vault path of the BMC sudo password")
     p.add_argument("--out-dir", default="harness_runs")
@@ -3496,6 +4027,58 @@ def build_parser() -> argparse.ArgumentParser:
                    help="where answered instance parts are persisted, one file per target")
     p.set_defaults(func=run_diagnose)
 
+    p = sub.add_parser(
+        "debug-fleet", aliases=["fleet"],
+        help="one-shot initial debug fan-out: run the read-only diagnose agent "
+             "on a list of servers concurrently (each gets a regular run)")
+    p.add_argument("--inventory", required=True)
+    p.add_argument("--servers", nargs="+", required=True,
+                   help="servers to debug, mixed forms fine: inventory host "
+                        "names, IPv4 addresses, 'rack=<id>,cable=<n>' pairs, "
+                        "or target aliases")
+    _add_target_args(p, ssh=True)
+    p.add_argument("--workers", type=int, default=4,
+                   help="parallel diagnose agents (default: 4, max 32)")
+    p.add_argument("--symptom", default="",
+                   help="symptom to diagnose on every server; may be omitted "
+                        "when --test-log is given")
+    p.add_argument("--test-log", action="append", default=None,
+                   help="harness/FAT run log whose failures seed every "
+                        "diagnosis (repeatable)")
+    p.add_argument("--secret-dir", help="local dir mapping vault paths to files (lab use)")
+    p.add_argument("--parts-csv", help="parts list CSV (columns: slot,fru,pn,sn)")
+    p.add_argument("--docs-lib", default=None,
+                   help="RAG document library managed by 'harness docs' "
+                        "(default: harness_docs/ if it exists)")
+    p.add_argument("--docs-dir", help="directory of architecture PDFs used for RAG "
+                                      "(legacy ad-hoc; prefer --docs-lib)")
+    p.add_argument("--context", action="append", default=None,
+                   help="extra human-supplied context added to every prompt "
+                        "(repeatable)")
+    p.add_argument("--context-file", action="append", default=None,
+                   help="file whose contents are added as human-supplied "
+                        "context (repeatable)")
+    p.add_argument("--console", action="store_true",
+                   help="run probes over the serial console for every target "
+                        "(lab/qa only)")
+    p.add_argument("--console-address", default=None,
+                   help="override the rack manager console address (inventory default)")
+    p.add_argument("--port", type=int, default=None,
+                   help="pin single-service legacy mode on this port (ignores a configured console_defaults.services map)")
+    p.add_argument("--sudo-vault-path", default=None,
+                   help="override the vault path of the BMC sudo password")
+    p.add_argument("--out-dir", default="harness_runs")
+    _add_llm_args(p)
+    p.add_argument("--llm-model", default=None,
+                   help="specific LLM model, e.g. gemini/gemini-2.5-pro, "
+                        "local/Qwen2.5-7B-Instruct or gpt-4o; overrides --llm / "
+                        "inventory / the remembered model (config/models.yaml)")
+    p.add_argument("--approve-all", action="store_true", help="record every action approved")
+    p.add_argument("--wall-s", type=float, default=900.0, help="supervisor wall-clock budget")
+    p.add_argument("--parts-dir", default="config/parts",
+                   help="where answered instance parts are persisted, one file per target")
+    p.set_defaults(func=run_debug_fleet)
+
     p = sub.add_parser("console", help="run read-only probes over the serial console (lab/qa only)")
     p.add_argument("--inventory", required=True)
     _add_target_args(p, ssh=False)
@@ -3505,7 +4088,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--console-address", default=None,
                    help="override the rack manager console address (inventory default)")
     p.add_argument("--port", type=int, default=None,
-                   help="override the BMC access port (inventory default: 2200)")
+                   help="pin single-service legacy mode on this port (ignores a configured console_defaults.services map)")
     p.add_argument("--sudo-vault-path", default=None,
                    help="override the vault path of the BMC sudo password")
     p.add_argument("--out-dir", default=None,

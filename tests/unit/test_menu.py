@@ -613,8 +613,8 @@ def test_menu_runs_verdict_view(tmp_path, monkeypatch, capsys):
     base = _fake_run_dir(tmp_path, "abc123", {
         "diagnosis.json": '{"state": "healthy", "confidence": 0.8}'})
     args = SimpleNamespace(out_dir=str(base / "harness_runs"))
-    # 0 = run, 0 = verdict, 7 = back
-    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 0, 7]))
+    # 0 = run, 1 = verdict (0 = continue), 8 = back
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 1, 8]))
     assert _menu_runs(args) == 0
     out = capsys.readouterr().out
     assert "healthy" in out
@@ -648,7 +648,7 @@ def test_menu_runs_empty(tmp_path, monkeypatch, capsys):
     args = SimpleNamespace(out_dir=str(tmp_path / "harness_runs"))
     monkeypatch.setattr(menu_mod, "select", _scripted_select([0]))
     assert _menu_runs(args) == 0
-    assert "no runs or chat sessions yet" in capsys.readouterr().out
+    assert "no runs or saved sessions yet" in capsys.readouterr().out
 
 
 def test_menu_runs_missing_artifact(tmp_path, monkeypatch, capsys):
@@ -685,8 +685,8 @@ def test_menu_runs_delete_keeps_case_by_default(tmp_path, monkeypatch, capsys):
     from harness.operator import menu as menu_mod
     run, cases = _run_with_case(tmp_path)
     args = SimpleNamespace(out_dir=str(tmp_path / "harness_runs"))
-    # 0 = run, 6 = delete; confirms: yes (delete run), no (keep case)
-    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 6]))
+    # 0 = run, 7 = delete (0 = continue); confirms: yes (delete run), no (keep case)
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 7]))
     answers = iter([True, False])
     monkeypatch.setattr(menu_mod, "confirm",
                         lambda prompt, default=False: next(answers))
@@ -701,8 +701,8 @@ def test_menu_runs_delete_also_drops_case(tmp_path, monkeypatch, capsys):
     from harness.operator import menu as menu_mod
     _run, cases = _run_with_case(tmp_path)
     args = SimpleNamespace(out_dir=str(tmp_path / "harness_runs"))
-    # 0 = run, 6 = delete; confirms: yes (delete run), yes (drop case)
-    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 6]))
+    # 0 = run, 7 = delete (0 = continue); confirms: yes (delete run), yes (drop case)
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 7]))
     answers = iter([True, True])
     monkeypatch.setattr(menu_mod, "confirm",
                         lambda prompt, default=False: next(answers))
@@ -716,8 +716,8 @@ def test_menu_runs_delete_cancelled(tmp_path, monkeypatch, capsys):
     from harness.operator import menu as menu_mod
     run, cases = _run_with_case(tmp_path)
     args = SimpleNamespace(out_dir=str(tmp_path / "harness_runs"))
-    # 0 = run, 6 = delete (confirm no), 7 = back
-    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 6, 7]))
+    # 0 = run, 7 = delete (0 = continue), 8 = back
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 7, 8]))
     monkeypatch.setattr(menu_mod, "confirm", lambda prompt, default=False: False)
     assert _menu_runs(args) == 0
     out = capsys.readouterr().out
@@ -753,7 +753,7 @@ def test_menu_runs_lists_chat_sessions(tmp_path, monkeypatch, capsys):
 
     monkeypatch.setattr(menu_mod, "select", fake_select)
     assert _menu_runs(args) == 0
-    labels = seen["Run or chat session (most recent first)"]
+    labels = seen["Run or saved session (most recent first)"]
     assert labels and labels[0].startswith("chat |")
     assert "what is the memory rule?" in labels[0]
 
@@ -822,6 +822,149 @@ def test_chat_sessions_skips_debug_sessions_and_garbage(tmp_path):
     _fake_chat_session(base, name="chat-2")
     found = cli_mod._chat_sessions(base / "harness_runs")
     assert [p.name for p in found] == ["chat-2"] and debug.exists()
+
+
+# ---- runs menu: continue from the last point (debug + chat) ----
+
+def _fake_debug_session(base, name="h1-1", target_label="h1"):
+    """A saved debug (REPL) session dir with target + inv_path recorded."""
+    root = base / "harness_runs" / "sessions" / name
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "session.json").write_text(json.dumps({
+        "mode": "debug", "target_label": target_label,
+        "inv_path": str(base / "inventory.yaml"),
+        "target": {"name": target_label},
+        "transcript": [{"role": "user", "kind": "message",
+                        "content": "mem errors on boot"}],
+    }), encoding="utf-8")
+    return root
+
+
+def test_debug_sessions_listing_marks_non_chat(tmp_path):
+    base = tmp_path / "harness_runs"
+    debug = _fake_debug_session(base)
+    _fake_chat_session(base, name="chat-1")
+    found = cli_mod._debug_sessions(base / "harness_runs")
+    assert [p.name for p in found] == ["h1-1"]
+    label = cli_mod._summarize_debug_session(debug)
+    assert label.startswith("debug |")
+    assert "h1" in label and "mem errors on boot" in label
+
+
+def test_menu_runs_debug_session_listed_and_continuous(tmp_path, monkeypatch):
+    """Saved debug sessions appear in the picker and 'continue' builds a
+    debug --resume argv in place, with the session's own inventory + target."""
+    from harness.operator import menu as menu_mod
+    root = _fake_debug_session(tmp_path)
+    args = SimpleNamespace(out_dir=str(tmp_path / "harness_runs"))
+    built, picks_seen = [], {}
+
+    def fake_select(prompt, options):
+        picks_seen.setdefault(prompt, options)
+        return 0  # first pick: the debug session row, then continue
+
+    monkeypatch.setattr(menu_mod, "select", fake_select)
+    monkeypatch.setattr(cli_mod, "_run_wizard_sub",
+                        lambda argv: built.append(argv) or 0)
+    assert _menu_runs(args) == 0
+    labels = picks_seen["Run or saved session (most recent first)"]
+    assert labels and labels[0].startswith("debug |")
+    argv = built[0]
+    assert argv[0] == "debug"
+    assert argv[argv.index("--resume") + 1] == str(root)
+    assert argv[argv.index("--inventory") + 1] == \
+        str(tmp_path / "inventory.yaml")
+    assert argv[argv.index("--host") + 1] == "h1"
+
+
+def _diagnosis_payload(state="fault", confidence=0.9):
+    return {"state": state, "confidence": confidence,
+            "diagnosis": "CPU temperature spike decoded from MSR evidence",
+            "subsystems_considered": ["cpu"],
+            "actions": [{"step": 1, "action": "Reseat CPU",
+                         "rationale": "cites doc page 12",
+                         "risk": "low", "required_tool": "none",
+                         "impact": "none"}],
+            "evidence": [{"mnemonic": "MSR_0", "raw_hex": "0x0"}]}
+
+
+def _run_with_diagnosis(tmp_path, run_id="abc123", meta=None):
+    files = {"diagnosis.json": json.dumps(_diagnosis_payload())}
+    if meta:
+        files["run_meta.json"] = json.dumps(meta)
+    base = _fake_run_dir(tmp_path, run_id, files)
+    inv = _write_inventory(tmp_path)
+    return base / "harness_runs" / run_id, inv
+
+
+def test_menu_runs_run_continue_seeds_debug_session(tmp_path, monkeypatch):
+    """'continue' on a diagnosis run seeds a session.json from the run's last
+    point (target from run_meta spec, evidence digest, the run linked in
+    history) and launches the debug REPL on that directory."""
+    from harness.operator import menu as menu_mod
+    run, inv_path = _run_with_diagnosis(
+        tmp_path, meta={"host": "h1", "spec": {"host": "h1"}})
+    args = SimpleNamespace(out_dir=str(tmp_path / "harness_runs"))
+    built = []
+    monkeypatch.setattr(cli_mod, "_run_wizard_sub",
+                        lambda argv: built.append(argv) or 0)
+    # 0 = the run, 0 = continue
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 0]))
+    assert _menu_runs(args, str(inv_path)) == 0
+    argv = built[0]
+    assert argv[0] == "debug" and "--resume" in argv
+    assert argv[argv.index("--inventory") + 1] == str(inv_path)
+    assert argv[argv.index("--host") + 1] == "h1"
+    seeded = Path(argv[argv.index("--resume") + 1])
+    payload = json.loads(
+        (seeded / "session.json").read_text(encoding="utf-8"))
+    assert payload["mode"] == "debug"
+    assert payload["runs"] == [str(run)]
+    assert payload["target"] == {"name": "h1"}
+    assert payload["evidence"]
+    assert "fault" in payload["transcript"][0]["content"]
+
+
+def test_menu_runs_run_without_diagnosis_has_no_continue(
+        tmp_path, monkeypatch):
+    """A run with no diagnosis.json (nothing to continue from) offers no
+    'continue' row in its inspect views."""
+    from harness.operator import menu as menu_mod
+    base = _fake_run_dir(tmp_path, "abc123", {"trace.json": "{}"})
+    args = SimpleNamespace(out_dir=str(base / "harness_runs"))
+    seen = {}
+
+    def fake_select(prompt, options):
+        seen.setdefault(prompt, options)
+        return len(options) - 1  # open the run, then Back
+
+    monkeypatch.setattr(menu_mod, "select", fake_select)
+    assert _menu_runs(args) == 0
+    assert all(not o.startswith("continue") for o in seen["Inspect"])
+
+
+def test_menu_runs_run_continue_falls_back_to_rack_cable(
+        tmp_path, monkeypatch):
+    """Pre-spec run dirs continue from rack/cable in run_meta (the rack+cable
+    target argv replaces --host)."""
+    from harness.operator import menu as menu_mod
+    _run, inv_path = _run_with_diagnosis(
+        tmp_path, meta={"host": "Q63-cable2", "rack": "Q63", "cable": "2"})
+    args = SimpleNamespace(out_dir=str(tmp_path / "harness_runs"))
+    built = []
+    monkeypatch.setattr(cli_mod, "_run_wizard_sub",
+                        lambda argv: built.append(argv) or 0)
+    monkeypatch.setattr(menu_mod, "select", _scripted_select([0, 0]))
+    assert _menu_runs(args, str(inv_path)) == 0
+    argv = built[0]
+    assert argv[argv.index("--rack") + 1] == "Q63"
+    assert argv[argv.index("--cable") + 1] == "2"
+    assert "--host" not in argv
+    seeded = Path(argv[argv.index("--resume") + 1])
+    payload = json.loads(
+        (seeded / "session.json").read_text(encoding="utf-8"))
+    assert payload["target"] == {"rack": "Q63", "cable": "2"}
+    assert payload["target_label"] == "Q63-cable2"
 
 
 # ---- run listing labels / run metadata ----
@@ -897,6 +1040,24 @@ def test_write_run_meta_captures_target_and_serial(tmp_path):
     assert meta["rack"] == "Q63" and meta["cable"] == "2"
     assert meta["model"] == "r650"
     assert meta["session_id"] == "sess1"
+
+
+def test_write_run_meta_records_launch_spec(tmp_path):
+    """With args, the exact launch targeting lands in run_meta so 'continue'
+    can rebuild the same TargetSpec for a follow-up session."""
+    out = tmp_path / "run1"
+    out.mkdir()
+    args = SimpleNamespace(host=None, rack="Q63", cable="2", address=None,
+                           target="q63c2",
+                           targets_file="config/targets.yaml")
+    cli_mod._write_run_meta(out, SimpleNamespace(label="Q63-cable2",
+                                                 console=None),
+                            SimpleNamespace(model=None), "sess1", args=args)
+    meta = json.loads((out / "run_meta.json").read_text(encoding="utf-8"))
+    assert meta["spec"]["rack"] == "Q63" and meta["spec"]["cable"] == "2"
+    assert meta["spec"]["target"] == "q63c2"
+    assert meta["spec"]["targets_file"] == "config/targets.yaml"
+    assert "host" not in meta["spec"] and "address" not in meta["spec"]
 
 
 def test_synthesize_case_from_diagnosis_and_audit(tmp_path):

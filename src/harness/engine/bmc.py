@@ -52,3 +52,18 @@ class BmcRunner(Runner):
             exit_code=proc.returncode,
             elapsed_ms=0,
         )
+
+
+class LanProbeRunner(BmcRunner):
+    """IpmiCollector yields the bare read-only ipmitool forms (``-I lanplus
+    -H -U -E`` absent); this adapter rewrites them INTO the pinned LAN shape
+    before the BMC allowlist gate runs, so the gate still only ever sees the
+    three exact read-only templates. The recorded/audited argv is the wire
+    form. Collector- or CLI-injected runners keep their own contract."""
+
+    def execute(self, argv: list[str], timeout: float = 30.0) -> CommandResult:
+        if (argv and "-I" not in argv
+                and argv[0].rsplit("/", 1)[-1] == "ipmitool"):
+            argv = ["/usr/bin/ipmitool", "-I", "lanplus", "-H", self.address,
+                    "-U", self.username, "-E", *argv[1:]]
+        return super().execute(argv, timeout=timeout)

@@ -19,6 +19,7 @@ from .models import (
     BMCDomain,
     ConsoleDefaults,
     ConsoleDomain,
+    ConsoleService,
     Host,
     Inventory,
     LLMConfig,
@@ -92,42 +93,80 @@ def lint_inventory(inv: Inventory) -> list[InventoryIssue]:
     if inv.llm is not None and inv.llm.api_key_vault_path is not None:
         _lint_value(None, "llm.api_key_vault_path", inv.llm.api_key_vault_path, issues)
     if inv.console_defaults is not None:
-        d = inv.console_defaults
-        _lint_value(None, "console_defaults.identity_vault_path", d.identity_vault_path, issues)
-        _lint_value(None, "console_defaults.known_hosts_path", d.known_hosts_path, issues)
-        if d.sudo_vault_path is not None:
-            _lint_value(None, "console_defaults.sudo_vault_path", d.sudo_vault_path, issues)
-        if d.redfish_password_vault_path is not None:
-            _lint_value(None, "console_defaults.redfish_password_vault_path",
-                        d.redfish_password_vault_path, issues)
-        if d.password_vault_path is not None:
-            _lint_value(None, "console_defaults.password_vault_path",
-                        d.password_vault_path, issues)
-        if d.node_password_vault_path is not None:
-            _lint_value(None, "console_defaults.node_password_vault_path",
-                        d.node_password_vault_path, issues)
-        if d.port is not None and not 1 <= d.port <= 65535:
-            issues.append(InventoryIssue(None, "console_defaults.port",
-                                         f"port {d.port} out of range 1-65535"))
+        _lint_console_defaults("console_defaults", inv.console_defaults, issues)
     if inv.llm_console is not None:
-        d = inv.llm_console
-        _lint_value(None, "llm_console.identity_vault_path", d.identity_vault_path, issues)
-        _lint_value(None, "llm_console.known_hosts_path", d.known_hosts_path, issues)
-        if d.sudo_vault_path is not None:
-            _lint_value(None, "llm_console.sudo_vault_path", d.sudo_vault_path, issues)
-        if d.redfish_password_vault_path is not None:
-            _lint_value(None, "llm_console.redfish_password_vault_path",
-                        d.redfish_password_vault_path, issues)
-        if d.password_vault_path is not None:
-            _lint_value(None, "llm_console.password_vault_path",
-                        d.password_vault_path, issues)
-        if d.node_password_vault_path is not None:
-            _lint_value(None, "llm_console.node_password_vault_path",
-                        d.node_password_vault_path, issues)
-        if d.port is not None and not 1 <= d.port <= 65535:
-            issues.append(InventoryIssue(None, "llm_console.port",
-                                         f"port {d.port} out of range 1-65535"))
+        _lint_console_defaults("llm_console", inv.llm_console, issues)
     return issues
+
+
+def _lint_console_defaults(prefix: str, d: ConsoleDefaults,
+                           issues: list[InventoryIssue]) -> None:
+    _lint_value(None, f"{prefix}.identity_vault_path", d.identity_vault_path, issues)
+    _lint_value(None, f"{prefix}.known_hosts_path", d.known_hosts_path, issues)
+    if d.sudo_vault_path is not None:
+        _lint_value(None, f"{prefix}.sudo_vault_path", d.sudo_vault_path, issues)
+    if d.redfish_password_vault_path is not None:
+        _lint_value(None, f"{prefix}.redfish_password_vault_path",
+                    d.redfish_password_vault_path, issues)
+    if d.password_vault_path is not None:
+        _lint_value(None, f"{prefix}.password_vault_path",
+                    d.password_vault_path, issues)
+    if d.node_password_vault_path is not None:
+        _lint_value(None, f"{prefix}.node_password_vault_path",
+                    d.node_password_vault_path, issues)
+    if d.port is not None and not 1 <= d.port <= 65535:
+        issues.append(InventoryIssue(None, f"{prefix}.port",
+                                     f"port {d.port} out of range 1-65535"))
+    if d.bmc is not None:
+        _lint_value(None, f"{prefix}.bmc.address", d.bmc.address, issues)
+        _lint_value(None, f"{prefix}.bmc.username", d.bmc.username, issues)
+        _lint_value(None, f"{prefix}.bmc.password_vault_path",
+                    d.bmc.password_vault_path, issues)
+        if not d.bmc.password_vault_path:
+            issues.append(InventoryIssue(
+                None, f"{prefix}.bmc.password_vault_path",
+                "required when the bmc block is set (vault path only)"))
+        if not d.bmc.address:
+            issues.append(InventoryIssue(
+                None, f"{prefix}.bmc.address",
+                "required when the bmc block is set"))
+    if d.services:
+        seen_ports: dict[int, str] = {}
+        for name, svc in d.services.items():
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+                issues.append(InventoryIssue(
+                    None, f"{prefix}.services.{name}",
+                    "service name must match [A-Za-z0-9_-]+"))
+            if svc.port is not None:
+                if not 1 <= svc.port <= 65535:
+                    issues.append(InventoryIssue(
+                        None, f"{prefix}.services.{name}.port",
+                        f"port {svc.port} out of range 1-65535"))
+                elif svc.port in seen_ports:
+                    issues.append(InventoryIssue(
+                        None, f"{prefix}.services.{name}.port",
+                        f"port {svc.port} already used by service "
+                        f"{seen_ports[svc.port]!r}"))
+                else:
+                    seen_ports[svc.port] = name
+            for field in ("sudo_vault_path", "node_password_vault_path"):
+                value = getattr(svc, field)
+                if value is not None:
+                    _lint_value(None,
+                                f"{prefix}.services.{name}.{field}", value, issues)
+            if svc.node_user is not None:
+                _lint_value(None, f"{prefix}.services.{name}.node_user",
+                            svc.node_user, issues)
+            for prog in svc.programs:
+                if not re.fullmatch(r"[a-z][a-z0-9_-]*", str(prog)):
+                    issues.append(InventoryIssue(
+                        None, f"{prefix}.services.{name}.programs",
+                        f"program {prog!r} must look like a command name"))
+            for sub in svc.subsystems:
+                if not re.fullmatch(r"[a-z_][a-z0-9_]*", str(sub)):
+                    issues.append(InventoryIssue(
+                        None, f"{prefix}.services.{name}.subsystems",
+                        f"collector name {sub!r} invalid"))
 
 
 def load_inventory(path: str | Path) -> Inventory:
@@ -210,11 +249,48 @@ def _from_mapping(raw: dict | None) -> Inventory:
                      console_defaults=console_defaults, llm_console=llm_console)
 
 
+def _console_service_from_mapping(name: str, raw: object) -> ConsoleService | None:
+    if not isinstance(raw, dict):
+        return None
+    prompts = raw.get("prompts")
+    port_raw = raw.get("port")
+    return ConsoleService(
+        name=name,
+        port=int(port_raw) if port_raw is not None else None,
+        prompts=(prompts[0], prompts[1]) if prompts else None,
+        sudo_vault_path=raw.get("sudo_vault_path"),
+        node_user=raw.get("node_user"),
+        node_password_vault_path=raw.get("node_password_vault_path"),
+        programs=tuple(str(p) for p in raw.get("programs", []) or []),
+        subsystems=tuple(str(s) for s in raw.get("subsystems", []) or []),
+    )
+
+
+def _bmc_from_mapping(raw: object) -> BMCDomain | None:
+    if not isinstance(raw, dict):
+        return None
+    return BMCDomain(
+        address=str(raw.get("address", "")),
+        username=str(raw.get("username", "")),
+        password_vault_path=str(raw.get("password_vault_path", "")),
+    )
+
+
 def _console_defaults_from_mapping(raw: object, trust: str) -> ConsoleDefaults | None:
     if not isinstance(raw, dict):
         return None
     prompts = raw.get("prompts", ("RScmCli#", "~#"))
     port_raw = raw.get("port")
+    services = None
+    services_raw = raw.get("services")
+    if isinstance(services_raw, dict) and services_raw:
+        services = {}
+        for name, svc in services_raw.items():
+            parsed = _console_service_from_mapping(str(name), svc)
+            if parsed is not None:
+                services[str(name)] = parsed
+        if not services:
+            services = None
     return ConsoleDefaults(
         address=raw["address"],
         user=raw["user"],
@@ -232,6 +308,8 @@ def _console_defaults_from_mapping(raw: object, trust: str) -> ConsoleDefaults |
         password_vault_path=raw.get("password_vault_path"),
         node_user=raw.get("node_user"),
         node_password_vault_path=raw.get("node_password_vault_path"),
+        services=services,
+        bmc=_bmc_from_mapping(raw.get("bmc")),
     )
 
 

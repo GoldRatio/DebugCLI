@@ -24,6 +24,9 @@ class CommandResult:
     stderr: str
     exit_code: int
     elapsed_ms: int
+    # Multi-service console provenance: which service (port) served this probe.
+    # None for SSH/BMC-LAN/local executors.
+    service: str | None = None
 
     @property
     def ok(self) -> bool:

@@ -221,7 +221,8 @@ harness chat> what does the manual say about DIMM population rules?
   auto-continues your newest chat, so one conversation stays one entry
   instead of a new chat dir per launch (`--new` starts a fresh chat;
   `--resume <session-dir>` re-enters a specific one; the "Inspect past runs"
-  `continue` action does the same).
+  `continue` action does the same). Debug sessions appear there too (`debug`
+  tag), and continue in place the same way.
 - Target tools (`diagnose`/`probe`/`verify`) are unavailable: the agent says
   so and points you at `harness debug` for live debugging.
 - Slash commands: `/help`, `/model`, `/context`, `/status`, `/stop`, `/runs`,
@@ -423,15 +424,23 @@ Under `harness_runs/<run-id>/`:
 - `dumps/*.txt` — raw collector output for manual cross-checking.
 
 Chat sessions are saved alongside the runs (`harness_runs/sessions/chat-*`)
-and listed in the same "Inspect past runs" menu, tagged `chat |` with the
-date, message count, and your first message so they are type-to-filter
-findable. Picking one offers chat-specific views:
+and debug sessions (`harness_runs/sessions/<target>-*`) are listed in the
+same "Inspect past runs" menu, tagged `chat |` / `debug |` with the date,
+message count, and your first message so they are type-to-filter findable.
+Picking one offers session views:
 
-- `continue` — re-enter that conversation where it left off (the same
-  session keeps growing; equivalent to `harness chat --resume <dir>`).
+- `continue` — re-enter that session where it left off (the same
+  session keeps growing; equivalent to `harness chat --resume <dir>` for
+  chats and `harness debug --resume <dir>` for debug sessions).
 - `transcript` — print the saved conversation (`[you]` / `[agent]` /
   `[tool]` rows).
 - `delete` — remove the saved session after a confirm.
+
+Picking a diagnosis run offers `continue` too: it seeds a fresh debug
+session from the run's last point (the target is rebuilt from the run's
+launch metadata, the diagnosis becomes the session's evidence digest, and
+the run is linked in the session's history) and launches the debug REPL on
+it, so follow-up debugging starts exactly where that run stopped.
 
 ### Deleting runs
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from dataclasses import replace as _replace
 from typing import Literal
 
 TrustLevel = Literal["lab", "qa", "prod"]
@@ -36,6 +37,56 @@ class BMCDomain:
     address: str
     username: str
     password_vault_path: str
+
+
+# Probe-program routing tables for multi-service console targets (one node, one
+# serial session per service port). BMC-shell programs run on the BMC access
+# port (OpenBMC BusyBox; ``dmesg -r`` is the BMC ring buffer, as today); the
+# host-SOL set runs on the node Linux console. A service entry overrides its
+# table with ``programs:``.
+BMC_SERVICE_PROGRAMS = ("ipmitool", "i2cdump", "i2cget", "i2cdetect", "i2ctransfer", "ls", "dmesg")
+HOST_SERVICE_PROGRAMS = ("lspci", "dmidecode", "nvme", "smartctl",
+                         "lsblk", "cat", "grep", "ss", "ip", "docker", "hostname")
+# Collector names served by each service class when not configured explicitly.
+BMC_SERVICE_SUBSYSTEMS = ("cpu_msr", "kernel", "ipmi")
+HOST_SERVICE_SUBSYSTEMS = ("pcie", "storage")
+
+
+def is_bmc_service_name(name: str) -> bool:
+    """Name convention: a service named (or containing) ``bmc`` serves the
+    BMC-shell program set unless it declares explicit ``programs``."""
+    return "bmc" in name.lower()
+
+
+def default_programs_for_service(name: str) -> tuple[str, ...]:
+    return BMC_SERVICE_PROGRAMS if is_bmc_service_name(name) else HOST_SERVICE_PROGRAMS
+
+
+def default_subsystems_for_service(name: str) -> tuple[str, ...]:
+    return BMC_SERVICE_SUBSYSTEMS if is_bmc_service_name(name) else HOST_SERVICE_SUBSYSTEMS
+
+
+@dataclass(frozen=True)
+class ConsoleService:
+    """One named node console service (a port) under ``console_defaults.services``.
+
+    One debug session on one node then reaches several console services: the
+    BMC access port (2200, OpenBMC BusyBox shell) and the host SOL port (22)
+    are routed PER PROBE by program/command, never by the agent. ``port``/
+    ``prompts``/``sudo_vault_path``/``node_user``/``node_password_vault_path``
+    override the fleet defaults for this service; ``programs`` replaces the
+    name-convention routing table (BMC set vs host set); ``subsystems`` moves
+    collector names to this service. Vault paths only -- never inline secrets.
+    """
+
+    name: str  # identifier-stable label (lint enforces [A-Za-z0-9_-]+)
+    port: int | None = None
+    prompts: tuple[str, str] | None = None
+    sudo_vault_path: str | None = None
+    node_user: str | None = None
+    node_password_vault_path: str | None = None
+    programs: tuple[str, ...] = ()
+    subsystems: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -97,6 +148,13 @@ class ConsoleDomain:
     password_vault_path: str | None = None  # vault path of the rackmgr SSH password
     node_user: str | None = None   # user the node serial console is logged in as
     node_password_vault_path: str | None = None  # vault path of the node login/sudo password
+    # Multi-service routing (from a ConsoleDefaults.services entry): which probe
+    # programs this service accepts and which collector names it serves. Empty
+    # = derive from the service name convention ("bmc" -> BMC shell set,
+    # otherwise the host-SOL set); see default_programs_for_service.
+    programs: tuple[str, ...] = ()
+    subsystems: tuple[str, ...] = ()
+    service_name: str = "default"
 
     def address_for_rack(self, rack: str | None = None) -> str:
         """The manager to SSH to for ``rack``: the per-rack map entry when
@@ -168,6 +226,16 @@ class ConsoleDefaults:
     password_vault_path: str | None = None
     node_user: str | None = None
     node_password_vault_path: str | None = None
+    # Multi-service console access: one node, one serial session PER service
+    # port (BMC shell 2200, host SOL 22, ...). None = single-service legacy
+    # behavior from ``port``. Insertion order of the mapping fixes routing
+    # precedence: the first service whose program table lists a command's
+    # program serves it.
+    services: dict[str, ConsoleService] | None = None
+    # Optional BMC LAN credentials (address/username/password_vault_path) so
+    # rack/cable targets get the ipmitool-over-LAN channel (IpmiCollector) in
+    # the same run. Absent = BMC LAN stays unavailable for console targets.
+    bmc: BMCDomain | None = None
 
     def address_for_rack(self, rack: str | None = None) -> str:
         """Per-rack manager address when mapped, else ``address``."""
@@ -196,6 +264,38 @@ class ConsoleDefaults:
             password_vault_path=self.password_vault_path,
             node_user=self.node_user,
             node_password_vault_path=self.node_password_vault_path)
+
+    def consoles_for_rack(self, rack: str, cable: str) -> dict[str, ConsoleDomain]:
+        """Per-service :class:`ConsoleDomain` map for one rack/cable target.
+
+        Without ``services`` this is the legacy single ``{"default": ...}`` map
+        built from ``port``. With ``services``, each entry becomes its own
+        domain: the service's port/prompts/credential overrides are layered
+        onto the fleet defaults, and the name convention fills empty
+        ``programs``/``subsystems``."""
+        if not self.services:
+            return {"default": self.for_rack(rack, cable)}
+        out: dict[str, ConsoleDomain] = {}
+        for name, svc in self.services.items():
+            base = self.for_rack(rack, cable)
+            out[name] = _replace(
+                base,
+                port=svc.port if svc.port is not None else self.port,
+                prompts=svc.prompts if svc.prompts is not None else self.prompts,
+                sudo_vault_path=(svc.sudo_vault_path
+                                 if svc.sudo_vault_path is not None
+                                 else self.sudo_vault_path),
+                node_user=(svc.node_user if svc.node_user is not None
+                           else self.node_user),
+                node_password_vault_path=(
+                    svc.node_password_vault_path
+                    if svc.node_password_vault_path is not None
+                    else self.node_password_vault_path),
+                programs=svc.programs or default_programs_for_service(name),
+                subsystems=svc.subsystems or default_subsystems_for_service(name),
+                service_name=name,
+            )
+        return out
 
 
 @dataclass(frozen=True)

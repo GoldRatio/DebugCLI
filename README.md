@@ -237,7 +237,10 @@ Sessions continue themselves: re-entering `harness debug` for the same target
 (or `harness chat` at all) auto-continues the newest saved session, so one
 conversation stays one entry under "Inspect past runs" instead of becoming a
 new `chat-<timestamp>` dir per launch. `--new` starts a fresh session;
-`--resume <dir>` re-enters a specific one.
+`--resume <dir>` re-enters a specific one. "Inspect past runs" also offers
+`continue` on every saved chat/debug session, and on each diagnosis run it
+can seed a debug session from the run's last point (target + evidence) and
+launch it.
 
 ### Optional: rack-level Redfish evidence
 

@@ -79,7 +79,19 @@ created once it has content (no empty `chat-<ts>` dirs).
   Only constructible at `trust_level` lab/qa; destructive or injection-y
   probes are rejected by `validate_serial_probe`.
 - **BMC (IPMI path)** — `engine/bmc.py` for IPMI/BMC access with separate
-  rotated credentials from SSH.
+  rotated credentials from SSH. `LanProbeRunner` pins the bare collector
+  ipmitool forms into the exact LAN templates before the gate.
+- **Multi-service console (rack/cable)** — `engine/services.py`
+  (`MultiConsoleRunner`) fans one rack/cable session out over
+  `console_defaults.services`: one serial session per service port (BMC shell
+  2200, host SOL 22, ...). Routing is per-command by program table
+  (`ipmitool`/`i2c*`/`dmesg` on the BMC shell; `lspci`/`smartctl`/... on the
+  host), explicit `programs:`/`subsystems:` per service override the name
+  convention. The agent never picks ports; BMC-LAN ipmitool (via
+  `console_defaults.bmc`) wins the `ipmi` collector when credentials exist,
+  with the BMC shell as fallback. Per-probe provenance is stamped
+  (`CommandResult.service`) and the `run_start` audit event lists the service
+  map.
 
 ## Credential flow
 
