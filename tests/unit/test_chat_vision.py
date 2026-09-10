@@ -232,6 +232,87 @@ def test_agent_retries_text_only_when_images_rejected():
     assert result is None  # the say was streamed instead
 
 
+def _raw_session(max_tools=2):
+    from harness.operator.repl import Session
+
+    session = Session(
+        mode="chat", inv_path="", inv=type("Inv", (), {"host_names": []})(),
+        host=None, store=None, out_dir=None, session_dir=None,
+        llm=None, router_llm=None, llm_mode="chat", docs_lib=None,
+        docs_dir=None, parts_csv=None, secret_dir=None, console=False,
+        max_tools=max_tools)
+    return session
+
+
+# ---- agent-loop chain termination: budget wrap-up + visible LLM failure ----
+
+def _run_agent_local(session, events):
+    import threading
+
+    from harness.operator.repl import _run_agent
+
+    return _run_agent(session, "common CX8 errors",
+                      progress=events.append, cancel=threading.Event())
+
+
+def test_agent_budget_spent_gets_forced_final_answer():
+    """When the tool budget runs out mid-chain the agent composes one final
+    answer from what it gathered instead of dying on a raw budget note
+    (chat answers must not truncate after a 'let me pull the details' say)."""
+
+    calls: list[list] = []
+
+    class _Router:
+        def chat_json(self, messages):
+            calls.append(messages)
+            if len(calls) == 1:  # first decision: run one tool
+                return {"say": "looking that up", "tool": "docs",
+                        "query": "CX8 errors"}
+            if "budget for this message" in messages[-1]["content"]:
+                return {"say": "FINAL ANSWER: CX8 details.", "tool": "none"}
+            return {"say": "another say", "tool": "docs", "query": "more"}
+
+    import harness.operator.repl as repl_mod
+    session = _raw_session(max_tools=1)
+    session.router_llm = _Router()
+    real_docs = repl_mod._tool_docs
+    repl_mod._tool_docs = lambda sess, turn: "docs result"
+    try:
+        events: list[str] = []
+        result = _run_agent_local(session, events)
+    finally:
+        repl_mod._tool_docs = real_docs
+    assert any("FINAL ANSWER: CX8 details." in e for e in events)
+    assert result is None  # the say was streamed
+
+
+def test_agent_midchain_llm_failure_is_visible_not_silent():
+    """A mid-chain decide() failure (timeout/garbage) must print a visible
+    explanation instead of leaving a dangling 'let me look that up' say."""
+
+    calls: list[list] = []
+
+    class _Router:
+        def chat_json(self, messages):
+            calls.append(messages)
+            if len(calls) == 1:
+                return {"say": "pulling details", "tool": "docs",
+                        "query": "CX8"}
+            raise RuntimeError("timed out")
+
+    import harness.operator.repl as repl_mod
+    session = _raw_session(max_tools=8)
+    session.router_llm = _Router()
+    real_docs = repl_mod._tool_docs
+    repl_mod._tool_docs = lambda sess, turn: "docs result"
+    try:
+        events: list[str] = []
+        _run_agent_local(session, events)
+    finally:
+        repl_mod._tool_docs = real_docs
+    assert any("agent stopped early" in e for e in events)
+
+
 # ---- ingest model resolution chain (cli._ingest_captioner) ----
 
 def test_ingest_captioner_env_wins(monkeypatch):

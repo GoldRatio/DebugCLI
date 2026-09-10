@@ -967,6 +967,13 @@ def _status_line(session: Session) -> str:
 #: stops; the operator can always send another message to continue the chain).
 DEFAULT_TOOL_BUDGETS = {"debug": 8, "chat": 4}
 
+#: Forced final-decision note when the tool budget runs out mid-chain.
+_BUDGET_WRAPUP_NOTE = (
+    "The tool-call budget for this message is now spent. Do not choose "
+    "another tool: give your final answer now with tool 'none', summarizing "
+    "what the results above show and noting anything still unexplored "
+    "(the operator can send another message to continue).")
+
 
 def _tool_budget(session: Session) -> int:
     return session.max_tools or DEFAULT_TOOL_BUDGETS.get(session.mode, 4)
@@ -1045,7 +1052,15 @@ def _run_agent(session: Session, line: str,
         images = []  # images attach to one decision, not the whole chain
         if turn is None:
             if not first:
-                break  # mid-chain LLM failure: stop with what we have
+                # Mid-chain LLM failure (timeout / garbage / rejected output):
+                # stop the chain, but visibly -- the operator just saw a "let
+                # me look that up" say and must not be left with a dangling
+                # promise and a silent death.
+                progress("(agent stopped early: the LLM did not return a "
+                         "usable decision -- timeout or unusable output; "
+                         "the results above are kept, send another message "
+                         "to continue)")
+                break
             cmd = _keyword_route(line)
             if cmd.intent == "status":
                 progress(_status_line(session).strip())
@@ -1063,6 +1078,20 @@ def _run_agent(session: Session, line: str,
             # "+ done" line.
             return None if turn.say else final
         if tool_calls >= max_tools:
+            # Budget reached mid-chain: give the model ONE forced decision to
+            # compose the final answer from everything gathered so far, so the
+            # turn ends with an answer instead of a raw tool result.
+            messages = build_messages(
+                transcript=session.transcript, user_text=line,
+                evidence_digest=session.evidence,
+                host_names=tuple(session.inv.host_names),
+                target_label=session.target_label,
+                mode=session.mode)
+            messages.append({"role": "user", "content": _BUDGET_WRAPUP_NOTE})
+            wrap = decide(session.router_llm, messages, (), mode=session.mode)
+            if wrap is not None and wrap.say and wrap.tool in ("", "none"):
+                _say(session, progress, wrap.say)
+                return None
             progress("tool-call budget reached for this message; send another "
                      "message to continue")
             return final
