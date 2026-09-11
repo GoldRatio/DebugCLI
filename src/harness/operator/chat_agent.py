@@ -100,7 +100,11 @@ Tools (at most one per response):
 Always fill "say" -- it is shown to the operator before anything runs. When
 calling a tool, say briefly what you are about to do and why (1-2 sentences).
 You will see each tool's result before your next decision, and you may chain
-tools until you can answer; stop (tool "none") as soon as you can."""
+tools until you can answer; stop (tool "none") as soon as you can. When you
+DO answer with tool "none", give the operator the FULL answer in that same
+"say": lay out every relevant finding collected so far, the reasoning that
+connects them, and concrete next steps -- structured and complete, never a
+bare one-liner, because this say is the only thing the operator keeps."""
 
 DEBUG_CONTRACT = """Respond with STRICT JSON only (no markdown fences, no prose):
 {"say": "...", "tool": "diagnose"|"probe"|"docs"|"verify"|"run"|"file"|"none", <tool fields>}
@@ -150,7 +154,11 @@ Tools (at most one per response):
 Always fill "say" -- it is shown to the operator before anything runs. When
 calling a tool, say briefly what you are about to do and why (1-2 sentences).
 You will see each tool's result before your next decision, and you may chain
-tools until you can answer; stop (tool "none") as soon as you can. Prefer
+tools until you can answer; stop (tool "none") as soon as you can. When you
+DO answer with tool "none", give the operator the FULL answer in that same
+"say": lay out every relevant finding collected so far, the reasoning that
+connects them, and concrete next steps -- structured and complete, never a
+bare one-liner, because this say is the only thing the operator keeps. Prefer
 looking something up over guessing when the operator needs a precise,
 checkable answer."""
 
@@ -295,6 +303,7 @@ _ENTRY_PREFIX = {
 }
 
 _MAX_ENTRY_CHARS = 800
+_MAX_RESULT_CHARS = 4000
 _TRANSCRIPT_WINDOW = 12
 
 
@@ -322,7 +331,11 @@ def build_messages(*, transcript: list[dict], user_text: str,
     for entry in list(transcript)[-_TRANSCRIPT_WINDOW:]:
         role = "assistant" if entry.get("role") == "agent" else "user"
         prefix = _ENTRY_PREFIX.get(entry.get("kind", ""), "")
-        content = _clip(f"{prefix}{entry.get('content', '')}", _MAX_ENTRY_CHARS)
+        # Tool results keep far more detail than chit-chat entries: the final
+        # answer can only be as complete as the evidence it is shown.
+        limit = (_MAX_RESULT_CHARS if entry.get("kind") == "result"
+                 else _MAX_ENTRY_CHARS)
+        content = _clip(f"{prefix}{entry.get('content', '')}", limit)
         if content:
             messages.append({"role": role, "content": content})
     blocks: list[str] = []
